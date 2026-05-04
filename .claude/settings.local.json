@@ -5,7 +5,8 @@
       "Bash(go build *)",
       "Bash(go test *)",
       "Bash(dotnet ef *)",
-      "Bash(dotnet tool install *)"
+      "Bash(dotnet tool install *)",
+      "Bash(go mod *)"
     ]
   }
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/hex"
 	"errors"
+	"io"
 	"log"
 	"path/filepath"
 	"sort"
@@ -12,11 +13,15 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"cherry-picker/internal/config"
 	dht "cherry-picker/internal/dht"
 	"cherry-picker/internal/export"
 	"cherry-picker/internal/pipeline"
+
+	"golang.org/x/text/encoding/simplifiedchinese"
+	"golang.org/x/text/transform"
 )
 
 type Application struct {
@@ -307,7 +312,7 @@ func normalizeMetadata(data []byte) (*pipeline.Metadata, error) {
 
 	metadata := &pipeline.Metadata{}
 	if name := firstString(info, "name.utf-8", "name"); name != "" {
-		metadata.Name = name
+		metadata.Name = fixEncoding(name)
 	}
 	if length, ok := asInt64(info["length"]); ok {
 		metadata.Length = length
@@ -331,7 +336,14 @@ func normalizeMetadata(data []byte) (*pipeline.Metadata, error) {
 			}
 			if path := pathParts(item); len(path) > 0 {
 				entry.Path = path
-				entry.PathText = filepath.ToSlash(filepath.Join(path...))
+				clean := make([]string, 0, len(path))
+				for _, p := range path {
+					p = fixEncoding(p)
+					if p != "" && !isPaddingFile(p) { clean = append(clean, p) }
+				}
+				if len(clean) == 0 { continue }
+				entry.Path = clean
+				entry.PathText = filepath.ToSlash(filepath.Join(clean...))
 			}
 			metadata.Files = append(metadata.Files, entry)
 		}
@@ -367,6 +379,30 @@ func normalizeMetadata(data []byte) (*pipeline.Metadata, error) {
 	}
 
 	return metadata, nil
+}
+
+func isPaddingFile(name string) bool {
+	return len(name) > 10 && strings.HasPrefix(name, "_____padding_file_")
+}
+
+func fixEncoding(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" || utf8.ValidString(s) {
+		return s
+	}
+	// Try GBK → UTF-8 (most common legacy encoding in Chinese torrents)
+	decoded, err := io.ReadAll(transform.NewReader(
+		strings.NewReader(s),
+		simplifiedchinese.GBK.NewDecoder(),
+	))
+	if err == nil {
+		result := string(decoded)
+		if utf8.ValidString(result) {
+			return strings.TrimSpace(result)
+		}
+	}
+	// Fallback: strip invalid UTF-8 bytes
+	return strings.ToValidUTF8(s, "")
 }
 
 func firstString(values map[string]interface{}, keys ...string) string {
