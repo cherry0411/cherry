@@ -1,4 +1,4 @@
-var API = window.CHERRY_API || 'http://localhost:5070';
+var API = window.CHERRY_API || '';
 
 // ---- i18n ----
 var LANG_KEY = 'cherry_lang';
