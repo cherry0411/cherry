@@ -55,6 +55,8 @@ var app = builder.Build();
 await using (var scope = app.Services.CreateAsyncScope())
 {
     var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+    // Extension must exist before migration (trigram index depends on it)
+    await db.Database.ExecuteSqlRawAsync("CREATE EXTENSION IF NOT EXISTS pg_trgm");
     var pending = await db.Database.GetPendingMigrationsAsync();
     if (pending.Any())
     {
@@ -66,7 +68,6 @@ await using (var scope = app.Services.CreateAsyncScope())
                 $"INSERT INTO \"__EFMigrationsHistory\" VALUES ('{pending.Last()}', '10.0.0')");
         }
     }
-    await db.Database.ExecuteSqlRawAsync("CREATE EXTENSION IF NOT EXISTS pg_trgm");
 }
 
 // CORS — allow independent frontend deployment
