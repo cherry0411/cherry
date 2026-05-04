@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(dotnet build *)",
+      "Bash(go build *)",
+      "Bash(go test *)",
+      "Bash(dotnet ef *)",
+      "Bash(dotnet tool install *)"
+    ]
+  }
+}

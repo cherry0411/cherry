@@ -1,0 +1,8 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/Cherry.Api/Cherry.Api.csproj" />
+    <Project Path="src/Cherry.Application/Cherry.Application.csproj" />
+    <Project Path="src/Cherry.Domain/Cherry.Domain.csproj" />
+    <Project Path="src/Cherry.Infrastructure/Cherry.Infrastructure.csproj" />
+  </Folder>
+</Solution>

@@ -1,0 +1,129 @@
+using Cherry.Domain.Interfaces;
+
+namespace Cherry.Infrastructure.Dedup;
+
+public class CuckooFilter : IDedupFilter, IDisposable
+{
+    private readonly int _bucketCount;
+    private readonly ulong[] _buckets; // 4 slots per bucket, 16-bit per slot, packed in ulong
+    private long _count;
+    private readonly int _maxKicks = 500;
+
+    public long Count => Volatile.Read(ref _count);
+
+    /// <param name="capacity">Expected number of unique items</param>
+    public CuckooFilter(long capacity = 100_000_000)
+    {
+        _bucketCount = (int)(capacity / 4) + 1;
+        _buckets = new ulong[_bucketCount];
+    }
+
+    public bool MightContain(string infoHash)
+    {
+        var fp = Fingerprint(infoHash);
+        var (i1, i2) = BucketIndices(infoHash);
+
+        return BucketContains(i1, fp) || BucketContains(i2, fp);
+    }
+
+    public bool Add(string infoHash)
+    {
+        var fp = Fingerprint(infoHash);
+        if (fp == 0) fp = 1;
+
+        var (i1, i2) = BucketIndices(infoHash);
+
+        if (TryInsertIntoBucket(i1, fp) || TryInsertIntoBucket(i2, fp))
+        {
+            Interlocked.Increment(ref _count);
+            return true;
+        }
+
+        var idx = (Random.Shared.Next() & 1) == 0 ? i1 : i2;
+        for (var n = 0; n < _maxKicks; n++)
+        {
+            var slot = Random.Shared.Next(4);
+            var oldFp = SwapSlot(idx, slot, fp);
+            if (oldFp == 0)
+            {
+                Interlocked.Increment(ref _count);
+                return true;
+            }
+            fp = oldFp;
+            idx = AltIndex(idx, fp);
+        }
+
+        return false;
+    }
+
+    private bool BucketContains(int bucket, ushort fp)
+    {
+        var packed = Volatile.Read(ref _buckets[bucket]);
+        return ((packed & 0xFFFF) == fp) ||
+               (((packed >> 16) & 0xFFFF) == fp) ||
+               (((packed >> 32) & 0xFFFF) == fp) ||
+               (((packed >> 48) & 0xFFFF) == fp);
+    }
+
+    private bool TryInsertIntoBucket(int bucket, ushort fp)
+    {
+        var fp64 = (ulong)fp;
+        while (true)
+        {
+            var packed = Volatile.Read(ref _buckets[bucket]);
+            ulong newPacked;
+            if ((packed & 0xFFFF) == 0) newPacked = packed | fp64;
+            else if (((packed >> 16) & 0xFFFF) == 0) newPacked = packed | (fp64 << 16);
+            else if (((packed >> 32) & 0xFFFF) == 0) newPacked = packed | (fp64 << 32);
+            else if (((packed >> 48) & 0xFFFF) == 0) newPacked = packed | (fp64 << 48);
+            else return false;
+
+            if (Interlocked.CompareExchange(ref _buckets[bucket], newPacked, packed) == packed)
+                return true;
+        }
+    }
+
+    private ushort SwapSlot(int bucket, int slot, ushort newFp)
+    {
+        var shift = slot * 16;
+        var mask = 0xFFFFul << shift;
+        while (true)
+        {
+            var packed = Volatile.Read(ref _buckets[bucket]);
+            var oldFp = (ushort)((packed >> shift) & 0xFFFF);
+            var newPacked = (packed & ~mask) | ((ulong)newFp << shift);
+            if (Interlocked.CompareExchange(ref _buckets[bucket], newPacked, packed) == packed)
+                return oldFp;
+        }
+    }
+
+    private int AltIndex(int idx, ushort fp) => (int)(((uint)idx ^ ((uint)fp * 0x5bd1e995)) % (uint)_bucketCount);
+
+    private (int, int) BucketIndices(string infoHash)
+    {
+        var hash = (ulong)infoHash.GetHashCode();
+        var hash2 = (ulong)HashCode.Combine(infoHash, 0x9e3779b9);
+        return (
+            (int)(hash % (ulong)_bucketCount),
+            (int)(hash2 % (ulong)_bucketCount)
+        );
+    }
+
+    private ushort Fingerprint(string infoHash)
+    {
+        var h = (uint)infoHash.GetHashCode();
+        h ^= (uint)(infoHash.Length * 0x9e3779b9);
+        h *= 0x85ebca6b;
+        h ^= h >> 13;
+        h *= 0xc2b2ae35;
+        h ^= h >> 16;
+
+        var fp = (ushort)(h & 0xFFFF);
+        if (fp == 0) fp = 1;
+        return fp;
+    }
+
+    public void Dispose()
+    {
+    }
+}

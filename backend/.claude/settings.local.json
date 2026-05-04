@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(dotnet --version)",
+      "Bash(dotnet new *)",
+      "Bash(mkdir -p src)",
+      "Bash(dotnet sln *)",
+      "Bash(dotnet add *)",
+      "Bash(dotnet build *)",
+      "Bash(taskkill /F /IM Cherry.Api.exe)",
+      "Bash(taskkill /F /IM dotnet.exe)",
+      "Bash(dotnet tool *)"
+    ]
+  }
+}
