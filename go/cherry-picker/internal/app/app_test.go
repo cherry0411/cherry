@@ -64,3 +64,29 @@ func TestNormalizeMetadataPrefersUTF8AndAggregatesFiles(t *testing.T) {
 		t.Fatalf("first path = %q, want sorted utf-8 path", metadata.Files[0].PathText)
 	}
 }
+
+func TestNormalizeMetadataSingleFile(t *testing.T) {
+	data := []byte(dht.Encode(map[string]interface{}{
+		"name":         "ubuntu-24.04-desktop-amd64.iso",
+		"length":       4865957888,
+		"piece length": 262144,
+		"pieces":       "fake-hash-data",
+	}))
+
+	metadata, err := normalizeMetadata(data)
+	if err != nil {
+		t.Fatalf("normalizeMetadata() error = %v", err)
+	}
+	if metadata.FileCount != 1 {
+		t.Fatalf("FileCount = %d, want 1", metadata.FileCount)
+	}
+	if len(metadata.Files) != 1 {
+		t.Fatalf("len(Files) = %d, want 1", len(metadata.Files))
+	}
+	if metadata.Files[0].PathText != "ubuntu-24.04-desktop-amd64.iso" {
+		t.Fatalf("PathText = %q", metadata.Files[0].PathText)
+	}
+	if metadata.Files[0].Length != 4865957888 {
+		t.Fatalf("File.Length = %d, want 4865957888", metadata.Files[0].Length)
+	}
+}
