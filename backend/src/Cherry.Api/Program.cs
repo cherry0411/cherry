@@ -6,6 +6,7 @@ using Cherry.Infrastructure.Dedup;
 using Cherry.Infrastructure.Repositories;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.OpenApi;
+using Npgsql;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -54,11 +55,18 @@ var app = builder.Build();
 await using (var scope = app.Services.CreateAsyncScope())
 {
     var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
-    if (db.Database.HasPendingModelChanges())
+    var pending = await db.Database.GetPendingMigrationsAsync();
+    if (pending.Any())
     {
-        await db.Database.MigrateAsync();
-        await db.Database.ExecuteSqlRawAsync("CREATE EXTENSION IF NOT EXISTS pg_trgm");
+        try { await db.Database.MigrateAsync(); }
+        catch (PostgresException ex) when (ex.SqlState == "42P07")
+        {
+            // Tables already exist from manual creation — record the migration
+            await db.Database.ExecuteSqlRawAsync(
+                $"INSERT INTO \"__EFMigrationsHistory\" VALUES ('{pending.Last()}', '10.0.0')");
+        }
     }
+    await db.Database.ExecuteSqlRawAsync("CREATE EXTENSION IF NOT EXISTS pg_trgm");
 }
 
 // CORS — allow independent frontend deployment
