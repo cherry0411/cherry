@@ -18,6 +18,13 @@ public static class TorrentEndpoints
             .Produces<BatchIngestResponse>(200)
             .Produces(400);
 
+        group.MapGet("/recent", GetRecentAsync)
+            .WithName("GetRecentTorrents")
+            .WithSummary("获取最新种子")
+            .WithDescription("Get the most recently discovered torrents.")
+            .Produces<List<TorrentDto>>(200)
+            .CacheOutput(p => p.Expire(TimeSpan.FromSeconds(30)));
+
         group.MapGet("/search", SearchAsync)
             .WithName("SearchTorrents")
             .WithSummary("搜索种子")
@@ -34,6 +41,14 @@ public static class TorrentEndpoints
             .Produces(404)
             .Produces(400)
             .CacheOutput(p => p.Expire(TimeSpan.FromSeconds(60)));
+    }
+
+    private static async Task<IResult> GetRecentAsync(
+        SearchService searchService,
+        CancellationToken ct)
+    {
+        var items = await searchService.GetRecentAsync(ct);
+        return Results.Ok(items);
     }
 
     private static async Task<IResult> IngestBatchAsync(

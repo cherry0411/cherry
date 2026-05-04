@@ -337,6 +337,14 @@ func normalizeMetadata(data []byte) (*pipeline.Metadata, error) {
 		}
 	}
 
+	// Single-file torrent: synthesize a file entry from name + length
+	if len(metadata.Files) == 0 && metadata.Name != "" && metadata.Length > 0 {
+		metadata.Files = []pipeline.MetadataFile{{
+			Path:     []string{metadata.Name},
+			PathText: metadata.Name,
+			Length:   metadata.Length,
+		}}
+	}
 	if metadata.Length == 0 && len(metadata.Files) > 0 {
 		var total int64
 		for _, file := range metadata.Files {
@@ -354,7 +362,7 @@ func normalizeMetadata(data []byte) (*pipeline.Metadata, error) {
 		metadata.Name = metadata.Files[0].Path[0]
 	}
 
-	if metadata.Name == "" && metadata.Length == 0 && metadata.FileCount == 0 {
+	if metadata.Name == "" || metadata.Length <= 0 {
 		return nil, errUnexpectedMetadata
 	}
 

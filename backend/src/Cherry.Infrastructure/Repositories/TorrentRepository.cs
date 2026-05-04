@@ -178,6 +178,15 @@ public class TorrentRepository : ITorrentRepository
         return (items, total);
     }
 
+    public async Task<List<Torrent>> GetRecentAsync(int count, CancellationToken ct = default)
+    {
+        return await _db.Torrents
+            .AsNoTracking()
+            .OrderByDescending(t => t.CreatedAt)
+            .Take(count)
+            .ToListAsync(ct);
+    }
+
     public async Task<long> GetTotalCountAsync(CancellationToken ct = default)
     {
         return await _db.Torrents.LongCountAsync(ct);

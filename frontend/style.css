@@ -38,6 +38,8 @@ a:hover { color: var(--accent-hover); }
 }
 .logo { font-size: 1.15rem; font-weight: 600; color: var(--text); white-space: nowrap; }
 .logo:hover { color: var(--text); opacity: .7; text-decoration: none; }
+.nav-link { font-size: .88rem; color: var(--text-dim); font-weight: 500; }
+.nav-link:hover { color: var(--text); text-decoration: none; }
 .nav-search { display: flex; flex: 1; max-width: 440px; margin: 0 auto; }
 .search-input {
     flex: 1; padding: 7px 14px; background: var(--bg); border: 1px solid var(--border);

@@ -35,6 +35,21 @@ public class SearchService
         return new SearchResponse(dtos, total, request.Page, request.PageSize);
     }
 
+    public async Task<List<TorrentDto>> GetRecentAsync(CancellationToken ct = default)
+    {
+        var items = await _repo.GetRecentAsync(100, ct);
+        return items.Select(t => new TorrentDto(
+            InfoHash: t.InfoHash,
+            MagnetLink: $"magnet:?xt=urn:btih:{t.InfoHash}",
+            Name: t.Name,
+            TotalLength: t.TotalLength,
+            FileCount: t.FileCount,
+            IsPrivate: t.IsPrivate,
+            CreatedAt: t.CreatedAt,
+            Files: null
+        )).ToList();
+    }
+
     public async Task<TorrentDto?> GetDetailAsync(string infoHash, CancellationToken ct = default)
     {
         var t = await _repo.GetByInfoHashAsync(infoHash.ToLowerInvariant(), ct);

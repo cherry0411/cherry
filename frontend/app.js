@@ -22,6 +22,8 @@ var dict = {
         stats_today: '今日新增',
         stats_cache: '内存缓存',
         stats_date: '服务器日期',
+        nav_recent: '最新',
+        recent_title: '最近新增',
         recent_searches: '最近搜索',
         results_for: '结果',
         found: '找到',
@@ -80,6 +82,8 @@ var dict = {
         stats_today: 'Discovered Today',
         stats_cache: 'Memory Cache',
         stats_date: 'Server Date',
+        nav_recent: 'Recent',
+        recent_title: 'Recently Added',
         recent_searches: 'Recent Searches',
         results_for: 'Results for',
         found: 'found',
@@ -490,12 +494,58 @@ var DetailPage = {
     }
 };
 
+var RecentPage = {
+    template: '\
+<div>\
+    <h2 style="font-size:1.15rem;font-weight:600;margin-bottom:14px;">{{ T("recent_title") }}</h2>\
+    <div v-if="loading">\
+        <div class="skel-card" v-for="_ in 5"><div class="skeleton skel-line long"></div><div class="skeleton skel-line mid"></div><div class="skeleton skel-line short"></div></div>\
+    </div>\
+    <div v-else-if="error" class="error-state"><p>{{ error }}</p><button class="btn-retry" @click="fetchData">{{ T("retry") }}</button></div>\
+    <div v-else class="result-list">\
+        <div v-for="item in items" :key="item.infoHash" class="result-card" @click="$router.push(\'/torrent/\' + item.infoHash)">\
+            <div class="result-top">\
+                <div class="result-icon">{{ catInfo(item.name).icon }}</div>\
+                <div class="result-body">\
+                    <div class="result-name">{{ item.name }}</div>\
+                    <div class="result-tags">\
+                        <span v-if="catInfo(item.name).cat" class="tag tag-cat">{{ catInfo(item.name).cat }}</span>\
+                        <span class="tag tag-size">{{ fmtSize(item.totalLength) }}</span>\
+                        <span v-if="item.fileCount>1" class="tag tag-files">{{ item.fileCount }} files</span>\
+                        <span v-if="item.isPrivate" class="tag tag-private">{{ T("private_torrent") }}</span>\
+                    </div>\
+                </div>\
+            </div>\
+            <div class="result-footer">\
+                <span>{{ fmtRelative(item.createdAt) }} &middot; <span class="result-hash">{{ item.infoHash.slice(0,12) }}...</span></span>\
+                <button class="result-copy" @click.stop="copyMagnet(item)">🧲 {{ T("copy_magnet") }}</button>\
+            </div>\
+        </div>\
+    </div>\
+</div>',
+    data: function(){ return { items:[], loading:true, error:'' }; },
+    mounted: function(){ this.fetchData(); },
+    methods: {
+        T:T, fmtSize:fmtSize, fmtRelative:fmtRelative, catInfo:detectCategory,
+        fetchData: function(){
+            var self=this; self.loading=true;
+            fetch(API+'/api/v1/torrents/recent')
+                .then(function(r){if(!r.ok)throw new Error('Failed');return r.json();})
+                .then(function(d){self.items=d||[];})
+                .catch(function(e){self.error=e.message;})
+                .finally(function(){self.loading=false;});
+        },
+        copyMagnet: function(item){ copyText(magnetLink(item.infoHash,item.name), T('link_copied')); }
+    }
+};
+
 // ---- Router ----
 var router = VueRouter.createRouter({
     history: VueRouter.createWebHistory(),
     routes:[
         { path:'/', component:HomePage },
         { path:'/search', component:SearchPage },
+        { path:'/recent', component:RecentPage },
         { path:'/torrent/:infoHash', component:DetailPage }
     ]
 });
@@ -505,28 +555,14 @@ var App = {
     template: '\
 <nav class="topbar">\
     <a href="/" class="logo">🍒 Cherry</a>\
-    <div class="nav-search">\
-        <input type="text" class="search-input" :placeholder="T(\'search_placeholder\')" v-model="q" @keydown.enter="doSearch" ref="navInput" />\
-        <button class="btn-search" @click="doSearch">{{ T("search_btn") }}</button>\
-    </div>\
+    <a href="/recent" class="nav-link">{{ T("nav_recent") }}</a>\
+    <span style="flex:1;"></span>\
     <span class="lang-switch" @click="switchLang" :title="lang==\'zh\'?\'Switch to English\':\'切换到中文\'">{{ T("lang_label") }}</span>\
 </nav>\
 <main class="main"><router-view /></main>',
-    data: function(){ return { q:'', lang:lang }; },
-    watch: { '$route.query.q': function(v){ if(v) this.q = v; } },
-    mounted: function(){
-        var self=this;
-        document.addEventListener('keydown',function(e){
-            if ((e.ctrlKey||e.metaKey) && e.key==='k') {
-                e.preventDefault();
-                self.$refs.navInput && self.$refs.navInput.focus();
-                self.$refs.navInput && self.$refs.navInput.select();
-            }
-        });
-    },
+    data: function(){ return { lang:lang }; },
     methods: {
-        T:T, switchLang:switchLang,
-        doSearch: function(){ var q=this.q.trim(); if(!q)return; saveHistory(q); this.$router.push({path:'/search',query:{q:q}}); }
+        T:T, switchLang:switchLang
     }
 };
 
