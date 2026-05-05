@@ -39,7 +39,7 @@ var handshakePrefix = []byte{
 
 // read reads size-length bytes from conn to data.
 func read(conn *net.TCPConn, size int, data *bytes.Buffer) error {
-	conn.SetReadDeadline(time.Now().Add(time.Second * 15))
+	conn.SetReadDeadline(time.Now().Add(time.Second * 4))
 
 	n, err := io.CopyN(data, conn, int64(size))
 	if err != nil || n != int64(size) {
@@ -74,7 +74,7 @@ func sendMessage(conn *net.TCPConn, data []byte) error {
 	buffer := bytes.NewBuffer(nil)
 	binary.Write(buffer, binary.BigEndian, length)
 
-	conn.SetWriteDeadline(time.Now().Add(time.Second * 10))
+	conn.SetWriteDeadline(time.Now().Add(time.Second * 3))
 	_, err := conn.Write(append(buffer.Bytes(), data...))
 	return err
 }
@@ -86,7 +86,7 @@ func sendHandshake(conn *net.TCPConn, infoHash, peerID []byte) error {
 	copy(data[28:48], infoHash)
 	copy(data[48:], peerID)
 
-	conn.SetWriteDeadline(time.Now().Add(time.Second * 10))
+	conn.SetWriteDeadline(time.Now().Add(time.Second * 3))
 	_, err := conn.Write(data)
 	return err
 }
@@ -245,7 +245,7 @@ func (wire *Wire) fetchMetadata(r Request) {
 	infoHash := r.InfoHash
 	address := genAddress(r.IP, r.Port)
 
-	dial, err := net.DialTimeout("tcp", address, time.Second*15)
+	dial, err := net.DialTimeout("tcp", address, time.Second*4)
 	if err != nil {
 		wire.blackList.insert(r.IP, r.Port)
 		return
