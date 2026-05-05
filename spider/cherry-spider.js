@@ -17,20 +17,42 @@ var CONFIG = {
 };
 
 var API_BATCH_URL = CONFIG.apiUrl + '/api/v1/torrents/batch';
+var API_CHECK_URL = CONFIG.apiUrl + '/api/v1/torrents/check';
 
 // Use Set for O(1) dedup
 var processed = new Set();
+var remoteKnown = new Set();  // exists on main API — skip download entirely
 var dedupMax = CONFIG.dedupSize;
 var batch = [];
+var checkQueue = [];          // pending API checks
+var checkTimer = 0;
 var httpAgent = new http.Agent({ keepAlive: true, maxSockets: 4 });
 
 var stats = {
     metadata_ok: 0, metadata_fail: 0, exported: 0, export_fail: 0,
-    dedup_hits: 0, startTime: Date.now(),
+    dedup_hits: 0, remote_hits: 0, remote_checks: 0, startTime: Date.now(),
 };
 
 function log(msg) {
     console.log('[spider:' + CONFIG.port + '] ' + new Date().toISOString() + ' ' + msg);
+}
+
+function flushCheckQueue() {
+    if (checkQueue.length === 0) return;
+    var hashes = checkQueue.splice(0, 100).map(function (h) { return h.hash; });
+    var url = API_CHECK_URL + '?hashes=' + hashes.join(',');
+    http.get(url, { agent: httpAgent, timeout: 5000 }, function (res) {
+        var body = '';
+        res.on('data', function (d) { body += d; });
+        res.on('end', function () {
+            try {
+                var existing = JSON.parse(body);
+                existing.forEach(function (h) { remoteKnown.add(h); });
+                stats.remote_hits += existing.length;
+                stats.remote_checks += hashes.length;
+            } catch (e) {}
+        });
+    }).on('error', function () {});
 }
 
 function sendBatch() {
@@ -83,6 +105,7 @@ function logStats() {
     var bw = elapsed > 0 ? Math.floor(stats.metadata_ok / 60) : 0;
     log('rate ok=' + stats.metadata_ok + ' fail=' + stats.metadata_fail +
         ' export=' + stats.exported + ' dedup=' + processed.size + '/' + dedupMax +
+        ' remote=' + stats.remote_hits + '/' + stats.remote_checks +
         ' dh/s=' + dhr + ' cpu=' + os.loadavg()[0].toFixed(1));
 }
 
@@ -93,16 +116,24 @@ var p2p = P2PSpider({
 });
 
 p2p.ignore(function (infohash, rinfo, callback) {
-    if (processed.has(infohash)) {
+    if (processed.has(infohash) || remoteKnown.has(infohash)) {
         stats.dedup_hits++;
         callback(true);
-    } else {
-        callback(false);
+        return;
     }
-    // Rotate: clear oldest half when full
+    callback(false);
+    processed.add(infohash);
+    // Queue for remote check — if API already has it, future hits skip download
+    checkQueue.push({ hash: infohash });
+    if (checkQueue.length >= 50) flushCheckQueue();
+
     if (processed.size > dedupMax) {
         var keys = Array.from(processed).slice(0, Math.floor(dedupMax / 2));
         keys.forEach(function (k) { processed.delete(k); });
+    }
+    if (remoteKnown.size > dedupMax) {
+        var rkeys = Array.from(remoteKnown).slice(0, Math.floor(dedupMax / 2));
+        rkeys.forEach(function (k) { remoteKnown.delete(k); });
     }
 });
 
@@ -155,6 +186,7 @@ p2p.on('metadata', function (metadata) {
 });
 
 setInterval(sendBatch, CONFIG.flushInterval);
+setInterval(flushCheckQueue, 2000);   // flush pending checks every 2s
 setInterval(logStats, 30000);
 
 p2p.listen(CONFIG.port, CONFIG.address);

@@ -35,6 +35,9 @@ public class SearchService
         return new SearchResponse(dtos, total, request.Page, request.PageSize);
     }
 
+    public async Task<List<string>> CheckExistsAsync(List<string> hashes, CancellationToken ct)
+        => await _repo.CheckExistsAsync(hashes, ct);
+
     public async Task<List<TorrentDto>> GetRecentAsync(CancellationToken ct = default)
     {
         var items = await _repo.GetRecentAsync(100, ct);

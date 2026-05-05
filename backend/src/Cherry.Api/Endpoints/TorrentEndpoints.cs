@@ -18,6 +18,13 @@ public static class TorrentEndpoints
             .Produces<BatchIngestResponse>(200)
             .Produces(400);
 
+        group.MapGet("/check", CheckExistsAsync)
+            .WithName("CheckExists")
+            .WithSummary("批量检查info_hash是否存在")
+            .WithDescription("Given ?hashes=a1,b2,c3, returns which hashes already exist in the database.")
+            .Produces<List<string>>(200)
+            .CacheOutput(p => p.Expire(TimeSpan.FromSeconds(5)));
+
         group.MapGet("/recent", GetRecentAsync)
             .WithName("GetRecentTorrents")
             .WithSummary("获取最新种子")
@@ -41,6 +48,28 @@ public static class TorrentEndpoints
             .Produces(404)
             .Produces(400)
             .CacheOutput(p => p.Expire(TimeSpan.FromSeconds(60)));
+    }
+
+    private static async Task<IResult> CheckExistsAsync(
+        HttpContext http,
+        SearchService searchService,
+        CancellationToken ct)
+    {
+        var hashesParam = http.Request.Query["hashes"].ToString();
+        if (string.IsNullOrWhiteSpace(hashesParam))
+            return Results.BadRequest("?hashes=a1,b2,c3 required");
+
+        var hashes = hashesParam.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Select(h => h.ToLowerInvariant())
+            .Where(h => h.Length == 40)
+            .Distinct()
+            .Take(100)
+            .ToList();
+
+        if (hashes.Count == 0) return Results.Ok(new List<string>());
+
+        var existing = await searchService.CheckExistsAsync(hashes, ct);
+        return Results.Ok(existing);
     }
 
     private static async Task<IResult> GetRecentAsync(

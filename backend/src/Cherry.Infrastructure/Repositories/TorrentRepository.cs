@@ -178,6 +178,16 @@ public class TorrentRepository : ITorrentRepository
         return (items, total);
     }
 
+    public async Task<List<string>> CheckExistsAsync(List<string> hashes, CancellationToken ct = default)
+    {
+        if (hashes.Count == 0) return new List<string>();
+        return await _db.Torrents
+            .AsNoTracking()
+            .Where(t => hashes.Contains(t.InfoHash))
+            .Select(t => t.InfoHash)
+            .ToListAsync(ct);
+    }
+
     public async Task<List<Torrent>> GetRecentAsync(int count, CancellationToken ct = default)
     {
         return await _db.Torrents
