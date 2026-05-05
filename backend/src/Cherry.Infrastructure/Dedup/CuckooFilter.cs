@@ -1,3 +1,4 @@
+using System.IO.Compression;
 using Cherry.Domain.Interfaces;
 
 namespace Cherry.Infrastructure.Dedup;
@@ -5,17 +6,58 @@ namespace Cherry.Infrastructure.Dedup;
 public class CuckooFilter : IDedupFilter, IDisposable
 {
     private readonly int _bucketCount;
-    private readonly ulong[] _buckets; // 4 slots per bucket, 16-bit per slot, packed in ulong
+    private readonly ulong[] _buckets;
     private long _count;
     private readonly int _maxKicks = 500;
+    private readonly string? _persistPath;
 
     public long Count => Volatile.Read(ref _count);
 
-    /// <param name="capacity">Expected number of unique items</param>
-    public CuckooFilter(long capacity = 100_000_000)
+    public CuckooFilter(long capacity = 100_000_000, string? persistPath = null)
     {
         _bucketCount = (int)(capacity / 4) + 1;
         _buckets = new ulong[_bucketCount];
+        _persistPath = persistPath;
+        if (persistPath != null) Load();
+    }
+
+    public void Save()
+    {
+        if (_persistPath == null) return;
+        try
+        {
+            var dir = Path.GetDirectoryName(_persistPath);
+            if (dir != null) Directory.CreateDirectory(dir);
+            var tmp = _persistPath + ".tmp";
+            using var fs = new FileStream(tmp, FileMode.Create, FileAccess.Write);
+            using var gz = new GZipStream(fs, CompressionLevel.Fastest);
+            using var bw = new BinaryWriter(gz);
+            bw.Write(_bucketCount);
+            bw.Write(Volatile.Read(ref _count));
+            var buf = new byte[_bucketCount * sizeof(ulong)];
+            Buffer.BlockCopy(_buckets, 0, buf, 0, buf.Length);
+            bw.Write(buf);
+            File.Move(tmp, _persistPath, overwrite: true);
+        }
+        catch { }
+    }
+
+    private void Load()
+    {
+        if (_persistPath == null || !File.Exists(_persistPath)) return;
+        try
+        {
+            using var fs = new FileStream(_persistPath, FileMode.Open, FileAccess.Read);
+            using var gz = new GZipStream(fs, CompressionMode.Decompress);
+            using var br = new BinaryReader(gz);
+            var count = br.ReadInt32();
+            if (count != _bucketCount) return;
+            _count = br.ReadInt64();
+            var buf = br.ReadBytes(_bucketCount * sizeof(ulong));
+            if (buf.Length == _buckets.Length * sizeof(ulong))
+                Buffer.BlockCopy(buf, 0, _buckets, 0, buf.Length);
+        }
+        catch { }
     }
 
     public bool MightContain(string infoHash)

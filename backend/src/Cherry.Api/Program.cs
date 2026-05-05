@@ -24,7 +24,9 @@ builder.Services.AddDbContextPool<AppDbContext>(options =>
 }, poolSize: 64);
 
 // Core services
-builder.Services.AddSingleton<IDedupFilter>(_ => new CuckooFilter(capacity: 100_000_000));
+var dedupPath = Path.Combine(builder.Environment.ContentRootPath, "cuckoo.dat");
+var dedup = new CuckooFilter(capacity: 100_000_000, persistPath: dedupPath);
+builder.Services.AddSingleton<IDedupFilter>(dedup);
 builder.Services.AddScoped<ITorrentRepository, TorrentRepository>();
 builder.Services.AddScoped<SearchService>();
 builder.Services.AddScoped<StatsService>();
@@ -50,6 +52,9 @@ builder.Services.AddSwaggerGen(options =>
 });
 
 var app = builder.Build();
+
+// Persist CuckooFilter on graceful shutdown
+app.Lifetime.ApplicationStopping.Register(() => dedup.Save());
 
 // Auto-apply EF Core migrations and ensure pg_trgm extension
 await using (var scope = app.Services.CreateAsyncScope())

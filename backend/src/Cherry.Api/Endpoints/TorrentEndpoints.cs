@@ -1,5 +1,6 @@
 using Cherry.Application.Dtos;
 using Cherry.Application.Services;
+using Cherry.Domain.Interfaces;
 using Microsoft.AspNetCore.Mvc;
 
 namespace Cherry.Api.Endpoints;
@@ -50,25 +51,19 @@ public static class TorrentEndpoints
             .CacheOutput(p => p.Expire(TimeSpan.FromSeconds(60)));
     }
 
-    private static async Task<IResult> CheckExistsAsync(
+    private static IResult CheckExistsAsync(
         HttpContext http,
-        SearchService searchService,
-        CancellationToken ct)
+        IDedupFilter dedup)
     {
         var hashesParam = http.Request.Query["hashes"].ToString();
         if (string.IsNullOrWhiteSpace(hashesParam))
             return Results.BadRequest("?hashes=a1,b2,c3 required");
 
-        var hashes = hashesParam.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+        var existing = hashesParam.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
             .Select(h => h.ToLowerInvariant())
-            .Where(h => h.Length == 40)
-            .Distinct()
-            .Take(100)
+            .Where(h => h.Length == 40 && dedup.MightContain(h))
             .ToList();
 
-        if (hashes.Count == 0) return Results.Ok(new List<string>());
-
-        var existing = await searchService.CheckExistsAsync(hashes, ct);
         return Results.Ok(existing);
     }
 
