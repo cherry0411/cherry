@@ -281,10 +281,16 @@ func (a *Application) roleBehavior() roleBehavior {
 
 func (a *Application) consumeMetadata(ctx context.Context, downloader *dht.Wire, events chan<- pipeline.Event, stats *runtimeStats, seen *seenSet) {
 	responses := downloader.Response()
+	var ok, fail uint64
+	logTicker := time.NewTicker(30 * time.Second)
+	defer logTicker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
+		case <-logTicker.C:
+			a.logger.Printf("metadata download: ok=%d fail=%d (30s)", ok, fail)
+			ok, fail = 0, 0
 		case response := <-responses:
 			infoHashHex := hex.EncodeToString(response.InfoHash)
 			responseKey := strings.Join([]string{infoHashHex, response.IP, strconv.Itoa(response.Port)}, "|")
@@ -305,6 +311,8 @@ func (a *Application) consumeMetadata(ctx context.Context, downloader *dht.Wire,
 			}
 			if err != nil {
 				event.Error = err.Error()
+				stats.metadataEventsDeduped.Add(1)
+				continue
 			}
 			a.submitEvent(events, event, stats.metadataEventsDropped.Add, stats.metadataEventsSent.Add)
 		}
