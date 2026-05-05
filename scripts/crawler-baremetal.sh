@@ -33,10 +33,14 @@ export CHERRY_PICKER_EXPORTER_RETRY_BACKOFF="1s"
 PID_DIR="$WORKDIR/pids"
 mkdir -p "$PID_DIR"
 
+GO_BIN=/usr/local/go/bin/go
+
 build() {
     echo "Building crawler..."
-    cd "$(dirname "$0")/../go/cherry-picker"
-    go build -o "$WORKDIR/cherry-picker" ./cmd/cherry-picker
+    local src_dir
+    src_dir="$(cd "$(dirname "$0")/../go/cherry-picker" && pwd)"
+    cd "$src_dir"
+    $GO_BIN build -buildvcs=false -o "$WORKDIR/cherry-picker" ./cmd/cherry-picker
     echo "Built: $WORKDIR/cherry-picker"
 }
 
