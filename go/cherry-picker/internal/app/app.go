@@ -1,7 +1,6 @@
 package app
 
 import (
-	"bytes"
 	"context"
 	"encoding/hex"
 	"encoding/json"
@@ -55,35 +54,27 @@ func New(cfg config.Config, logger *log.Logger) *Application {
 	return &Application{cfg: cfg, logger: logger}
 }
 
-type brokerPeer struct {
-	InfoHash string `json:"info_hash"`
-	IP       string `json:"ip"`
-	Port     int    `json:"port"`
-}
+var apiClient = &http.Client{Timeout: 10 * time.Second}
 
-var brokerClient = &http.Client{Timeout: 5 * time.Second}
+// remoteKnown stores hashes the main API confirmed it already has.
+var remoteKnown sync.Map
 
-func pushPeersToBroker(brokerURL string, peers []brokerPeer) {
-	if len(peers) == 0 {
+func checkBatchExists(apiURL string, hashes []string) {
+	if len(hashes) == 0 {
 		return
 	}
-	body, _ := json.Marshal(peers)
-	resp, err := brokerClient.Post(brokerURL+"/push", "application/json", bytes.NewReader(body))
+	url := apiURL + "/api/v1/torrents/check?hashes=" + strings.Join(hashes, ",")
+	resp, err := apiClient.Get(url)
 	if err != nil {
 		return
-	}
-	resp.Body.Close()
-}
-
-func pullPeersFromBroker(brokerURL string) []brokerPeer {
-	resp, err := brokerClient.Get(brokerURL + "/pull")
-	if err != nil {
-		return nil
 	}
 	defer resp.Body.Close()
-	var peers []brokerPeer
-	json.NewDecoder(resp.Body).Decode(&peers)
-	return peers
+	var found []string
+	if json.NewDecoder(resp.Body).Decode(&found) == nil {
+		for _, h := range found {
+			remoteKnown.Store(h, true)
+		}
+	}
 }
 
 func (a *Application) Run(ctx context.Context) error {
@@ -94,78 +85,43 @@ func (a *Application) Run(ctx context.Context) error {
 	}
 
 	exporter := export.NewBatchExporter(a.logger, sink, a.cfg.Exporter.BatchSize, a.cfg.Exporter.FlushInterval, events)
-	go func() {
-		if err := exporter.Run(ctx); err != nil {
-			a.logger.Printf("exporter stopped with error: %v", err)
-		}
-	}()
+	go func() { _ = exporter.Run(ctx) }()
 
 	stats := &runtimeStats{}
-	behavior := a.roleBehavior()
-	useBroker := a.cfg.BrokerURL != ""
 	infohashSeen := newSeenSet(a.cfg.Dedupe.PeerTTL)
 	peerSeen := newSeenSet(a.cfg.Dedupe.PeerTTL)
 
-	// Discovery mode with broker: collect peers and periodically push
-	var brokerBuf []brokerPeer
-	var brokerMu sync.Mutex
-	brokerFlush := func() {
-		brokerMu.Lock()
-		if len(brokerBuf) == 0 {
-			brokerMu.Unlock()
-			return
+	// Pre-check queue: batch-check hashes with main API before downloading
+	checkQueue := make(chan string, 4096)
+	go func() {
+		ticker := time.NewTicker(2 * time.Second)
+		defer ticker.Stop()
+		buf := make([]string, 0, 100)
+		for {
+			select {
+			case <-ctx.Done():
+				checkBatchExists(a.cfg.Exporter.HTTPEndpoint, buf)
+				return
+			case h := <-checkQueue:
+				buf = append(buf, h)
+				if len(buf) >= 50 {
+					checkBatchExists(a.cfg.Exporter.HTTPEndpoint, buf)
+					buf = buf[:0]
+				}
+			case <-ticker.C:
+				checkBatchExists(a.cfg.Exporter.HTTPEndpoint, buf)
+				buf = buf[:0]
+			}
 		}
-		batch := brokerBuf
-		brokerBuf = nil
-		brokerMu.Unlock()
-		pushPeersToBroker(a.cfg.BrokerURL, batch)
-	}
+	}()
 
 	var downloader *dht.Wire
 	metadataRequestSeen := newSeenSet(a.cfg.Dedupe.MetadataTTL)
 	metadataResultSeen := newSeenSet(a.cfg.Dedupe.MetadataTTL)
-	if behavior.fetchMetadata {
-		downloader = dht.NewWire(a.cfg.Metadata.BlackListSize, a.cfg.Metadata.RequestQueueSize, a.cfg.Metadata.WorkerQueueSize)
-		go a.consumeMetadata(ctx, downloader, events, stats, metadataResultSeen)
-		go downloader.Run()
-		a.logger.Printf("metadata workers enabled: blacklist=%d queue=%d workers=%d", a.cfg.Metadata.BlackListSize, a.cfg.Metadata.RequestQueueSize, a.cfg.Metadata.WorkerQueueSize)
-
-		// Metadata mode with broker: poll broker for peers
-		if useBroker {
-			go func() {
-				ticker := time.NewTicker(500 * time.Millisecond)
-				defer ticker.Stop()
-				for {
-					select {
-					case <-ctx.Done():
-						return
-					case <-ticker.C:
-						peers := pullPeersFromBroker(a.cfg.BrokerURL)
-						for _, p := range peers {
-							a.queueMetadataRequest(downloader, p.InfoHash, p.IP, p.Port, metadataRequestSeen, stats)
-						}
-					}
-				}
-			}()
-		}
-	}
-
-	// Discovery mode: flush broker buffer periodically
-	if useBroker && behavior.emitPeerEvents {
-		go func() {
-			ticker := time.NewTicker(time.Second)
-			defer ticker.Stop()
-			for {
-				select {
-				case <-ctx.Done():
-					brokerFlush()
-					return
-				case <-ticker.C:
-					brokerFlush()
-				}
-			}
-		}()
-	}
+	downloader = dht.NewWire(a.cfg.Metadata.BlackListSize, a.cfg.Metadata.RequestQueueSize, a.cfg.Metadata.WorkerQueueSize)
+	go a.consumeMetadata(ctx, downloader, events, stats, metadataResultSeen)
+	go downloader.Run()
+	a.logger.Printf("metadata workers: %d, queue: %d", a.cfg.Metadata.WorkerQueueSize, a.cfg.Metadata.RequestQueueSize)
 
 	dhtConfig := dht.NewCrawlConfig()
 	if a.cfg.Discovery.Mode == "standard" {
@@ -182,38 +138,26 @@ func (a *Application) Run(ctx context.Context) error {
 	}
 	dhtConfig.OnGetPeersResponse = func(infoHash string, peer *dht.Peer) {
 		infoHashHex := hex.EncodeToString([]byte(infoHash))
-		if useBroker && behavior.emitPeerEvents {
-			brokerMu.Lock()
-			brokerBuf = append(brokerBuf, brokerPeer{InfoHash: infoHashHex, IP: peer.IP.String(), Port: peer.Port})
-			brokerMu.Unlock()
-		} else if behavior.emitPeerEvents {
+		if a.cfg.Role != "metadata" {
 			a.submitPeerEvent(events, infoHashHex, peer.IP.String(), peer.Port, "get_peers_response", peerSeen, stats)
 		}
-		if downloader != nil && !useBroker {
-			a.queueMetadataRequest(downloader, infoHashHex, peer.IP.String(), peer.Port, metadataRequestSeen, stats)
-		}
+		a.queueMetadataRequest(downloader, infoHashHex, peer.IP.String(), peer.Port, metadataRequestSeen, stats, checkQueue)
 	}
 	dhtConfig.OnAnnouncePeer = func(infoHash, ip string, port int) {
 		infoHashHex := hex.EncodeToString([]byte(infoHash))
-		if useBroker && behavior.emitPeerEvents {
-			brokerMu.Lock()
-			brokerBuf = append(brokerBuf, brokerPeer{InfoHash: infoHashHex, IP: ip, Port: port})
-			brokerMu.Unlock()
-		} else if behavior.emitPeerEvents {
+		if a.cfg.Role != "metadata" {
 			a.submitPeerEvent(events, infoHashHex, ip, port, "announce_peer", peerSeen, stats)
 		}
-		if downloader != nil && !useBroker {
-			a.queueMetadataRequest(downloader, infoHashHex, ip, port, metadataRequestSeen, stats)
-		}
+		a.queueMetadataRequest(downloader, infoHashHex, ip, port, metadataRequestSeen, stats, checkQueue)
 	}
 
 	node := dht.New(dhtConfig)
 	go a.emitStats(ctx, events, stats, node)
 	go node.Run()
-	a.logger.Printf("crawler started: role=%s instance=%s listen=%s broker=%s mode=%s", a.cfg.Role, a.cfg.InstanceID, a.cfg.ListenAddr, a.cfg.BrokerURL, a.cfg.Discovery.Mode)
+	a.logger.Printf("started: instance=%s udp=%s workers=%d nodes=%d", a.cfg.InstanceID, a.cfg.ListenAddr, a.cfg.Metadata.WorkerQueueSize, a.cfg.Discovery.MaxNodes)
 
 	<-ctx.Done()
-	a.logger.Printf("shutdown requested")
+	a.logger.Printf("shutdown")
 	return nil
 }
 
@@ -252,9 +196,15 @@ func (a *Application) submitPeerEvent(events chan<- pipeline.Event, infoHashHex,
 	}, stats.peerEventsDropped.Add, stats.peerEventsSent.Add)
 }
 
-func (a *Application) queueMetadataRequest(downloader *dht.Wire, infoHashHex, ip string, port int, seen *seenSet, stats *runtimeStats) {
+func (a *Application) queueMetadataRequest(downloader *dht.Wire, infoHashHex, ip string, port int, seen *seenSet, stats *runtimeStats, checkQueue chan string) {
 	requestKey := strings.Join([]string{infoHashHex, ip, strconv.Itoa(port)}, "|")
 	if seen.Seen(requestKey) {
+		stats.metadataRequestsDeduped.Add(1)
+		return
+	}
+
+	// Skip if remote API already has this infohash — save the TCP download
+	if _, ok := remoteKnown.Load(infoHashHex); ok {
 		stats.metadataRequestsDeduped.Add(1)
 		return
 	}
@@ -262,6 +212,12 @@ func (a *Application) queueMetadataRequest(downloader *dht.Wire, infoHashHex, ip
 	infoHashBytes, err := hex.DecodeString(infoHashHex)
 	if err != nil {
 		return
+	}
+
+	// Queue for remote check — next time the same hash will be skipped
+	select {
+	case checkQueue <- infoHashHex:
+	default:
 	}
 
 	stats.metadataRequestsQueued.Add(1)
