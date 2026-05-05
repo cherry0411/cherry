@@ -2,7 +2,6 @@ FROM mcr.microsoft.com/dotnet/sdk:10.0 AS build
 WORKDIR /source
 
 # Layer 1: copy project files and restore (cached unless csproj changes)
-COPY NuGet.config ./
 COPY Cherry.slnx ./
 COPY src/Cherry.Domain/Cherry.Domain.csproj src/Cherry.Domain/
 COPY src/Cherry.Application/Cherry.Application.csproj src/Cherry.Application/
