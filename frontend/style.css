@@ -120,6 +120,7 @@ a:hover { color: var(--accent-hover); }
 .tag-size { background: #ecf9f0; color: var(--green); }
 .tag-files { background: #f3f0fa; color: var(--purple); }
 .tag-private { background: #fef8e7; color: var(--yellow); }
+.tag-health { background: var(--green-bg); color: var(--green); }
 
 .result-footer { display: flex; justify-content: space-between; align-items: center; font-size: .74rem; color: var(--text-muted); margin-top: 3px; }
 .result-hash { font-family: "SF Mono","Fira Code",monospace; font-size: .7rem; color: var(--text-muted); }

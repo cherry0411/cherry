@@ -306,6 +306,7 @@ var SearchPage = {
                         <span v-if="catInfo(item.name).cat" class="tag tag-cat">{{ catInfo(item.name).cat }}</span>\
                         <span class="tag tag-size">{{ fmtSize(item.totalLength) }}</span>\
                         <span v-if="item.fileCount>1" class="tag tag-files">{{ item.fileCount }} files</span>\
+                        <span v-if="item.peerCount>0" class="tag tag-health">{{ item.peerCount }} peers</span>
                         <span v-if="item.isPrivate" class="tag tag-private">{{ T("private_torrent") }}</span>\
                     </div>\
                 </div>\
@@ -394,6 +395,7 @@ var DetailPage = {
             <div class="detail-title-area">\
                 <div class="detail-title">{{ torrent.name }}</div>\
                 <div class="detail-subtitle">\
+                    <span v-if="torrent.peerCount>0" class="tag tag-health">{{ torrent.peerCount }} peers</span>\
                     <span>{{ fmtRelative(torrent.createdAt) }}</span>\
                     <span v-if="torrent.isPrivate" class="tag tag-private">{{ T("private_torrent") }}</span>\
                     <span v-if="catInfo(torrent.name).cat" class="tag tag-cat">{{ catInfo(torrent.name).cat }}</span>\
@@ -512,6 +514,7 @@ var RecentPage = {
                         <span v-if="catInfo(item.name).cat" class="tag tag-cat">{{ catInfo(item.name).cat }}</span>\
                         <span class="tag tag-size">{{ fmtSize(item.totalLength) }}</span>\
                         <span v-if="item.fileCount>1" class="tag tag-files">{{ item.fileCount }} files</span>\
+                        <span v-if="item.peerCount>0" class="tag tag-health">{{ item.peerCount }} peers</span>
                         <span v-if="item.isPrivate" class="tag tag-private">{{ T("private_torrent") }}</span>\
                     </div>\
                 </div>\
