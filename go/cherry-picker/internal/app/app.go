@@ -59,11 +59,19 @@ var apiClient = &http.Client{Timeout: 10 * time.Second}
 // remoteKnown stores hashes the main API confirmed it already has.
 var remoteKnown sync.Map
 
-func checkBatchExists(apiURL string, hashes []string) {
+func baseURL(exporterURL string) string {
+	// Strip /api/v1/... suffix from exporter URL to get base
+	if idx := strings.Index(exporterURL, "/api/"); idx > 0 {
+		return exporterURL[:idx]
+	}
+	return exporterURL
+}
+
+func checkBatchExists(apiBase string, hashes []string) {
 	if len(hashes) == 0 {
 		return
 	}
-	url := apiURL + "/api/v1/torrents/check?hashes=" + strings.Join(hashes, ",")
+	url := apiBase + "/api/v1/torrents/check?hashes=" + strings.Join(hashes, ",")
 	resp, err := apiClient.Get(url)
 	if err != nil {
 		return
@@ -100,16 +108,16 @@ func (a *Application) Run(ctx context.Context) error {
 		for {
 			select {
 			case <-ctx.Done():
-				checkBatchExists(a.cfg.Exporter.HTTPEndpoint, buf)
+				checkBatchExists(baseURL(a.cfg.Exporter.HTTPEndpoint), buf)
 				return
 			case h := <-checkQueue:
 				buf = append(buf, h)
 				if len(buf) >= 50 {
-					checkBatchExists(a.cfg.Exporter.HTTPEndpoint, buf)
+					checkBatchExists(baseURL(a.cfg.Exporter.HTTPEndpoint), buf)
 					buf = buf[:0]
 				}
 			case <-ticker.C:
-				checkBatchExists(a.cfg.Exporter.HTTPEndpoint, buf)
+				checkBatchExists(baseURL(a.cfg.Exporter.HTTPEndpoint), buf)
 				buf = buf[:0]
 			}
 		}
