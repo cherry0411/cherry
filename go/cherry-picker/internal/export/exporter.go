@@ -83,6 +83,8 @@ func (be *BatchExporter) Run(ctx context.Context) error {
 		defer cancel()
 		if err := be.sink.WriteBatch(flushCtx, batch); err != nil {
 			be.logger.Printf("export batch failed: %v", err)
+			} else {
+				be.logger.Printf("export: %d events sent", len(batch))
 		}
 		batch = batch[:0]
 	}

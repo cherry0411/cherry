@@ -6,7 +6,12 @@
       "Bash(go test *)",
       "Bash(dotnet ef *)",
       "Bash(dotnet tool install *)",
-      "Bash(go mod *)"
+      "Bash(go mod *)",
+      "Bash(sed -i 's/ticker := time.NewTicker\\(500/pollTicker := time.NewTicker\\(500/' internal/app/app.go)",
+      "Bash(sed -i 's/defer ticker.Stop\\(\\)/defer pollTicker.Stop\\(\\)/' internal/app/app.go)",
+      "Bash(sed -i 's/case <-ticker.C:/case <-pollTicker.C:/' internal/app/app.go)",
+      "Bash(git checkout *)",
+      "Bash(python3 -c ' *)"
     ]
   }
 }
