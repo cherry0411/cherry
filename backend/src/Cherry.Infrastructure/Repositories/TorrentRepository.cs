@@ -169,11 +169,16 @@ public class TorrentRepository : ITorrentRepository
 
         var total = await baseQuery.LongCountAsync(ct);
 
-        // Ranking: hot torrents first, then relevant new ones
+        // Ranking: relevance × popularity
+        // Tier 3: relevant + popular; Tier 2: relevant; Tier 1: popular; Tier 0: rest
         var items = await baseQuery
-            .OrderByDescending(t => t.PeerCount >= 50 ? 2 : t.PeerCount > 0 ? 1 : 0)
+            .OrderByDescending(t =>
+                (EF.Functions.TrigramsSimilarityDistance(t.Name, query) < 0.7 && t.PeerCount > 10) ? 3
+                : EF.Functions.TrigramsSimilarityDistance(t.Name, query) < 0.7 ? 2
+                : t.PeerCount > 10 ? 1
+                : 0)
             .ThenByDescending(t => t.PeerCount)
-            .ThenByDescending(t => t.CreatedAt)
+            .ThenBy(t => EF.Functions.TrigramsSimilarityDistance(t.Name, query))
             .Skip((page - 1) * pageSize)
             .Take(pageSize)
             .ToListAsync(ct);
