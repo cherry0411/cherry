@@ -306,7 +306,7 @@ var SearchPage = {
                         <span v-if="catInfo(item.name).cat" class="tag tag-cat">{{ catInfo(item.name).cat }}</span>\
                         <span class="tag tag-size">{{ fmtSize(item.totalLength) }}</span>\
                         <span v-if="item.fileCount>1" class="tag tag-files">{{ item.fileCount }} files</span>\
-                        <span v-if="item.peerCount>0" class="tag tag-health">{{ item.peerCount }} peers</span>
+                        <span v-if="item.peerCount>0" class="tag tag-health">{{ item.peerCount }} peers</span>\
                         <span v-if="item.isPrivate" class="tag tag-private">{{ T("private_torrent") }}</span>\
                     </div>\
                 </div>\
@@ -514,7 +514,7 @@ var RecentPage = {
                         <span v-if="catInfo(item.name).cat" class="tag tag-cat">{{ catInfo(item.name).cat }}</span>\
                         <span class="tag tag-size">{{ fmtSize(item.totalLength) }}</span>\
                         <span v-if="item.fileCount>1" class="tag tag-files">{{ item.fileCount }} files</span>\
-                        <span v-if="item.peerCount>0" class="tag tag-health">{{ item.peerCount }} peers</span>
+                        <span v-if="item.peerCount>0" class="tag tag-health">{{ item.peerCount }} peers</span>\
                         <span v-if="item.isPrivate" class="tag tag-private">{{ T("private_torrent") }}</span>\
                     </div>\
                 </div>\
