@@ -1,89 +1,52 @@
 #!/usr/bin/env bash
-# Cherry JS Spider Manager
+# Cherry JS Spider — PM2 launcher
 set -e
-
-WORKDIR="$(cd "$(dirname "$0")" && pwd)"
-PID_DIR="$WORKDIR/pids"
-LOG_DIR="$WORKDIR/logs"
-mkdir -p "$PID_DIR" "$LOG_DIR"
-
-NODES=6
-START_PORT=20003
-MAIN_API="${SPIDER_API_URL:-http://CHANGE-ME}"
-PREFIX="${SPIDER_INSTANCE_PREFIX:-js}"
-
-start_one() {
-    local i=$1 port=$2
-    local id="${PREFIX}-${i}"
-    local pidfile="$PID_DIR/spider-${i}.pid"
-    local logfile="$LOG_DIR/spider-${i}.log"
-
-    if [ -f "$pidfile" ] && kill -0 "$(cat "$pidfile")" 2>/dev/null; then
-        echo "  spider-${i} already running (PID $(cat "$pidfile"))"
-        return
-    fi
-
-    SPIDER_PORT="$port" \
-    SPIDER_ADDRESS="0.0.0.0" \
-    SPIDER_API_URL="$MAIN_API" \
-    SPIDER_INSTANCE_ID="$id" \
-    SPIDER_MAX_CONN="${SPIDER_MAX_CONN:-600}" \
-    SPIDER_MAX_NODES="${SPIDER_MAX_NODES:-5000}" \
-    SPIDER_TIMEOUT="${SPIDER_TIMEOUT:-5000}" \
-    SPIDER_DEDUP_SIZE="${SPIDER_DEDUP_SIZE:-200000}" \
-    nohup node "$WORKDIR/cherry-spider.js" >> "$logfile" 2>&1 &
-    echo $! > "$pidfile"
-    echo "  Started spider-${i} ($id) UDP :$port (PID $!)"
-}
-
-stop_one() {
-    local i=$1
-    local pidfile="$PID_DIR/spider-${i}.pid"
-    if [ -f "$pidfile" ]; then
-        local pid=$(cat "$pidfile")
-        if kill -0 "$pid" 2>/dev/null; then
-            kill "$pid" && echo "  Stopped spider-${i} (PID $pid)"
-        fi
-        rm -f "$pidfile"
-    fi
-}
-
-start() {
-    echo "=== Starting $NODES spider nodes ($(node -v)) ==="
-    for i in $(seq 1 $NODES); do
-        start_one "$i" $((START_PORT + i - 1))
-    done
-}
-
-stop() {
-    echo "Stopping..."
-    for i in $(seq 1 $NODES); do stop_one "$i"; done
-}
-
-status() {
-    for i in $(seq 1 $NODES); do
-        local pidfile="$PID_DIR/spider-${i}.pid"
-        if [ -f "$pidfile" ] && kill -0 "$(cat "$pidfile")" 2>/dev/null; then
-            echo "spider-${i} : RUNNING (PID $(cat "$pidfile")) UDP :$((START_PORT + i - 1))"
-        else
-            echo "spider-${i} : STOPPED"
-        fi
-    done
-    echo ""
-    echo "=== Recent logs ==="
-    for i in $(seq 1 $NODES); do
-        local lf="$LOG_DIR/spider-${i}.log"
-        [ -f "$lf" ] && echo "--- spider-${i} ---" && tail -4 "$lf"
-    done
-}
-
-logs() { tail -f "$LOG_DIR/spider-${1:-1}.log"; }
+cd "$(dirname "$0")"
+mkdir -p logs
 
 case "${1:-start}" in
-    start)  start ;;
-    stop)   stop ;;
-    restart) stop; start ;;
-    status) status ;;
-    logs)   logs "$2" ;;
-    *)      echo "Usage: $0 {start|stop|restart|status|logs [N]}" ;;
+    install-pm2)
+        npm install -g pm2
+        ;;
+
+    start)
+        pm2 start ecosystem.config.js
+        pm2 save
+        echo "Spider started. Commands: pm2 status, pm2 logs, pm2 monit"
+        ;;
+
+    stop)
+        pm2 stop spider
+        ;;
+
+    restart)
+        pm2 reload ecosystem.config.js
+        ;;
+
+    delete)
+        pm2 delete spider
+        ;;
+
+    status)
+        pm2 status
+        pm2 jlist 2>/dev/null | node -e "var d=JSON.parse(require('fs').readFileSync('/dev/stdin','utf8')); d.forEach(function(p){console.log(p.name+':'+p.pm2_env.SPIDER_PORT+' pid='+p.pid+' status='+p.pm2_env.status+' uptime='+Math.floor(p.pm2_env.pm_uptime/1000)+'s mem='+Math.floor(p.monit.memory/1024/1024)+'MB cpu='+p.monit.cpu+'%');})" 2>/dev/null || true
+        ;;
+
+    logs)
+        pm2 logs spider ${2:---lines 50}
+        ;;
+
+    flush)
+        pm2 flush
+        ;;
+
+    startup)
+        pm2 startup
+        pm2 save
+        echo "PM2 will auto-start on boot. Run 'pm2 unstartup' to disable."
+        ;;
+
+    *)
+        echo "Usage: $0 {install-pm2|start|stop|restart|delete|status|logs|flush|startup}"
+        ;;
 esac
