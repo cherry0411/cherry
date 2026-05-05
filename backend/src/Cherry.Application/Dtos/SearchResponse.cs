@@ -24,4 +24,7 @@ public record TorrentFileDto(
     long Length
 );
 
-public record TorrentRequestDto(string InfoHash);
+public record TorrentRequestDto
+{
+    public string InfoHash { get; init; } = string.Empty;
+}
