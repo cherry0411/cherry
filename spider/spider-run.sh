@@ -2,7 +2,7 @@
 # Cherry JS Spider — PM2 launcher
 set -e
 cd "$(dirname "$0")"
-mkdir -p logs
+mkdir -p logs 2>/dev/null || true
 
 case "${1:-start}" in
     install-pm2)
