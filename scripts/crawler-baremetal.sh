@@ -5,7 +5,7 @@ set -e
 WORKDIR="/opt/cherry-crawler"
 PID_DIR="$WORKDIR/pids"
 LOG_DIR="$WORKDIR/logs"
-GO_BIN=/usr/local/go/bin
+GO_BIN=/usr/local/go/bin/go
 mkdir -p "$PID_DIR" "$LOG_DIR"
 
 NODES_DISCOVERY=4   # DHT sniffing only (lightweight)
