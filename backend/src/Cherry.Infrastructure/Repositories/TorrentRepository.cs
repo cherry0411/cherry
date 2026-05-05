@@ -169,14 +169,23 @@ public class TorrentRepository : ITorrentRepository
 
         var total = await baseQuery.LongCountAsync(ct);
 
+        // Ranking: hot torrents first, then relevant new ones
         var items = await baseQuery
-            .OrderByDescending(t => t.PeerCount)
+            .OrderByDescending(t => t.PeerCount >= 50 ? 2 : t.PeerCount > 0 ? 1 : 0)
+            .ThenByDescending(t => t.PeerCount)
             .ThenByDescending(t => t.CreatedAt)
             .Skip((page - 1) * pageSize)
             .Take(pageSize)
             .ToListAsync(ct);
 
         return (items, total);
+    }
+
+    public async Task DecayPeerCountsAsync(CancellationToken ct = default)
+    {
+        await _db.Torrents
+            .Where(t => t.PeerCount > 0 && t.PeerUpdatedAt < DateTime.UtcNow.AddDays(-7))
+            .ExecuteUpdateAsync(s => s.SetProperty(t => t.PeerCount, t => t.PeerCount / 2), ct);
     }
 
     public async Task BatchUpdatePeerCountsAsync(Dictionary<string, int> counts, CancellationToken ct = default)

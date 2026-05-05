@@ -209,8 +209,16 @@ p2p.on('metadata', function (metadata) {
 
 setInterval(sendBatch, CONFIG.flushInterval);
 setInterval(flushCheckQueue, 2000);
-setInterval(flushPeerCounts, 60000);   // push peer counts every 60s
+setInterval(flushPeerCounts, 60000);
 setInterval(logStats, 30000);
+
+// Daily decay: POST /api/v1/torrents/decay-peers (runs once per 24h)
+setInterval(function () {
+    var url = new URL(CONFIG.apiUrl + '/api/v1/torrents/decay-peers');
+    var req = http.request({ hostname: url.hostname, port: url.port, path: url.pathname, method: 'POST', agent: httpAgent, timeout: 5000 }, function (res) { res.resume(); });
+    req.on('error', function () {});
+    req.end();
+}, 86400000);
 
 p2p.listen(CONFIG.port, CONFIG.address);
 log('started maxConn=' + CONFIG.maxConnections + ' maxNodes=' + CONFIG.nodesMaxSize + ' dedup=' + dedupMax + ' api=' + CONFIG.apiUrl);

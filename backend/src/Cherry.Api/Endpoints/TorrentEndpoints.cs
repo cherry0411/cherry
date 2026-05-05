@@ -19,6 +19,12 @@ public static class TorrentEndpoints
             .Produces<BatchIngestResponse>(200)
             .Produces(400);
 
+        group.MapPost("/decay-peers", DecayPeerCountsAsync)
+            .WithName("DecayPeerCounts")
+            .WithSummary("衰减过期peer计数")
+            .WithDescription("Halves peer_count for torrents not updated in 7 days.")
+            .Produces(200);
+
         group.MapPost("/peers", UpdatePeerCountsAsync)
             .WithName("UpdatePeerCounts")
             .WithSummary("批量更新peer计数")
@@ -55,6 +61,14 @@ public static class TorrentEndpoints
             .Produces(404)
             .Produces(400)
             .CacheOutput(p => p.Expire(TimeSpan.FromSeconds(60)));
+    }
+
+    private static async Task<IResult> DecayPeerCountsAsync(
+        ITorrentRepository repo,
+        CancellationToken ct)
+    {
+        await repo.DecayPeerCountsAsync(ct);
+        return Results.Ok(new { decayed = true });
     }
 
     private static async Task<IResult> UpdatePeerCountsAsync(
