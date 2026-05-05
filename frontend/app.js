@@ -401,7 +401,14 @@ var DetailPage = {
         <div class="skel-card"><div class="skeleton skel-line" style="width:70%;height:22px;margin-bottom:12px;"></div><div class="skeleton skel-line mid"></div><div class="skeleton skel-line short"></div></div>\
     </div>\
 \
-    <div v-else-if="error" class="error-state"><p>{{ error }}</p><button class="btn-retry" @click="loadDetail">{{ T("retry") }}</button></div>\
+    <div v-else-if="error" class="error-state">\
+    <p>⚠ {{ error }}</p>\
+    <p style="font-size:.82rem;color:var(--text-dim);margin-bottom:12px;">You can manually upload the .torrent file:</p>\
+    <input type="file" accept=".torrent" @change="uploadTorrent" ref="fileInput" style="margin-bottom:8px;" />\
+    <span v-if="uploading" style="font-size:.8rem;color:var(--text-dim);">Uploading...</span>\
+    <span v-if="uploadResult" style="font-size:.8rem;color:var(--green);">{{ uploadResult }}</span>\
+    <button class="btn-retry" @click="loadDetail" style="margin-left:8px;">{{ T("retry") }}</button>\
+</div>\
 \
     <div v-else>\
         <div class="detail-hero">\
@@ -465,7 +472,7 @@ var DetailPage = {
         </div>\
     </div>\
 </div>',
-    data: function(){ return { torrent:{}, loading:true, error:'', copied:false, fileFilter:'', filePage:1, filePageSize:50, sortBy:'', sortAsc:true }; },
+    data: function(){ return { torrent:{}, loading:true, error:'', copied:false, uploading:false, uploadResult:'', fileFilter:'', filePage:1, filePageSize:50, sortBy:'', sortAsc:true }; },
     computed: {
         magnet: function(){ return magnetLink(this.torrent.infoHash, this.torrent.name); },
         allFiles: function(){ return (this.torrent.files||[]).slice(0,500); },
@@ -503,6 +510,22 @@ var DetailPage = {
         },
         copyMagnet: function(){ var self=this; copyText(this.magnet, T('link_copied')); self.copied=true; setTimeout(function(){self.copied=false;},2000); },
         copyHash: function(){ copyText(this.torrent.infoHash, T('hash_copied')); },
+        uploadTorrent: function(e){
+            var self = this;
+            var f = e.target.files[0];
+            if (!f) return;
+            self.uploading = true; self.uploadResult = '';
+            var fd = new FormData();
+            fd.append('file', f);
+            fetch(API + '/api/v1/torrents/upload', { method: 'POST', body: fd })
+                .then(function(r){ return r.ok ? r.json() : r.json().then(function(e){ throw new Error(e.detail || 'Upload failed'); }); })
+                .then(function(d){
+                    if (d.status === 'duplicate') self.uploadResult = 'Already in database';
+                    else { self.uploadResult = 'Added! Reloading...'; setTimeout(function(){ window.location.reload(); }, 1000); }
+                })
+                .catch(function(e){ self.uploadResult = 'Error: ' + e.message; })
+                .finally(function(){ self.uploading = false; });
+        },
         sortFiles: function(field){
             if (this.sortBy === field) { this.sortAsc = !this.sortAsc; }
             else { this.sortBy = field; this.sortAsc = true; }

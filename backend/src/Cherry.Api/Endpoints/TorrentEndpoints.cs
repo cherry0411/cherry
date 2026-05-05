@@ -1,5 +1,7 @@
+using System.Text;
 using Cherry.Application.Dtos;
 using Cherry.Application.Services;
+using Cherry.Domain.Entities;
 using Cherry.Domain.Interfaces;
 using Microsoft.AspNetCore.Mvc;
 
@@ -18,6 +20,14 @@ public static class TorrentEndpoints
             .WithDescription("Receive torrent metadata batch from crawlers. Each event contains info_hash and metadata including file list.")
             .Produces<BatchIngestResponse>(200)
             .Produces(400);
+
+        group.MapPost("/upload", UploadTorrentAsync)
+            .WithName("UploadTorrent")
+            .WithSummary("上传.torrent文件手动入库")
+            .WithDescription("Upload a .torrent file, parse metadata, and save to the database.")
+            .Produces<TorrentDto>(200)
+            .Produces(400)
+            .DisableAntiforgery();
 
         group.MapPost("/decay-peers", DecayPeerCountsAsync)
             .WithName("DecayPeerCounts")
@@ -61,6 +71,163 @@ public static class TorrentEndpoints
             .Produces(404)
             .Produces(400)
             .CacheOutput(p => p.Expire(TimeSpan.FromSeconds(60)));
+    }
+
+    private static async Task<IResult> UploadTorrentAsync(
+        HttpRequest request,
+        ITorrentRepository repo,
+        IDedupFilter dedup,
+        CancellationToken ct)
+    {
+        if (!request.HasFormContentType || request.Form.Files.Count == 0)
+            return Results.BadRequest("Upload a .torrent file");
+
+        var file = request.Form.Files[0];
+        using var ms = new MemoryStream();
+        await file.CopyToAsync(ms, ct);
+        var data = ms.ToArray();
+        var info = ParseTorrentInfo(data);
+        if (info is null)
+            return Results.BadRequest("Invalid torrent file");
+
+        var infoHash = ComputeInfoHash(data);
+        if (!dedup.Add(infoHash))
+            return Results.Ok(new { info_hash = infoHash, status = "duplicate" });
+
+        var name = info.GetValueOrDefault("name.utf-8") as byte[] ?? info.GetValueOrDefault("name") as byte[];
+        if (name is null) return Results.BadRequest("No name in torrent");
+        var nameStr = Encoding.UTF8.GetString(name).Trim();
+        var length = Convert.ToInt64(info.GetValueOrDefault("length", 0L));
+        var pieceLength = Convert.ToInt64(info.GetValueOrDefault("piece length", 0L));
+        var files = new List<TorrentFile>();
+        var totalLen = length;
+
+        if (info.TryGetValue("files", out var fileList) && fileList is List<object> fl)
+        {
+            totalLen = 0;
+            foreach (var fobj in fl)
+            {
+                if (fobj is not Dictionary<string, object> fd) continue;
+                var fbytes = fd.GetValueOrDefault("path.utf-8") as List<object>
+                    ?? fd.GetValueOrDefault("path") as List<object>;
+                if (fbytes is null) continue;
+                var fpath = string.Join("/", fbytes.Select(p => Encoding.UTF8.GetString((byte[])p)));
+                var flen = Convert.ToInt64(fd.GetValueOrDefault("length", 0L));
+                if (string.IsNullOrEmpty(fpath) || fpath.Contains("_____padding_file_")) continue;
+                files.Add(new TorrentFile { PathText = fpath, Length = flen });
+                totalLen += flen;
+            }
+        }
+        else if (length > 0)
+        {
+            files.Add(new TorrentFile { PathText = nameStr, Length = length });
+        }
+
+        if (files.Count == 0 || string.IsNullOrEmpty(nameStr))
+            return Results.BadRequest("No valid files in torrent");
+
+        var torrents = new List<Torrent>
+        {
+            new()
+            {
+                InfoHash = infoHash,
+                Name = nameStr,
+                PieceLength = (int)pieceLength,
+                TotalLength = totalLen,
+                FileCount = files.Count,
+                Source = "upload",
+                Files = files
+            }
+        };
+        await repo.BulkInsertTorrentsAsync(torrents, ct);
+        return Results.Ok(new { info_hash = infoHash, name = nameStr, files = files.Count, status = "added" });
+    }
+
+    private static string ComputeInfoHash(byte[] torrentData)
+    {
+        var infoStart = FindInfoDict(torrentData);
+        var infoBytes = torrentData[infoStart..];
+        var raw = infoBytes[1..^1]; // strip 'd' and 'e'
+        return Convert.ToHexString(System.Security.Cryptography.SHA1.HashData(raw)).ToLowerInvariant();
+    }
+
+    private static int FindInfoDict(byte[] data)
+    {
+        for (var i = 0; i < data.Length - 4; i++)
+            if (data[i] == '4' && data[i + 1] == ':' && data[i + 2] == 'i' && data[i + 3] == 'n' && data[i + 4] == 'f' && data[i + 5] == 'o')
+                return i + 6;
+        return -1;
+    }
+
+    private static Dictionary<string, object>? ParseTorrentInfo(byte[] data)
+    {
+        var idx = FindInfoDict(data);
+        if (idx < 0) return null;
+        var result = BDecode(data, idx, out _);
+        return result as Dictionary<string, object>;
+    }
+
+    private static object? BDecode(byte[] data, int pos, out int end)
+    {
+        end = pos;
+        if (pos >= data.Length) return null;
+        return data[pos] switch
+        {
+            (byte)'d' => ParseDict(data, pos, out end),
+            (byte)'l' => ParseList(data, pos, out end),
+            (byte)'i' => ParseInt(data, pos, out end),
+            >= (byte)'0' and <= (byte)'9' => ParseString(data, pos, out end),
+            _ => null
+        };
+    }
+
+    private static Dictionary<string, object>? ParseDict(byte[] data, int pos, out int end)
+    {
+        var dict = new Dictionary<string, object>();
+        pos++; // skip 'd'
+        while (pos < data.Length && data[pos] != 'e')
+        {
+            var key = ParseString(data, pos, out pos);
+            if (key is null) break;
+            var val = BDecode(data, pos, out pos);
+            if (val is not null) dict[Encoding.UTF8.GetString(key)] = val;
+        }
+        end = pos < data.Length ? pos + 1 : pos; // skip 'e'
+        return dict;
+    }
+
+    private static List<object>? ParseList(byte[] data, int pos, out int end)
+    {
+        var list = new List<object>();
+        pos++;
+        while (pos < data.Length && data[pos] != 'e')
+        {
+            var val = BDecode(data, pos, out pos);
+            if (val is not null) list.Add(val);
+        }
+        end = pos < data.Length ? pos + 1 : pos;
+        return list;
+    }
+
+    private static long? ParseInt(byte[] data, int pos, out int end)
+    {
+        pos++; // skip 'i'
+        end = Array.IndexOf(data, (byte)'e', pos);
+        if (end < 0) return null;
+        var str = Encoding.ASCII.GetString(data, pos, end - pos);
+        end++;
+        return long.TryParse(str, out var v) ? v : null;
+    }
+
+    private static byte[]? ParseString(byte[] data, int pos, out int end)
+    {
+        end = pos;
+        var colon = Array.IndexOf(data, (byte)':', pos);
+        if (colon < 0) return null;
+        if (!int.TryParse(Encoding.ASCII.GetString(data, pos, colon - pos), out var len)) return null;
+        end = colon + 1 + len;
+        if (end > data.Length) return null;
+        return data[(colon + 1)..end];
     }
 
     private static async Task<IResult> DecayPeerCountsAsync(
