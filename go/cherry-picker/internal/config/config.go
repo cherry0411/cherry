@@ -10,14 +10,17 @@ import (
 )
 
 type Config struct {
-	Role       string
-	InstanceID string
-	ListenAddr string
-	EventQueue int
-	Dedupe     DedupeConfig
-	Discovery  DiscoveryConfig
-	Metadata   MetadataConfig
-	Exporter   ExporterConfig
+	Role          string
+	InstanceID    string
+	ListenAddr    string
+	EventQueue    int
+	BrokerURL     string
+	Dedupe        DedupeConfig
+	Discovery     DiscoveryConfig
+	Metadata      MetadataConfig
+	Exporter      ExporterConfig
+	AutoTune      bool
+	TargetCPU     float64
 }
 
 type DedupeConfig struct {
@@ -69,6 +72,9 @@ func Load() (Config, error) {
 		InstanceID: instanceID,
 		ListenAddr: getenvDefault("CHERRY_PICKER_LISTEN_ADDR", ":6881"),
 		EventQueue: getenvInt("CHERRY_PICKER_EVENT_QUEUE", 4096),
+		BrokerURL:  getenvDefault("CHERRY_PICKER_BROKER_URL", ""),
+		AutoTune:   getenvBool("CHERRY_PICKER_AUTO_TUNE", false),
+		TargetCPU:  float64(getenvInt("CHERRY_PICKER_TARGET_CPU", 80)) / 100.0,
 		Dedupe: DedupeConfig{
 			PeerTTL:     getenvDuration("CHERRY_PICKER_DEDUPE_PEER_TTL", 10*time.Minute),
 			MetadataTTL: getenvDuration("CHERRY_PICKER_DEDUPE_METADATA_TTL", 30*time.Minute),
