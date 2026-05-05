@@ -11,7 +11,9 @@
       "Bash(sed -i 's/defer ticker.Stop\\(\\)/defer pollTicker.Stop\\(\\)/' internal/app/app.go)",
       "Bash(sed -i 's/case <-ticker.C:/case <-pollTicker.C:/' internal/app/app.go)",
       "Bash(git checkout *)",
-      "Bash(python3 -c ' *)"
+      "Bash(python3 -c ' *)",
+      "Bash(git commit *)",
+      "Bash(git push *)"
     ]
   }
 }

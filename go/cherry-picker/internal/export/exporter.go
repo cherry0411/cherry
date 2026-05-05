@@ -159,6 +159,7 @@ type httpSink struct {
 	url          string
 	retries      int
 	retryBackoff time.Duration
+	logger       *log.Logger
 }
 
 func (s *httpSink) WriteBatch(ctx context.Context, batch []pipeline.Event) error {
@@ -182,10 +183,18 @@ func (s *httpSink) WriteBatch(ctx context.Context, batch []pipeline.Event) error
 
 		response, err := s.client.Do(request)
 		if err == nil {
-			response.Body.Close()
 			if response.StatusCode < 300 {
+				var result struct {
+					Accepted   int `json:"accepted"`
+					Duplicates int `json:"duplicates"`
+					Errors     int `json:"errors"`
+				}
+				json.NewDecoder(response.Body).Decode(&result)
+				response.Body.Close()
+				log.Printf("api response: %d accepted, %d duplicates, %d errors", result.Accepted, result.Duplicates, result.Errors)
 				return nil
 			}
+			response.Body.Close()
 			lastErr = fmt.Errorf("http exporter returned status %s", response.Status)
 		} else {
 			lastErr = err
