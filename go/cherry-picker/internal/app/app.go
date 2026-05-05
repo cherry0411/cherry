@@ -1,6 +1,7 @@
 package app
 
 import (
+	"bytes"
 	"context"
 	"encoding/hex"
 	"encoding/json"
@@ -58,6 +59,7 @@ var apiClient = &http.Client{Timeout: 10 * time.Second}
 
 // remoteKnown stores hashes the main API confirmed it already has.
 var remoteKnown sync.Map
+var peerCounts sync.Map // infohash → count of repeat sightings
 
 func baseURL(exporterURL string) string {
 	// Strip /api/v1/... suffix from exporter URL to get base
@@ -65,6 +67,24 @@ func baseURL(exporterURL string) string {
 		return exporterURL[:idx]
 	}
 	return exporterURL
+}
+
+func flushPeerCountsToAPI(apiBase string) {
+	counts := make(map[string]int)
+	peerCounts.Range(func(key, val interface{}) bool {
+		counts[key.(string)] = val.(int)
+		peerCounts.Delete(key)
+		return true
+	})
+	if len(counts) == 0 {
+		return
+	}
+	body, _ := json.Marshal(map[string]interface{}{"hashes": counts})
+	resp, err := apiClient.Post(apiBase+"/api/v1/torrents/peers", "application/json", bytes.NewReader(body))
+	if err != nil {
+		return
+	}
+	resp.Body.Close()
 }
 
 func checkBatchExists(apiBase string, hashes []string) {
@@ -164,6 +184,21 @@ func (a *Application) Run(ctx context.Context) error {
 	go node.Run()
 	a.logger.Printf("started: instance=%s udp=%s workers=%d nodes=%d", a.cfg.InstanceID, a.cfg.ListenAddr, a.cfg.Metadata.WorkerQueueSize, a.cfg.Discovery.MaxNodes)
 
+	// Periodic peer count flush
+	go func() {
+		ticker := time.NewTicker(60 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				flushPeerCountsToAPI(baseURL(a.cfg.Exporter.HTTPEndpoint))
+				return
+			case <-ticker.C:
+				flushPeerCountsToAPI(baseURL(a.cfg.Exporter.HTTPEndpoint))
+			}
+		}
+	}()
+
 	<-ctx.Done()
 	a.logger.Printf("shutdown")
 	return nil
@@ -208,12 +243,16 @@ func (a *Application) queueMetadataRequest(downloader *dht.Wire, infoHashHex, ip
 	requestKey := strings.Join([]string{infoHashHex, ip, strconv.Itoa(port)}, "|")
 	if seen.Seen(requestKey) {
 		stats.metadataRequestsDeduped.Add(1)
+		val, _ := peerCounts.LoadOrStore(infoHashHex, 0)
+		peerCounts.Store(infoHashHex, val.(int)+1)
 		return
 	}
 
-	// Skip if remote API already has this infohash — save the TCP download
+	// Skip if remote API already has this infohash — save the TCP download, count as peer sighting
 	if _, ok := remoteKnown.Load(infoHashHex); ok {
 		stats.metadataRequestsDeduped.Add(1)
+		val, _ := peerCounts.LoadOrStore(infoHashHex, 0)
+		peerCounts.Store(infoHashHex, val.(int)+1)
 		return
 	}
 
