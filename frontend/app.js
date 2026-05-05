@@ -250,6 +250,10 @@ var HomePage = {
             <input class="search-input" :placeholder="T(\'hero_input_placeholder\')" v-model="q" @keydown.enter="goSearch" ref="heroInput" />\
             <button class="btn-search" @click="goSearch">{{ T("search_btn") }}</button>\
         </div>\
+        <div style="margin-top:14px;font-size:.8rem;color:var(--text-muted);">\
+            <input class="search-input" style="max-width:320px;display:inline-block;padding:6px 12px;font-size:.8rem;font-family:monospace;" placeholder="Or paste info_hash..." v-model="hashInput" @keydown.enter="lookupHash" />\
+            <button class="btn-search" style="padding:6px 14px;font-size:.8rem;display:inline-block;" @click="lookupHash">Lookup</button>\
+        </div>\
         <div v-if="history.length" class="search-history">\
             <span v-for="h in history" :key="h" class="history-chip" @click="goHistory(h)">{{ h }}</span>\
         </div>\
@@ -270,7 +274,7 @@ var HomePage = {
     </div>\
     <div class="footer">{{ T("press_ctrl_k") }}</div>\
 </div>',
-    data: function(){ return { stats:{}, done:false, q:'', history:loadHistory() }; },
+    data: function(){ return { stats:{}, done:false, q:'', hashInput:'', history:loadHistory() }; },
     mounted: function(){
         var self = this;
         this.$refs.heroInput && this.$refs.heroInput.focus();
@@ -279,7 +283,17 @@ var HomePage = {
     methods: {
         T:T, fmtNumber:fmtNumber,
         goSearch: function(){ var q=this.q.trim(); if(q){saveHistory(q);this.$router.push({path:'/search',query:{q:q}});} },
-        goHistory: function(q){ this.q=q; saveHistory(q); this.$router.push({path:'/search',query:{q:q}}); }
+        goHistory: function(q){ this.q=q; saveHistory(q); this.$router.push({path:'/search',query:{q:q}}); },
+        lookupHash: function(){
+            var h = this.hashInput.trim().toLowerCase();
+            if (h.length === 40 && /^[a-f0-9]{40}$/.test(h)) {
+                this.$router.push('/torrent/' + h);
+            } else if (h.length === 40) {
+                alert('Invalid info_hash — must be 40 hex characters');
+            } else {
+                this.$router.push('/search?q=' + encodeURIComponent(h));
+            }
+        }
     }
 };
 
