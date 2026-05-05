@@ -1,3 +1,5 @@
+using System.Text.Json.Serialization;
+
 namespace Cherry.Application.Dtos;
 
 public record SearchResponse(
@@ -26,5 +28,6 @@ public record TorrentFileDto(
 
 public record TorrentRequestDto
 {
+    [JsonPropertyName("info_hash")]
     public string InfoHash { get; init; } = string.Empty;
 }

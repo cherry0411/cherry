@@ -290,8 +290,11 @@ public static class TorrentEndpoints
         if (hash.Length != 40 || !hash.All(c => c is >= 'a' and <= 'f' or >= '0' and <= '9'))
             return Results.BadRequest("Invalid info_hash");
 
-        if (db.TorrentRequests.Any(r => r.InfoHash == hash && r.Status == "pending"))
+        if (await db.TorrentRequests.AnyAsync(r => r.InfoHash == hash, cancellationToken: ct))
             return Results.Ok(new { status = "already_pending" });
+
+        if (await db.Torrents.AnyAsync(t => t.InfoHash == hash, ct))
+            return Results.Ok(new { status = "already_exists" });
 
         db.TorrentRequests.Add(new TorrentRequest { InfoHash = hash });
         await db.SaveChangesAsync(ct);
