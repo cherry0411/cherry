@@ -3,7 +3,9 @@ using Cherry.Application.Dtos;
 using Cherry.Application.Services;
 using Cherry.Domain.Entities;
 using Cherry.Domain.Interfaces;
+using Cherry.Infrastructure.Data;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.EntityFrameworkCore;
 
 namespace Cherry.Api.Endpoints;
 
@@ -28,6 +30,16 @@ public static class TorrentEndpoints
             .Produces<TorrentDto>(200)
             .Produces(400)
             .DisableAntiforgery();
+
+        group.MapPost("/request", RequestTorrentAsync)
+            .WithName("RequestTorrent")
+            .WithSummary("提交infohash到DHT抓取队列")
+            .WithDescription("Post {info_hash} to queue for DHT metadata fetch.");
+
+        group.MapGet("/pending", GetPendingRequestsAsync)
+            .WithName("GetPendingRequests")
+            .WithSummary("获取待抓取的infohash列表")
+            .WithDescription("Returns up to 10 pending infohashes for crawlers to fetch.");
 
         group.MapPost("/decay-peers", DecayPeerCountsAsync)
             .WithName("DecayPeerCounts")
@@ -228,6 +240,35 @@ public static class TorrentEndpoints
         end = colon + 1 + len;
         if (end > data.Length) return null;
         return data[(colon + 1)..end];
+    }
+
+    private static async Task<IResult> RequestTorrentAsync(
+        TorrentRequestDto dto,
+        AppDbContext db,
+        CancellationToken ct)
+    {
+        var hash = dto.InfoHash.ToLowerInvariant().Trim();
+        if (hash.Length != 40 || !hash.All(c => c is >= 'a' and <= 'f' or >= '0' and <= '9'))
+            return Results.BadRequest("Invalid info_hash");
+
+        if (db.TorrentRequests.Any(r => r.InfoHash == hash && r.Status == "pending"))
+            return Results.Ok(new { status = "already_pending" });
+
+        db.TorrentRequests.Add(new TorrentRequest { InfoHash = hash });
+        await db.SaveChangesAsync(ct);
+        return Results.Ok(new { status = "queued" });
+    }
+
+    private static async Task<IResult> GetPendingRequestsAsync(
+        AppDbContext db,
+        CancellationToken ct)
+    {
+        var pending = await db.TorrentRequests
+            .Where(r => r.Status == "pending")
+            .OrderBy(r => r.CreatedAt)
+            .Take(10)
+            .ToListAsync(ct);
+        return Results.Ok(pending.Select(r => r.InfoHash).ToList());
     }
 
     private static async Task<IResult> DecayPeerCountsAsync(

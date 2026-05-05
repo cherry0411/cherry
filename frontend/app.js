@@ -253,6 +253,8 @@ var HomePage = {
         <div style="margin-top:14px;font-size:.8rem;color:var(--text-muted);">\
             <input class="search-input" style="max-width:320px;display:inline-block;padding:6px 12px;font-size:.8rem;font-family:monospace;" placeholder="Or paste info_hash..." v-model="hashInput" @keydown.enter="lookupHash" />\
             <button class="btn-search" style="padding:6px 14px;font-size:.8rem;display:inline-block;" @click="lookupHash">Lookup</button>\
+            <button class="btn-copy" style="padding:5px 10px;font-size:.75rem;display:inline-block;vertical-align:middle;margin-left:4px;" @click="requestHash">DHT Fetch</button>\
+            <span v-if="hashStatus" style="display:block;margin-top:6px;font-size:.76rem;color:var(--accent);">{{ hashStatus }}</span>\
         </div>\
         <div v-if="history.length" class="search-history">\
             <span v-for="h in history" :key="h" class="history-chip" @click="goHistory(h)">{{ h }}</span>\
@@ -274,7 +276,7 @@ var HomePage = {
     </div>\
     <div class="footer">{{ T("press_ctrl_k") }}</div>\
 </div>',
-    data: function(){ return { stats:{}, done:false, q:'', hashInput:'', history:loadHistory() }; },
+    data: function(){ return { stats:{}, done:false, q:'', hashInput:'', hashStatus:'', history:loadHistory() }; },
     mounted: function(){
         var self = this;
         this.$refs.heroInput && this.$refs.heroInput.focus();
@@ -293,6 +295,27 @@ var HomePage = {
             } else {
                 this.$router.push('/search?q=' + encodeURIComponent(h));
             }
+        },
+        requestHash: function(){
+            var self = this;
+            var h = this.hashInput.trim().toLowerCase();
+            if (h.length !== 40 || !/^[a-f0-9]{40}$/.test(h)) {
+                alert('Enter a valid 40-char info_hash');
+                return;
+            }
+            self.hashStatus = 'Requesting...';
+            fetch(API + '/api/v1/torrents/request', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({info_hash: h})
+            })
+            .then(function(r){ return r.json(); })
+            .then(function(d){
+                if (d.status === 'already_pending') self.hashStatus = 'Already queued for DHT fetch';
+                else if (d.status === 'queued') self.hashStatus = 'Queued — crawler will find it soon';
+                else self.hashStatus = d.status;
+            })
+            .catch(function(){ self.hashStatus = 'Request failed'; });
         }
     }
 };
@@ -401,14 +424,7 @@ var DetailPage = {
         <div class="skel-card"><div class="skeleton skel-line" style="width:70%;height:22px;margin-bottom:12px;"></div><div class="skeleton skel-line mid"></div><div class="skeleton skel-line short"></div></div>\
     </div>\
 \
-    <div v-else-if="error" class="error-state">\
-    <p>⚠ {{ error }}</p>\
-    <p style="font-size:.82rem;color:var(--text-dim);margin-bottom:12px;">You can manually upload the .torrent file:</p>\
-    <input type="file" accept=".torrent" @change="uploadTorrent" ref="fileInput" style="margin-bottom:8px;" />\
-    <span v-if="uploading" style="font-size:.8rem;color:var(--text-dim);">Uploading...</span>\
-    <span v-if="uploadResult" style="font-size:.8rem;color:var(--green);">{{ uploadResult }}</span>\
-    <button class="btn-retry" @click="loadDetail" style="margin-left:8px;">{{ T("retry") }}</button>\
-</div>\
+    <div v-else-if="error" class="error-state"><p>⚠ {{ error }}</p><button class="btn-retry" @click="loadDetail">{{ T("retry") }}</button></div>\
 \
     <div v-else>\
         <div class="detail-hero">\

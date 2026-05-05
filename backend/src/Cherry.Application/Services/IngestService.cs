@@ -133,5 +133,6 @@ public class IngestService : IHostedService
         var inserted = await repo.BulkInsertTorrentsAsync(torrents, ct);
         var sources = events.Select(e => e.InstanceId).Distinct().OrderBy(s => s);
         _logger.LogInformation("Batch processed: {Total} events → {Inserted} new from [{Sources}]", events.Count, inserted, string.Join(", ", sources));
-    }
+
+            }
 }

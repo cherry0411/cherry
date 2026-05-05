@@ -30,6 +30,7 @@ import (
 type Application struct {
 	cfg    config.Config
 	logger *log.Logger
+	dht    *dht.DHT
 }
 
 type runtimeStats struct {
@@ -179,10 +180,36 @@ func (a *Application) Run(ctx context.Context) error {
 		a.queueMetadataRequest(downloader, infoHashHex, ip, port, metadataRequestSeen, stats, checkQueue)
 	}
 
-	node := dht.New(dhtConfig)
-	go a.emitStats(ctx, events, stats, node)
-	go node.Run()
+	a.dht = dht.New(dhtConfig)
+	go a.emitStats(ctx, events, stats, a.dht)
+	go a.dht.Run()
 	a.logger.Printf("started: instance=%s udp=%s workers=%d nodes=%d", a.cfg.InstanceID, a.cfg.ListenAddr, a.cfg.Metadata.WorkerQueueSize, a.cfg.Discovery.MaxNodes)
+
+	// Poll API for pending fetch requests, send DHT get_peers
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				resp, err := apiClient.Get(baseURL(a.cfg.Exporter.HTTPEndpoint) + "/api/v1/torrents/pending")
+				if err != nil {
+					continue
+				}
+				var pending []string
+				if json.NewDecoder(resp.Body).Decode(&pending) != nil {
+					resp.Body.Close()
+					continue
+				}
+				resp.Body.Close()
+				for _, h := range pending {
+					a.dht.GetPeers(h)
+				}
+			}
+		}
+	}()
 
 	// Periodic peer count flush
 	go func() {

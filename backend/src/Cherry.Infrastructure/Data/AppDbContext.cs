@@ -7,6 +7,7 @@ public class AppDbContext : DbContext
 {
     public DbSet<Torrent> Torrents => Set<Torrent>();
     public DbSet<TorrentFile> TorrentFiles => Set<TorrentFile>();
+    public DbSet<TorrentRequest> TorrentRequests => Set<TorrentRequest>();
 
     public AppDbContext(DbContextOptions<AppDbContext> options) : base(options) { }
 

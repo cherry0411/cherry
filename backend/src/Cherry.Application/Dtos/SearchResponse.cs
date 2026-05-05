@@ -23,3 +23,5 @@ public record TorrentFileDto(
     string PathText,
     long Length
 );
+
+public record TorrentRequestDto(string InfoHash);
