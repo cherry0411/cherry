@@ -1,4 +1,6 @@
 using System.IO.Compression;
+using System.Security.Cryptography;
+using System.Text;
 using Cherry.Domain.Interfaces;
 
 namespace Cherry.Infrastructure.Dedup;
@@ -143,23 +145,24 @@ public class CuckooFilter : IDedupFilter, IDisposable
 
     private (int, int) BucketIndices(string infoHash)
     {
-        var hash = (ulong)infoHash.GetHashCode();
-        var hash2 = (ulong)HashCode.Combine(infoHash, 0x9e3779b9);
+        var bytes = Encoding.UTF8.GetBytes(infoHash);
+        var hash = SHA256.HashData(bytes);
+        var h1 = BitConverter.ToUInt64(hash, 0);
+        var h2 = BitConverter.ToUInt32(hash, 8);
         return (
-            (int)(hash % (ulong)_bucketCount),
-            (int)(hash2 % (ulong)_bucketCount)
+            (int)(h1 % (ulong)_bucketCount),
+            (int)(h2 % (uint)_bucketCount)
         );
     }
 
     private ushort Fingerprint(string infoHash)
     {
-        var h = (uint)infoHash.GetHashCode();
-        h ^= (uint)(infoHash.Length * 0x9e3779b9);
-        h *= 0x85ebca6b;
+        var bytes = Encoding.UTF8.GetBytes(infoHash);
+        var hash = SHA256.HashData(bytes);
+        var h = BitConverter.ToUInt32(hash, 12);
         h ^= h >> 13;
         h *= 0xc2b2ae35;
         h ^= h >> 16;
-
         var fp = (ushort)(h & 0xFFFF);
         if (fp == 0) fp = 1;
         return fp;

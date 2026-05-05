@@ -157,26 +157,63 @@ public static class TorrentEndpoints
 
     private static string ComputeInfoHash(byte[] torrentData)
     {
-        var infoStart = FindInfoDict(torrentData);
-        var infoBytes = torrentData[infoStart..];
-        var raw = infoBytes[1..^1]; // strip 'd' and 'e'
-        return Convert.ToHexString(System.Security.Cryptography.SHA1.HashData(raw)).ToLowerInvariant();
+        var root = BDecode(torrentData, 0, out _) as Dictionary<string, object>;
+        if (root is null || !root.TryGetValue("info", out var info)) return string.Empty;
+        var infoBytes = BEncode(info);
+        return Convert.ToHexString(System.Security.Cryptography.SHA1.HashData(infoBytes)).ToLowerInvariant();
     }
 
-    private static int FindInfoDict(byte[] data)
+    private static byte[] BEncode(object value) => value switch
     {
-        for (var i = 0; i < data.Length - 4; i++)
-            if (data[i] == '4' && data[i + 1] == ':' && data[i + 2] == 'i' && data[i + 3] == 'n' && data[i + 4] == 'f' && data[i + 5] == 'o')
-                return i + 6;
-        return -1;
+        string s => Encoding.UTF8.GetBytes(s),
+        byte[] b => b,
+        long l => Encoding.ASCII.GetBytes($"i{l}e"),
+        int i => Encoding.ASCII.GetBytes($"i{i}e"),
+        List<object> list => BEncodeList(list),
+        Dictionary<string, object> dict => BEncodeDict(dict),
+        _ => Array.Empty<byte>()
+    };
+
+    private static byte[] BEncodeList(List<object> list)
+    {
+        var parts = new List<byte[]> { new byte[] { (byte)'l' } };
+        foreach (var item in list) parts.Add(BEncode(item));
+        parts.Add(new byte[] { (byte)'e' });
+        return parts.SelectMany(p => p).ToArray();
+    }
+
+    private static byte[] BEncodeDict(Dictionary<string, object> dict)
+    {
+        var parts = new List<byte[]> { new byte[] { (byte)'d' } };
+        foreach (var kv in dict.OrderBy(k => Encoding.UTF8.GetBytes(k.Key), ByteArrayComparer.Instance))
+        {
+            var key = Encoding.UTF8.GetBytes(kv.Key);
+            parts.Add(Encoding.ASCII.GetBytes($"{key.Length}:"));
+            parts.Add(key);
+            parts.Add(BEncode(kv.Value));
+        }
+        parts.Add(new byte[] { (byte)'e' });
+        return parts.SelectMany(p => p).ToArray();
+    }
+
+    private class ByteArrayComparer : IComparer<byte[]>
+    {
+        public static readonly ByteArrayComparer Instance = new();
+        public int Compare(byte[]? x, byte[]? y)
+        {
+            if (x is null || y is null) return 0;
+            var len = Math.Min(x.Length, y.Length);
+            for (var i = 0; i < len; i++) { var c = x[i].CompareTo(y[i]); if (c != 0) return c; }
+            return x.Length.CompareTo(y.Length);
+        }
     }
 
     private static Dictionary<string, object>? ParseTorrentInfo(byte[] data)
     {
-        var idx = FindInfoDict(data);
-        if (idx < 0) return null;
-        var result = BDecode(data, idx, out _);
-        return result as Dictionary<string, object>;
+        var root = BDecode(data, 0, out _) as Dictionary<string, object>;
+        if (root is not null && root.TryGetValue("info", out var info) && info is Dictionary<string, object> infoDict)
+            return infoDict;
+        return null;
     }
 
     private static object? BDecode(byte[] data, int pos, out int end)
@@ -214,8 +251,10 @@ public static class TorrentEndpoints
         pos++;
         while (pos < data.Length && data[pos] != 'e')
         {
+            var prev = pos;
             var val = BDecode(data, pos, out pos);
             if (val is not null) list.Add(val);
+            else if (pos == prev) break;
         }
         end = pos < data.Length ? pos + 1 : pos;
         return list;
