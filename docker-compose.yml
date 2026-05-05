@@ -27,6 +27,8 @@ services:
     environment:
       ConnectionStrings__Default: >-
         Host=postgres;Port=5432;Database=${POSTGRES_DB:-cherry};Username=${POSTGRES_USER:-cherry};Password=${POSTGRES_PASSWORD:-cH3rry_pg_7xK9mQw2};Pooling=true;MaxPoolSize=64
+    volumes:
+      - apidata:/app/data
     ports:
       - "127.0.0.1:5070:5070"
     healthcheck:
@@ -228,3 +230,4 @@ services:
 
 volumes:
   pgdata:
+  apidata:

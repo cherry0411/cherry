@@ -24,7 +24,7 @@ builder.Services.AddDbContextPool<AppDbContext>(options =>
 }, poolSize: 64);
 
 // Core services
-var dedupPath = Path.Combine(builder.Environment.ContentRootPath, "cuckoo.dat");
+var dedupPath = Path.Combine(builder.Environment.ContentRootPath, "data", "cuckoo.dat");
 var dedup = new CuckooFilter(capacity: 100_000_000, persistPath: dedupPath);
 builder.Services.AddSingleton<IDedupFilter>(dedup);
 builder.Services.AddScoped<ITorrentRepository, TorrentRepository>();
