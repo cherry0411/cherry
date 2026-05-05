@@ -18,10 +18,12 @@ var CONFIG = {
 
 var API_BATCH_URL = CONFIG.apiUrl + '/api/v1/torrents/batch';
 var API_CHECK_URL = CONFIG.apiUrl + '/api/v1/torrents/check';
+var API_PEERS_URL = CONFIG.apiUrl + '/api/v1/torrents/peers';
 
 // Use Set for O(1) dedup
 var processed = new Set();
-var remoteKnown = new Set();  // exists on main API — skip download entirely
+var remoteKnown = new Set();
+var peerCounts = new Map();   // infohash → count of announce_peer sightings
 var dedupMax = CONFIG.dedupSize;
 var batch = [];
 var checkQueue = [];          // pending API checks
@@ -53,6 +55,24 @@ function flushCheckQueue() {
             } catch (e) {}
         });
     }).on('error', function () {});
+}
+
+function flushPeerCounts() {
+    if (peerCounts.size === 0) return;
+    var data = {};
+    peerCounts.forEach(function (v, k) { data[k] = v; });
+    peerCounts.clear();
+    var payload = JSON.stringify({ hashes: data });
+    var url = new URL(API_PEERS_URL);
+    var req = http.request({
+        hostname: url.hostname, port: url.port, path: url.pathname,
+        method: 'POST', agent: httpAgent,
+        headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) },
+        timeout: 10000
+    }, function (res) { res.resume(); });
+    req.on('error', function () {});
+    req.write(payload);
+    req.end();
 }
 
 function sendBatch() {
@@ -116,14 +136,16 @@ var p2p = P2PSpider({
 });
 
 p2p.ignore(function (infohash, rinfo, callback) {
+    // Already known → skip download, count as peer sighting
     if (processed.has(infohash) || remoteKnown.has(infohash)) {
         stats.dedup_hits++;
+        var cur = peerCounts.get(infohash) || 0;
+        peerCounts.set(infohash, cur + 1);
         callback(true);
         return;
     }
     callback(false);
     processed.add(infohash);
-    // Queue for remote check — if API already has it, future hits skip download
     checkQueue.push({ hash: infohash });
     if (checkQueue.length >= 50) flushCheckQueue();
 
@@ -186,7 +208,8 @@ p2p.on('metadata', function (metadata) {
 });
 
 setInterval(sendBatch, CONFIG.flushInterval);
-setInterval(flushCheckQueue, 2000);   // flush pending checks every 2s
+setInterval(flushCheckQueue, 2000);
+setInterval(flushPeerCounts, 60000);   // push peer counts every 60s
 setInterval(logStats, 30000);
 
 p2p.listen(CONFIG.port, CONFIG.address);

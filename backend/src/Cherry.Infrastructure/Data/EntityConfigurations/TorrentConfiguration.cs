@@ -20,11 +20,14 @@ public class TorrentConfiguration : IEntityTypeConfiguration<Torrent>
         builder.Property(x => x.FileCount).HasColumnName("file_count").IsRequired();
         builder.Property(x => x.IsPrivate).HasColumnName("is_private").IsRequired();
         builder.Property(x => x.Source).HasColumnName("source").HasMaxLength(32);
+        builder.Property(x => x.PeerCount).HasColumnName("peer_count").HasDefaultValue(0);
+        builder.Property(x => x.PeerUpdatedAt).HasColumnName("peer_updated_at");
         builder.Property(x => x.CreatedAt).HasColumnName("created_at").HasDefaultValueSql("NOW()");
         builder.Property(x => x.UpdatedAt).HasColumnName("updated_at").HasDefaultValueSql("NOW()");
 
         builder.HasIndex(x => x.InfoHash).IsUnique().HasDatabaseName("uq_torrents_info_hash");
         builder.HasIndex(x => x.CreatedAt).HasDatabaseName("idx_torrents_created");
+        builder.HasIndex(x => x.PeerCount).HasDatabaseName("idx_torrents_peer_count");
         builder.HasIndex(x => x.Name)
             .HasDatabaseName("idx_torrents_name_trgm")
             .HasMethod("GIN")

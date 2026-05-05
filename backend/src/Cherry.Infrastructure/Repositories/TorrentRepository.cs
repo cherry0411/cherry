@@ -170,12 +170,43 @@ public class TorrentRepository : ITorrentRepository
         var total = await baseQuery.LongCountAsync(ct);
 
         var items = await baseQuery
-            .OrderByDescending(t => t.CreatedAt)
+            .OrderByDescending(t => t.PeerCount)
+            .ThenByDescending(t => t.CreatedAt)
             .Skip((page - 1) * pageSize)
             .Take(pageSize)
             .ToListAsync(ct);
 
         return (items, total);
+    }
+
+    public async Task BatchUpdatePeerCountsAsync(Dictionary<string, int> counts, CancellationToken ct = default)
+    {
+        if (counts.Count == 0) return;
+        var conn = (NpgsqlConnection)_db.Database.GetDbConnection();
+        if (conn.State != System.Data.ConnectionState.Open)
+            await conn.OpenAsync(ct);
+
+        var tableName = "_peer_temp_" + Guid.NewGuid().ToString("N");
+        await using (var cmd = new NpgsqlCommand($"CREATE TEMP TABLE {tableName} (info_hash VARCHAR(40), cnt INT)", conn))
+            await cmd.ExecuteNonQueryAsync(ct);
+
+        await using (var writer = await conn.BeginBinaryImportAsync($"COPY {tableName} FROM STDIN (FORMAT BINARY)", ct))
+        {
+            foreach (var (hash, count) in counts)
+            {
+                await writer.StartRowAsync(ct);
+                await writer.WriteAsync(hash, ct);
+                await writer.WriteAsync(count, ct);
+            }
+            await writer.CompleteAsync(ct);
+        }
+
+        await using (var cmd = new NpgsqlCommand(
+            $"UPDATE torrents SET peer_count = torrents.peer_count + t.cnt, peer_updated_at = NOW() FROM {tableName} t WHERE torrents.info_hash = t.info_hash", conn))
+            await cmd.ExecuteNonQueryAsync(ct);
+
+        await using (var cmd = new NpgsqlCommand($"DROP TABLE IF EXISTS {tableName}", conn))
+            await cmd.ExecuteNonQueryAsync(ct);
     }
 
     public async Task<List<string>> CheckExistsAsync(List<string> hashes, CancellationToken ct = default)

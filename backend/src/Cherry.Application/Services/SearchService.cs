@@ -28,8 +28,9 @@ public class SearchService
             TotalLength: t.TotalLength,
             FileCount: t.FileCount,
             IsPrivate: t.IsPrivate,
+            PeerCount: t.PeerCount,
             CreatedAt: t.CreatedAt,
-            Files: null // Don't include files in search results for performance
+            Files: null
         )).ToList();
 
         return new SearchResponse(dtos, total, request.Page, request.PageSize);
@@ -48,6 +49,7 @@ public class SearchService
             TotalLength: t.TotalLength,
             FileCount: t.FileCount,
             IsPrivate: t.IsPrivate,
+            PeerCount: t.PeerCount,
             CreatedAt: t.CreatedAt,
             Files: null
         )).ToList();
@@ -65,6 +67,7 @@ public class SearchService
             TotalLength: t.TotalLength,
             FileCount: t.FileCount,
             IsPrivate: t.IsPrivate,
+            PeerCount: t.PeerCount,
             CreatedAt: t.CreatedAt,
             Files: t.Files.Select(f => new TorrentFileDto(f.PathText, f.Length)).ToList()
         );

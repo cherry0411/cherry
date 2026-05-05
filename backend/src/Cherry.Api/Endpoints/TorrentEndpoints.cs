@@ -19,6 +19,12 @@ public static class TorrentEndpoints
             .Produces<BatchIngestResponse>(200)
             .Produces(400);
 
+        group.MapPost("/peers", UpdatePeerCountsAsync)
+            .WithName("UpdatePeerCounts")
+            .WithSummary("批量更新peer计数")
+            .WithDescription("POST {hashes: {info_hash: count, ...}} — batch update peer counts for ranking.")
+            .Produces(200);
+
         group.MapGet("/check", CheckExistsAsync)
             .WithName("CheckExists")
             .WithSummary("批量检查info_hash是否存在")
@@ -49,6 +55,16 @@ public static class TorrentEndpoints
             .Produces(404)
             .Produces(400)
             .CacheOutput(p => p.Expire(TimeSpan.FromSeconds(60)));
+    }
+
+    private static async Task<IResult> UpdatePeerCountsAsync(
+        Dictionary<string, int> hashes,
+        ITorrentRepository repo,
+        CancellationToken ct)
+    {
+        if (hashes.Count == 0) return Results.Ok();
+        await repo.BatchUpdatePeerCountsAsync(hashes, ct);
+        return Results.Ok();
     }
 
     private static IResult CheckExistsAsync(

@@ -14,6 +14,7 @@ public record TorrentDto(
     long TotalLength,
     int FileCount,
     bool IsPrivate,
+    int PeerCount,
     DateTime CreatedAt,
     List<TorrentFileDto>? Files
 );
