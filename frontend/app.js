@@ -139,8 +139,9 @@ var router = VueRouter.createRouter({ history: VueRouter.createWebHistory(), rou
 
 // ---- Root App ----
 var App = {
-    template: '<nav class="topbar"><a href="/" class="logo">🍒 Cherry</a><div class="search-wrap"><input type="text" class="search-input" :placeholder="T(\'search_placeholder\')" v-model="q" @keydown.enter="doSearch" ref="navInp" /><button class="search-btn" @click="doSearch">{{ T("search_btn") }}</button></div><div class="nav-links"><a href="/recent">Recent</a></div><span class="lang-switch" @click="switchLang">{{ T("lang_label") }}</span></nav><main class="main"><router-view /></main>',
+    template: '<nav class="topbar"><a href="/" class="logo">🍒 Cherry</a><div class="search-wrap" v-if="showSearch"><input type="text" class="search-input" :placeholder="T(\'search_placeholder\')" v-model="q" @keydown.enter="doSearch" ref="navInp" /><button class="search-btn" @click="doSearch">{{ T("search_btn") }}</button></div><div class="nav-links"><a href="/recent">Recent</a></div><span class="lang-switch" @click="switchLang">{{ T("lang_label") }}</span></nav><main class="main"><router-view /></main>',
     data: function () { return { q: '', lang: lang }; },
+    computed: { showSearch: function () { return this.$route.path !== '/'; } },
     watch: { '$route.query.q': function (v) { if (v) this.q = v; } },
     mounted: function () { var s = this; document.addEventListener('keydown', function (e) { if ((e.ctrlKey || e.metaKey) && e.key === 'k') { e.preventDefault(); s.$refs.navInp && s.$refs.navInp.focus(); } }); },
     methods: { T: T, switchLang: switchLang, doSearch: function () { var q = this.q.trim(); if (!q) return; saveHistory(q); this.$router.push({ path: '/search', query: { q: q } }); } }
