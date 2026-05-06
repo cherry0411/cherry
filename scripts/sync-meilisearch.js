@@ -37,13 +37,13 @@ async function main() {
             searchableAttributes: ['name'],
             sortableAttributes: ['peerCount', 'totalLength', 'fileCount', 'createdAt'],
             filterableAttributes: ['fileCount', 'totalLength', 'isPrivate', 'peerCount'],
+            typoTolerance: { minWordSizeForTypos: { oneTypo: 5, twoTypos: 8 }, disableOnWords: [], disableOnAttributes: [] },
             rankingRules: [
                 'words',
-                'typo',
+                'exactness',
                 'proximity',
                 'attribute',
                 'sort',
-                'exactness',
                 'createdAt:desc'
             ]
         })
