@@ -6,12 +6,10 @@ namespace Cherry.Infrastructure.Search;
 public class MeiliSearchClient
 {
     private readonly HttpClient _http;
-    private readonly string _baseUrl;
 
-    public MeiliSearchClient(HttpClient http, string baseUrl)
+    public MeiliSearchClient(HttpClient http)
     {
         _http = http;
-        _baseUrl = baseUrl;
     }
 
     public async Task<MeiliSearchResult?> SearchAsync(string query, int page, int pageSize, string? fileType, CancellationToken ct)
@@ -21,7 +19,7 @@ public class MeiliSearchClient
         if (!string.IsNullOrWhiteSpace(fileType))
             filter = $"fileCount > 0"; // fileType filter handled post-query
 
-        var url = $"{_baseUrl}/indexes/torrents/search";
+        var url = "/indexes/torrents/search";
         var body = JsonSerializer.Serialize(new
         {
             q = query,
