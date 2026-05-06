@@ -1,3 +1,6 @@
 .env
 backups/
 *.sql.gz
+node_modules/
+migration/node_modules/
+scripts/node_modules/
