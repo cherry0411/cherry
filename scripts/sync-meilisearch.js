@@ -42,7 +42,6 @@ async function main() {
                 'words',
                 'exactness',
                 'proximity',
-                'attribute',
                 'sort',
                 'createdAt:desc'
             ]

@@ -1,625 +1,149 @@
 var API = window.CHERRY_API || '';
 
-// ---- i18n ----
-var LANG_KEY = 'cherry_lang';
-var langs = ['zh','en'];
-var t = {};
-var lang = (function() {
-    try { var v = localStorage.getItem(LANG_KEY); if (langs.indexOf(v) >= 0) return v; }
-    catch(e) {}
-    return (navigator.language || '').startsWith('zh') ? 'zh' : 'en';
-})();
-
-var dict = {
-    zh: {
-        site_title: 'Cherry - DHT 搜索引擎',
-        search_placeholder: '搜索种子...',
-        search_btn: '搜索',
-        hero_title: 'Cherry 种子搜索',
-        hero_desc: '实时搜索 DHT 网络中发现的数千万个种子',
-        hero_input_placeholder: '电影、剧集、软件、音乐...',
-        stats_total: '种子总数',
-        stats_today: '今日新增',
-        stats_cache: '内存缓存',
-        stats_date: '服务器日期',
-        nav_recent: '最新',
-        recent_title: '最近新增',
-        recent_searches: '最近搜索',
-        results_for: '结果',
-        found: '找到',
-        searching: '搜索中',
-        no_results: '未找到结果',
-        no_results_hint: '尝试换一个关键词',
-        retry: '重试',
-        prev_page: '上一页',
-        next_page: '下一页',
-        copy_magnet: '复制',
-        back: '返回结果',
-        torrent_not_found: '种子未找到',
-        server_error: '服务器错误',
-        info_hash: 'Info Hash',
-        total_size: '大小',
-        file_count: '文件数',
-        discovered: '发现时间',
-        download_magnet: '下载磁力链接',
-        copy_link: '复制链接',
-        copied: '已复制',
-        file_list: '文件列表',
-        files_shown: '个文件，仅展示前',
-        more_files: '... 还有',
-        no_more: '个文件未展示',
-        filter_files: '筛选文件...',
-        hash_copied: 'Hash 已复制',
-        link_copied: '链接已复制',
-        press_ctrl_k: '按 Ctrl+K 快速搜索',
-        network_stats: '网络统计',
-        filters_all: '全部',
-        filters_video: '视频',
-        filters_audio: '音频',
-        filters_books: '图书',
-        filters_archives: '压缩包',
-        filters_images: '图片',
-        file_col_name: '文件名',
-        file_col_size: '大小',
-        private_torrent: '私有种子',
-        just_now: '刚刚',
-        min_ago: '分钟前',
-        h_ago: '小时前',
-        d_ago: '天前',
-        mo_ago: '个月前',
-        sort_name: '文件名',
-        sort_size: '大小',
-        lang_label: 'En'
-    },
-    en: {
-        site_title: 'Cherry - DHT Search Engine',
-        search_placeholder: 'Search torrents...',
-        search_btn: 'Search',
-        hero_title: 'Cherry Torrent Search',
-        hero_desc: 'Search millions of torrents discovered from the DHT network in real-time',
-        hero_input_placeholder: 'Movie, TV show, software, music...',
-        stats_total: 'Total Torrents',
-        stats_today: 'Discovered Today',
-        stats_cache: 'Memory Cache',
-        stats_date: 'Server Date',
-        nav_recent: 'Recent',
-        recent_title: 'Recently Added',
-        recent_searches: 'Recent Searches',
-        results_for: 'Results for',
-        found: 'found',
-        searching: 'Searching',
-        no_results: 'No results found',
-        no_results_hint: 'Try different keywords',
-        retry: 'Retry',
-        prev_page: 'Prev',
-        next_page: 'Next',
-        copy_magnet: 'Copy',
-        back: 'Back to results',
-        torrent_not_found: 'Torrent not found',
-        server_error: 'Server error',
-        info_hash: 'Info Hash',
-        total_size: 'Size',
-        file_count: 'Files',
-        discovered: 'Discovered',
-        download_magnet: 'Download Magnet',
-        copy_link: 'Copy Link',
-        copied: 'Copied',
-        file_list: 'File List',
-        files_shown: 'files, showing first',
-        more_files: '... and',
-        no_more: 'more files not shown',
-        filter_files: 'Filter files...',
-        hash_copied: 'Hash copied',
-        link_copied: 'Link copied',
-        press_ctrl_k: 'Press Ctrl+K to search anytime',
-        network_stats: 'Network Stats',
-        filters_all: 'All',
-        filters_video: 'Video',
-        filters_audio: 'Audio',
-        filters_books: 'Books',
-        filters_archives: 'Archives',
-        filters_images: 'Images',
-        file_col_name: 'Name',
-        file_col_size: 'Size',
-        private_torrent: 'Private',
-        just_now: 'just now',
-        min_ago: 'm ago',
-        h_ago: 'h ago',
-        d_ago: 'd ago',
-        mo_ago: 'mo ago',
-        sort_name: 'Name',
-        sort_size: 'Size',
-        lang_label: '中文'
-    }
-};
-
-function T(key) { return (dict[lang] && dict[lang][key]) || (dict.en[key]) || key; }
-
-function switchLang() {
-    lang = lang === 'zh' ? 'en' : 'zh';
-    try { localStorage.setItem(LANG_KEY, lang); } catch(e) {}
-    window.location.reload();
-}
-
-// ---- utility ----
 function fmtSize(bytes) {
     if (bytes == null || bytes <= 0) return '0 B';
     var u = ['B', 'KB', 'MB', 'GB', 'TB'];
     var i = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), u.length - 1);
     return (bytes / Math.pow(1024, i)).toFixed(i === 0 ? 0 : 1) + ' ' + u[i];
 }
-
 function fmtDate(iso) {
     if (!iso) return '-';
     var d = new Date(iso);
-    return d.toLocaleDateString('zh-CN',{year:'numeric',month:'2-digit',day:'2-digit'})
-        + ' ' + d.toLocaleTimeString('zh-CN',{hour:'2-digit',minute:'2-digit'});
+    return d.toLocaleDateString('zh-CN', { year: 'numeric', month: '2-digit', day: '2-digit' }) + ' ' + d.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' });
 }
-
 function fmtRelative(iso) {
-    if (!iso) return '';
-    var diff = Date.now() - new Date(iso).getTime();
-    if (diff < 0) return '';
-    var mins = Math.floor(diff / 60000);
-    if (mins < 1) return T('just_now');
-    if (mins < 60) return mins + T('min_ago');
-    var h = Math.floor(mins / 60);
-    if (h < 24) return h + T('h_ago');
-    var d = Math.floor(h / 24);
-    if (d < 30) return d + T('d_ago');
-    return Math.floor(d / 30) + T('mo_ago');
+    if (!iso) return ''; var diff = Date.now() - new Date(iso).getTime(); if (diff < 0) return '';
+    var m = Math.floor(diff / 60000); if (m < 1) return 'just now'; if (m < 60) return m + 'm ago';
+    var h = Math.floor(m / 60); if (h < 24) return h + 'h ago'; var d = Math.floor(h / 24);
+    if (d < 30) return d + 'd ago'; return Math.floor(d / 30) + 'mo ago';
 }
-
-function fmtNumber(n) {
-    if (n == null) return '0';
-    return Number(n).toLocaleString('zh-CN');
-}
-
-function magnetLink(hash, name) {
-    return 'magnet:?xt=urn:btih:' + hash + '&dn=' + encodeURIComponent(name || '');
-}
-
-function escapeHtml(s) {
-    return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
-}
-
+function fmtNumber(n) { return n == null ? '0' : Number(n).toLocaleString('zh-CN'); }
+function magnetLink(h, n) { return 'magnet:?xt=urn:btih:' + h + '&dn=' + encodeURIComponent(n || ''); }
+function escapeHtml(s) { return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;'); }
 function highlightTerm(text, query) {
     if (!query || !text) return escapeHtml(text);
-    var escaped = escapeHtml(text);
-    var q = escapeHtml(query).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    return escaped.replace(new RegExp('(' + q + ')', 'gi'), '<mark>$1</mark>');
+    var e = escapeHtml(text), q = escapeHtml(query).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    return e.replace(new RegExp('(' + q + ')', 'gi'), '<mark>$1</mark>');
 }
-
 function detectCategory(name) {
     if (!name) return { icon: '📄', cat: '' };
     var n = name.toLowerCase();
-    if (/s\d{1,2}e\d|season|episode|ova|oad/i.test(n)) return { icon: '📺', cat: 'Series' };
-    if (/\.(flac|mp3|m4a|aac|ogg|wav|24bit|96khz|album|discography)/i.test(n)) return { icon: '🎵', cat: 'Music' };
-    if (/\.(iso|dmg|exe|msi|appx|rar|zip|7z|deb|rpm|apk)/i.test(n) || /(windows|macos|linux|ubuntu|debian|fedora|android|ios|setup|install|portable|crack|patch|keygen)/i.test(n)) return { icon: '💿', cat: 'Software' };
-    if (/game|gog|steam|epic|repack|fitgirl|dodi/i.test(n)) return { icon: '🎮', cat: 'Game' };
-    if (/\.(epub|pdf|mobi|azw|djvu|cbz|cbr|chm)/i.test(n) || /ebook|book|magazine/i.test(n)) return { icon: '📚', cat: 'Books' };
-    if (/anime|s\d{2}e\d/i.test(n)) return { icon: '🎌', cat: 'Anime' };
-    if (/\.(mkv|mp4|avi|mov|wmv|webm|bluray|web-dl|webrip|bdrip|brrip|hdtv|dvdrip|1080p|2160p|720p|2160|hdr|x265|x264|hevc|avc)/i.test(n)) return { icon: '🎬', cat: 'Movie' };
+    if (/s\d{1,2}e\d|season|episode/i.test(n)) return { icon: '📺', cat: 'Series' };
+    if (/\.(flac|mp3|m4a|aac|ogg|wav)/i.test(n)) return { icon: '🎵', cat: 'Music' };
+    if (/\.(iso|dmg|exe|msi|rar|zip|7z|deb|rpm)/i.test(n) || /(setup|install|crack|keygen)/i.test(n)) return { icon: '💿', cat: 'Software' };
+    if (/game|gog|steam|epic/i.test(n)) return { icon: '🎮', cat: 'Game' };
+    if (/\.(pdf|epub|mobi)/i.test(n)) return { icon: '📚', cat: 'Books' };
+    if (/\.(mkv|mp4|avi|mov|bluray|web-dl|bdrip|1080p|2160p|x265|x264)/i.test(n)) return { icon: '🎬', cat: 'Movie' };
     return { icon: '📦', cat: '' };
 }
-
 function fileIcon(filename) {
     if (!filename) return '📄';
-    var ext = filename.split('.').pop().toLowerCase();
-    var map = {
-        mkv:'🎬',mp4:'🎬',avi:'🎬',mov:'🎬',wmv:'🎬',webm:'🎬',
-        flac:'🎵',mp3:'🎵',m4a:'🎵',aac:'🎵',ogg:'🎵',wav:'🎵',
-        iso:'💿',dmg:'💿',exe:'⚙️',msi:'⚙️',rar:'📦',zip:'📦','7z':'📦',tar:'📦',gz:'📦',
-        pdf:'📕',epub:'📚',mobi:'📚',djvu:'📚',
-        jpg:'🖼️',jpeg:'🖼️',png:'🖼️',gif:'🖼️',webp:'🖼️',bmp:'🖼️',
-        txt:'📝',nfo:'📝',srt:'💬',ass:'💬',sub:'💬',sfv:'✅',md5:'✅',sha1:'✅'
-    };
-    return map[ext] || '📄';
+    var m = { mkv: '🎬', mp4: '🎬', avi: '🎬', mov: '🎬', flac: '🎵', mp3: '🎵', m4a: '🎵', iso: '💿', exe: '⚙️', rar: '📦', zip: '📦', '7z': '📦', pdf: '📕', epub: '📚', jpg: '🖼️', png: '🖼️', txt: '📝', srt: '💬', sfv: '✅' };
+    var e = filename.split('.').pop().toLowerCase();
+    return m[e] || '📄';
 }
 
-// ---- Search history ----
-var HISTORY_KEY = 'cherry_search_history';
-function loadHistory() { try { return JSON.parse(localStorage.getItem(HISTORY_KEY))||[]; } catch(e) { return []; } }
-function saveHistory(q) {
-    var h = loadHistory().filter(function(x){return x!==q;});
-    h.unshift(q); if (h.length > 10) h.length = 10;
-    try { localStorage.setItem(HISTORY_KEY, JSON.stringify(h)); } catch(e) {}
-}
+// ---- i18n ----
+var lang = (function () { try { var v = localStorage.getItem('cherry_lang'); if (v) return v; } catch (e) { } return (navigator.language || '').startsWith('zh') ? 'zh' : 'en'; })();
+var dict = {
+    zh: { site_title: 'Cherry - 种子搜索', search_placeholder: '搜索种子...', search_btn: '搜索', hero_title: 'Cherry 种子搜索', hero_desc: '搜索千万级 DHT 网络种子', hero_placeholder: '电影、剧集、软件、音乐...', stat_total: '总种子', stat_today: '今日新增', stat_cache: '缓存', stat_date: '日期', recent_searches: '最近搜索', results_for: '结果', found: '条', no_results: '未找到结果', no_results_hint: '试试其他关键词', retry: '重试', prev_page: '上一页', next_page: '下一页', copy_magnet: '复制', back: '返回结果', torrent_not_found: '种子未找到', server_error: '服务器错误', info_hash: 'Info Hash', total_size: '大小', file_count: '文件数', discovered: '发现时间', download_magnet: '磁力链接', copy_link: '复制链接', copied: '已复制', file_list: '文件列表', filter_files: '筛选文件...', hash_copied: '已复制', link_copied: '已复制', private_torrent: '私有种子', just_now: '刚刚', min_ago: '分钟前', h_ago: '小时前', d_ago: '天前', mo_ago: '个月前', sort_name: '文件名', sort_size: '大小', lang_label: 'En', lookup: '查询', dht_fetch: 'DHT抓取', requesting: '提交中...', queued: '已加入队列', already_queued: '已在队列中' },
+    en: { site_title: 'Cherry - DHT Search', search_placeholder: 'Search torrents...', search_btn: 'Search', hero_title: 'Cherry Torrent Search', hero_desc: 'Search millions of torrents from DHT', hero_placeholder: 'Movies, TV, software, music...', stat_total: 'Total', stat_today: 'Today', stat_cache: 'Cache', stat_date: 'Date', recent_searches: 'Recent', results_for: 'Results for', found: 'found', no_results: 'No results', no_results_hint: 'Try different keywords', retry: 'Retry', prev_page: 'Prev', next_page: 'Next', copy_magnet: 'Copy', back: 'Back to results', torrent_not_found: 'Torrent not found', server_error: 'Server error', info_hash: 'Info Hash', total_size: 'Size', file_count: 'Files', discovered: 'Discovered', download_magnet: 'Magnet', copy_link: 'Copy Link', copied: 'Copied', file_list: 'File List', filter_files: 'Filter files...', hash_copied: 'Copied', link_copied: 'Copied', private_torrent: 'Private', just_now: 'just now', min_ago: 'm ago', h_ago: 'h ago', d_ago: 'd ago', mo_ago: 'mo ago', sort_name: 'Name', sort_size: 'Size', lang_label: '中文', lookup: 'Lookup', dht_fetch: 'DHT Fetch', requesting: 'Requesting...', queued: 'Queued', already_queued: 'Already queued' }
+};
+function T(k) { return (dict[lang] && dict[lang][k]) || dict.en[k] || k; }
+function switchLang() { lang = lang === 'zh' ? 'en' : 'zh'; try { localStorage.setItem('cherry_lang', lang); } catch (e) { } window.location.reload(); }
+
+// ---- History ----
+function loadHistory() { try { return JSON.parse(localStorage.getItem('cherry_history')) || []; } catch (e) { return []; } }
+function saveHistory(q) { var h = loadHistory().filter(function (x) { return x !== q; }); h.unshift(q); if (h.length > 10) h.length = 10; try { localStorage.setItem('cherry_history', JSON.stringify(h)); } catch (e) { } }
 
 // ---- Toast ----
-var toastTimer;
-function showToast(msg) {
-    var el = document.getElementById('toast');
-    if (!el) { el = document.createElement('div'); el.id='toast'; el.className='toast'; document.body.appendChild(el); }
-    el.textContent = msg; el.classList.add('show');
-    clearTimeout(toastTimer);
-    toastTimer = setTimeout(function(){el.classList.remove('show');}, 2000);
-}
-function copyText(text, msg) { try { navigator.clipboard.writeText(text); showToast(msg||'Copied'); } catch(e) { showToast(msg||'Copied'); } }
+var tt; function showToast(m) { var e = document.getElementById('toast'); if (!e) { e = document.createElement('div'); e.id = 'toast'; e.className = 'toast'; document.body.appendChild(e); } e.textContent = m; e.classList.add('show'); clearTimeout(tt); tt = setTimeout(function () { e.classList.remove('show'); }, 2000); }
+function copyText(t) { try { navigator.clipboard.writeText(t); showToast('Copied'); } catch (e) { showToast('Copied'); } }
 
 // ---- Components ----
-
 var HomePage = {
-    template: '\
-<div>\
-    <div class="hero">\
-        <div class="hero-icon">🍒</div>\
-        <h1>{{ T("hero_title") }}</h1>\
-        <p>{{ T("hero_desc") }}</p>\
-        <div class="hero-search">\
-            <input class="search-input" :placeholder="T(\'hero_input_placeholder\')" v-model="q" @keydown.enter="goSearch" ref="heroInput" />\
-            <button class="btn-search" @click="goSearch">{{ T("search_btn") }}</button>\
-        </div>\
-        <div style="margin-top:14px;font-size:.8rem;color:var(--text-muted);">\
-            <input class="search-input" style="max-width:320px;display:inline-block;padding:6px 12px;font-size:.8rem;font-family:monospace;" placeholder="Or paste info_hash..." v-model="hashInput" @keydown.enter="lookupHash" />\
-            <button class="btn-search" style="padding:6px 14px;font-size:.8rem;display:inline-block;" @click="lookupHash">Lookup</button>\
-            <button class="btn-copy" style="padding:5px 10px;font-size:.75rem;display:inline-block;vertical-align:middle;margin-left:4px;" @click="requestHash">DHT Fetch</button>\
-            <span v-if="hashStatus" style="display:block;margin-top:6px;font-size:.76rem;color:var(--accent);">{{ hashStatus }}</span>\
-        </div>\
-        <div v-if="history.length" class="search-history">\
-            <span v-for="h in history" :key="h" class="history-chip" @click="goHistory(h)">{{ h }}</span>\
-        </div>\
-    </div>\
-    <div class="stats-section">\
-        <h2>{{ T("network_stats") }}</h2>\
-        <div v-if="!stats.totalTorrents && !done" class="skel-loading">\
-            <div class="stats-grid">\
-                <div class="stat-card" v-for="_ in 4"><div class="skeleton" style="height:48px;"></div></div>\
-            </div>\
-        </div>\
-        <div v-else class="stats-grid">\
-            <div class="stat-card"><div class="stat-value counting">{{ fmtNumber(stats.totalTorrents) }}</div><div class="stat-label">{{ T("stats_total") }}</div></div>\
-            <div class="stat-card"><div class="stat-value counting">+{{ fmtNumber(stats.todayNew) }}</div><div class="stat-label">{{ T("stats_today") }}</div></div>\
-            <div class="stat-card"><div class="stat-value counting">{{ fmtNumber(stats.dedupFilterSize) }}</div><div class="stat-label">{{ T("stats_cache") }}</div></div>\
-            <div class="stat-card"><div class="stat-value">{{ (stats.serverTime||"").slice(0,10) }}</div><div class="stat-label">{{ T("stats_date") }}</div></div>\
-        </div>\
-    </div>\
-    <div class="footer">{{ T("press_ctrl_k") }}</div>\
-</div>',
-    data: function(){ return { stats:{}, done:false, q:'', hashInput:'', hashStatus:'', history:loadHistory() }; },
-    mounted: function(){
-        var self = this;
-        this.$refs.heroInput && this.$refs.heroInput.focus();
-        fetch(API + '/api/v1/stats').then(function(r){return r.ok?r.json():null;}).then(function(s){if(s)self.stats=s;}).catch(function(){}).finally(function(){self.done=true;});
-    },
+    template: '<div class="hero"><div class="hero-logo">🍒</div><h1>{{ T("hero_title") }}</h1><div class="hero-search"><input class="search-input" :placeholder="T(\'hero_placeholder\')" v-model="q" @keydown.enter="goSearch" ref="inp" /><button class="search-btn" @click="goSearch">{{ T("search_btn") }}</button></div><div class="hero-hash"><input placeholder="info_hash..." v-model="hq" @keydown.enter="lookupHash" /><button class="hash-btn" @click="lookupHash">{{ T("lookup") }}</button><button class="hash-btn" @click="requestHash" v-if="hq.length===40">{{ T("dht_fetch") }}</button><span v-if="hs" style="font-size:.76rem;color:var(--accent);">{{ hs }}</span></div><div v-if="history.length" class="search-history"><span v-for="h in history" class="history-chip" @click="goHistory(h)">{{ h }}</span></div><div class="stats-row"><span>{{ fmtNumber(st.totalTorrents) }} {{ T("stat_total") }}</span><span>+{{ fmtNumber(st.todayNew) }} {{ T("stat_today") }}</span><span>{{ fmtNumber(st.dedupFilterSize) }} {{ T("stat_cache") }}</span><span>{{ (st.serverTime||"").slice(0,10) }}</span></div><div class="footer">Ctrl+K to search</div></div>',
+    data: function () { return { st: {}, q: '', hq: '', hs: '', history: loadHistory() }; },
+    mounted: function () { var s = this; this.$refs.inp && this.$refs.inp.focus(); fetch(API + '/api/v1/stats').then(function (r) { return r.ok ? r.json() : null; }).then(function (d) { if (d) s.st = d; }).catch(function () { }); document.title = T('site_title'); },
     methods: {
-        T:T, fmtNumber:fmtNumber,
-        goSearch: function(){ var q=this.q.trim(); if(q){saveHistory(q);this.$router.push({path:'/search',query:{q:q}});} },
-        goHistory: function(q){ this.q=q; saveHistory(q); this.$router.push({path:'/search',query:{q:q}}); },
-        lookupHash: function(){
-            var h = this.hashInput.trim().toLowerCase();
-            if (h.length === 40 && /^[a-f0-9]{40}$/.test(h)) {
-                this.$router.push('/torrent/' + h);
-            } else if (h.length === 40) {
-                alert('Invalid info_hash — must be 40 hex characters');
-            } else {
-                this.$router.push('/search?q=' + encodeURIComponent(h));
-            }
-        },
-        requestHash: function(){
-            var self = this;
-            var h = this.hashInput.trim().toLowerCase();
-            if (h.length !== 40 || !/^[a-f0-9]{40}$/.test(h)) {
-                alert('Enter a valid 40-char info_hash');
-                return;
-            }
-            self.hashStatus = 'Requesting...';
-            fetch(API + '/api/v1/torrents/request', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({info_hash: h})
-            })
-            .then(function(r){ return r.json(); })
-            .then(function(d){
-                if (d.status === 'already_pending') self.hashStatus = 'Already queued for DHT fetch';
-                else if (d.status === 'queued') self.hashStatus = 'Queued — crawler will find it soon';
-                else self.hashStatus = d.status;
-            })
-            .catch(function(){ self.hashStatus = 'Request failed'; });
-        }
+        T: T, fmtNumber: fmtNumber,
+        goSearch: function () { var q = this.q.trim(); if (q) { saveHistory(q); this.$router.push({ path: '/search', query: { q: q } }); } },
+        goHistory: function (q) { this.q = q; saveHistory(q); this.$router.push({ path: '/search', query: { q: q } }); },
+        lookupHash: function () { var h = this.hq.trim().toLowerCase(); if (h.length === 40 && /^[a-f0-9]{40}$/.test(h)) { this.$router.push('/torrent/' + h); } else if (h) { this.$router.push('/search?q=' + encodeURIComponent(h)); } },
+        requestHash: function () { var s = this, h = s.hq.trim().toLowerCase(); s.hs = T('requesting'); fetch(API + '/api/v1/torrents/request', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ info_hash: h }) }).then(function (r) { return r.json(); }).then(function (d) { s.hs = d.status === 'already_pending' ? T('already_queued') : T('queued'); }).catch(function () { s.hs = ''; }); }
     }
 };
 
 var SearchPage = {
-    template: '\
-<div>\
-    <div class="search-header">\
-        <h2>{{ T("results_for") }} <span class="highlight">"{{ q }}"</span></h2>\
-        <div class="search-meta">{{ fmtNumber(total) }} {{ T("found") }}</div>\
-        <div class="search-actions">\
-            <span v-for="ft in filters" :key="ft.value" class="filter-chip" :class="{active:activeFilter===ft.value}" @click="setFilter(ft.value)">{{ ft.label }}</span>\
-        </div>\
-    </div>\
-    <div v-if="loading"><div class="skel-card" v-for="_ in 5"><div class="skeleton skel-line long"></div><div class="skeleton skel-line mid"></div><div class="skeleton skel-line short"></div></div></div>\
-    <div v-else-if="error" class="error-state"><p>{{ error }}</p><button class="btn-retry" @click="fetchData">{{ T("retry") }}</button></div>\
-    <div v-else-if="items.length===0" class="empty-state"><div class="empty-icon">🔍</div><p>{{ T("no_results") }} "{{ q }}"</p><p style="font-size:.82rem;color:var(--text-muted);">{{ T("no_results_hint") }}</p></div>\
-    <div v-else class="result-list">\
-        <div v-for="item in items" :key="item.infoHash" class="result-card" @click="$router.push(\'/torrent/\' + item.infoHash)">\
-            <div class="result-top">\
-                <div class="result-icon">{{ catInfo(item.name).icon }}</div>\
-                <div class="result-body">\
-                    <div class="result-name" v-html="highlightTerm(item.name,q)"></div>\
-                    <div class="result-tags">\
-                        <span v-if="catInfo(item.name).cat" class="tag tag-cat">{{ catInfo(item.name).cat }}</span>\
-                        <span class="tag tag-size">{{ fmtSize(item.totalLength) }}</span>\
-                        <span v-if="item.fileCount>1" class="tag tag-files">{{ item.fileCount }} files</span>\
-                        <span v-if="item.peerCount>0" class="tag tag-health">{{ item.peerCount }} peers</span>\
-                        <span v-if="item.isPrivate" class="tag tag-private">{{ T("private_torrent") }}</span>\
-                    </div>\
-                </div>\
-            </div>\
-            <div class="result-footer">\
-                <span>{{ fmtRelative(item.createdAt) }} &middot; <span class="result-hash">{{ item.infoHash.slice(0,12) }}...</span></span>\
-                <button class="result-copy" @click.stop="copyMagnet(item)">🧲 {{ T("copy_magnet") }}</button>\
-            </div>\
-        </div>\
-    </div>\
-    <div v-if="total>pageSize" class="pagination">\
-        <button :disabled="page<=1" @click="goPage(page-1)">&larr; {{ T("prev_page") }}</button>\
-        <template v-for="p in pageNumbers">\
-            <button v-if="p===\'...\'" class="page-dots" disabled>...</button>\
-            <button v-else :class="{current:p===page}" @click="goPage(p)">{{ p }}</button>\
-        </template>\
-        <button :disabled="page>=totalPages" @click="goPage(page+1)">{{ T("next_page") }} &rarr;</button>\
-    </div>\
-</div>',
-    data: function(){
+    template: '<div class="result-header"><span class="result-count">{{ fmtNumber(total) }}</span> {{ T("found") }} — {{ T("results_for") }} <b>{{ q }}</b><div class="result-filters"><span v-for="f in filters" class="filter-chip" :class="{active:af===f.v}" @click="setF(f.v)">{{ f.l }}</span></div></div><div v-if="loading"><div class="skeleton skel-line long"></div><div class="skeleton skel-line long"></div><div class="skeleton skel-line mid"></div></div><div v-else-if="err" class="error-state">{{ err }} <button class="retry-btn" @click="fetch">{{ T("retry") }}</button></div><div v-else-if="items.length===0" class="empty-state">{{ T("no_results") }} "{{ q }}"<br><span style="font-size:.82rem;color:var(--text-muted);">{{ T("no_results_hint") }}</span></div><div v-else><div v-for="(item,idx) in items" :key="item.infoHash" class="result-item" @click="$router.push(\'/torrent/\'+item.infoHash)"><div class="result-title" v-html="highlightTerm(item.name,q)"></div><div class="result-tags"><span v-if="catInfo(item.name).cat" class="tag tag-cat">{{ catInfo(item.name).cat }}</span><span class="tag tag-size">{{ fmtSize(item.totalLength) }}</span><span v-if="item.fileCount>1" class="tag tag-files">{{ item.fileCount }} files</span><span v-if="item.peerCount>0" class="tag tag-health">{{ item.peerCount }} peers</span></div><div class="result-footer"><span>{{ fmtRelative(item.createdAt) }}</span><span>{{ item.infoHash.slice(0,12) }}...</span><button class="result-copy-btn" @click.stop="cp(item)">🧲 {{ T("copy_magnet") }}</button></div></div></div><div v-if="total>pageSize" class="pagination"><button :disabled="page<=1" @click="goPage(page-1)">{{ T("prev_page") }}</button><span class="page-info">{{ page }} / {{ tp }}</span><button :disabled="page>=tp" @click="goPage(page+1)">{{ T("next_page") }}</button></div></div>',
+    data: function () {
         return {
-            items:[], total:0, loading:true, error:'', activeFilter:'',
-            filters:[
-                {label:T('filters_all'),value:''},
-                {label:'🎬 '+T('filters_video'),value:'mkv'},
-                {label:'🎵 '+T('filters_audio'),value:'mp3'},
-                {label:'📚 '+T('filters_books'),value:'pdf'},
-                {label:'📦 '+T('filters_archives'),value:'zip'},
-                {label:'🖼️ '+T('filters_images'),value:'jpg'}
-            ]
+            items: [], total: 0, loading: true, err: '', af: '',
+            filters: [{ l: 'All', v: '' }, { l: '🎬 Video', v: 'mkv' }, { l: '🎵 Audio', v: 'mp3' }, { l: '📚 Books', v: 'pdf' }, { l: '📦 Archives', v: 'zip' }, { l: '🖼️ Images', v: 'jpg' }]
         };
     },
-    computed: {
-        q: function(){ return (this.$route.query.q||'').trim(); },
-        page: function(){ return Math.max(1,parseInt(this.$route.query.page)||1); },
-        pageSize: function(){ return 20; },
-        totalPages: function(){ return Math.max(1,Math.ceil(this.total/this.pageSize)); },
-        pageNumbers: function(){
-            var p=[],tp=this.totalPages,cp=this.page;
-            var s=Math.max(1,cp-2),e=Math.min(tp,cp+2);
-            if(s>1){p.push(1);if(s>2)p.push('...');}
-            for(var i=s;i<=e;i++)p.push(i);
-            if(e<tp){if(e<tp-1)p.push('...');p.push(tp);}
-            return p;
-        }
-    },
-    watch: {
-        '$route.query.q':{immediate:true,handler:function(){this.fetchData();}},
-        '$route.query.page':{handler:function(){this.fetchData();}}
-    },
+    computed: { q: function () { return (this.$route.query.q || '').trim(); }, page: function () { return Math.max(1, parseInt(this.$route.query.page) || 1); }, pageSize: function () { return 20; }, tp: function () { return Math.max(1, Math.ceil(this.total / this.pageSize)); } },
+    watch: { '$route.query.q': { immediate: true, handler: function () { this.fetch(); } }, '$route.query.page': { handler: function () { this.fetch(); } } },
     methods: {
-        T:T, fmtSize:fmtSize, fmtDate:fmtDate, fmtNumber:fmtNumber, fmtRelative:fmtRelative,
-        catInfo:detectCategory, highlightTerm:highlightTerm,
-        setFilter: function(ft){ this.activeFilter = this.activeFilter===ft?'':ft; this.fetchData(); },
-        fetchData: function(){
-            var self=this; self.loading=true; self.error='';
-            if(!self.q){self.loading=false;return;}
-            saveHistory(self.q);
-            var p=new URLSearchParams({q:self.q,page:self.page,size:self.pageSize});
-            if(self.activeFilter)p.set('fileType',self.activeFilter);
-            fetch(API+'/api/v1/torrents/search?'+p)
-                .then(function(r){if(!r.ok)throw new Error('Search failed ('+r.status+')');return r.json();})
-                .then(function(d){self.items=d.items||[];self.total=d.total||0;})
-                .catch(function(e){self.error=e.message;})
-                .finally(function(){self.loading=false;});
+        T: T, fmtSize: fmtSize, fmtNumber: fmtNumber, fmtRelative: fmtRelative, catInfo: detectCategory, highlightTerm: highlightTerm,
+        setF: function (f) { this.af = this.af === f ? '' : f; this.fetch(); },
+        fetch: function () {
+            var s = this; s.loading = true; s.err = ''; if (!s.q) { s.loading = false; return; }
+            saveHistory(s.q); document.title = s.q + ' - Cherry';
+            var p = new URLSearchParams({ q: s.q, page: s.page, size: s.pageSize }); if (s.af) p.set('fileType', s.af);
+            fetch(API + '/api/v1/torrents/search?' + p).then(function (r) { if (!r.ok) throw new Error('Search failed'); return r.json(); }).then(function (d) { s.items = d.items || []; s.total = d.total || 0; }).catch(function (e) { s.err = e.message; }).finally(function () { s.loading = false; });
         },
-        goPage: function(p){ this.$router.push({path:'/search',query:{q:this.q,page:p}}); window.scrollTo({top:0,behavior:'smooth'}); },
-        copyMagnet: function(item){ copyText(magnetLink(item.infoHash,item.name), T('link_copied')); }
+        goPage: function (p) { this.$router.push({ path: '/search', query: { q: this.q, page: p } }); },
+        cp: function (item) { copyText(magnetLink(item.infoHash, item.name)); }
     }
 };
 
 var DetailPage = {
-    template: '\
-<div>\
-    <a class="back-link" @click="$router.back()">← {{ T("back") }}</a>\
-\
-    <div v-if="loading">\
-        <div class="skel-card"><div class="skeleton skel-line" style="width:70%;height:22px;margin-bottom:12px;"></div><div class="skeleton skel-line mid"></div><div class="skeleton skel-line short"></div></div>\
-    </div>\
-\
-    <div v-else-if="error" class="error-state"><p>⚠ {{ error }}</p><button class="btn-retry" @click="loadDetail">{{ T("retry") }}</button></div>\
-\
-    <div v-else>\
-        <div class="detail-hero">\
-            <div class="detail-icon">{{ catInfo(torrent.name).icon }}</div>\
-            <div class="detail-title-area">\
-                <div class="detail-title">{{ torrent.name }}</div>\
-                <div class="detail-subtitle">\
-                    <span v-if="torrent.peerCount>0" class="tag tag-health">{{ torrent.peerCount }} peers</span>\
-                    <span>{{ fmtRelative(torrent.createdAt) }}</span>\
-                    <span v-if="torrent.isPrivate" class="tag tag-private">{{ T("private_torrent") }}</span>\
-                    <span v-if="catInfo(torrent.name).cat" class="tag tag-cat">{{ catInfo(torrent.name).cat }}</span>\
-                </div>\
-            </div>\
-        </div>\
-\
-        <div class="detail-stats-row">\
-            <div class="detail-stat"><span class="ds-icon">📦</span><span class="ds-value size">{{ fmtSize(torrent.totalLength) }}</span></div>\
-            <div class="detail-stat"><span class="ds-icon">📄</span><span class="ds-value">{{ torrent.fileCount }}</span><span class="ds-label">files</span></div>\
-            <div class="detail-stat"><span class="ds-icon">🕐</span><span class="ds-value">{{ fmtDate(torrent.createdAt) }}</span></div>\
-        </div>\
-\
-        <div class="detail-actions-row">\
-            <a :href="magnet" class="btn-magnet">🧲 {{ T("download_magnet") }}</a>\
-            <button class="btn-copy" :class="{copied:copied}" @click="copyMagnet">{{ copied?\'✓ \'+T("copied"):\'📋 \'+T("copy_link") }}</button>\
-        </div>\
-\
-        <div class="hash-box">\
-            <span class="hash-text">{{ torrent.infoHash }}</span>\
-            <button class="hash-copy" @click="copyHash">{{ T("copy_link") }}</button>\
-        </div>\
-\
-        <div v-if="torrent.files && torrent.files.length" class="file-section">\
-            <div class="file-section-header">\
-                <h3>📂 {{ T("file_list") }} <span class="file-count-badge">({{ torrent.files.length }})</span></h3>\
-                <input class="file-search" :placeholder="T(\'filter_files\')" v-model="fileFilter" />\
-            </div>\
-            <div class="file-table-wrapper">\
-                <table class="file-table">\
-                    <thead>\
-                        <tr>\
-                            <th style="width:40px;text-align:right;">#</th>\
-                            <th class="sortable" @click="sortFiles(\'name\')">{{ T("sort_name") }}{{ sortBy==="name"?(sortAsc?" ↑":" ↓"):"" }}</th>\
-                            <th class="sortable" @click="sortFiles(\'size\')" style="text-align:right;width:100px;">{{ T("sort_size") }}{{ sortBy==="size"?(sortAsc?" ↑":" ↓"):"" }}</th>\
-                        </tr>\
-                    </thead>\
-                    <tbody>\
-                        <tr v-for="(f,idx) in pagedFiles" :key="f.pathText">\
-                            <td class="file-row-num">{{ idx + 1 + (filePage-1)*filePageSize }}</td>\
-                            <td><span class="file-row-icon">{{ fileIcon(f.pathText) }}</span>{{ f.pathText }}</td>\
-                            <td class="file-row-size">{{ fmtSize(f.length) }}</td>\
-                        </tr>\
-                    </tbody>\
-                </table>\
-            </div>\
-            <div v-if="filteredFiles.length > filePageSize" class="pagination">\
-                <button :disabled="filePage<=1" @click="filePage--">&larr;</button>\
-                <span style="padding:0 12px;font-size:.85rem;color:var(--text-dim);">{{ filePage }} / {{ fileTotalPages }}</span>\
-                <button :disabled="filePage>=fileTotalPages" @click="filePage++">&rarr;</button>\
-            </div>\
-            <div v-if="filteredFiles.length > 500" class="file-truncated" style="margin-top:8px;">{{ T("files_shown") }} 500 {{ T("no_more") }}</div>\
-        </div>\
-    </div>\
-</div>',
-    data: function(){ return { torrent:{}, loading:true, error:'', copied:false, uploading:false, uploadResult:'', fileFilter:'', filePage:1, filePageSize:50, sortBy:'', sortAsc:true }; },
+    template: '<div><a class="back-link" @click="$router.back()">← {{ T("back") }}</a><div v-if="loading"><div class="skeleton skel-line long"></div><div class="skeleton skel-line mid"></div></div><div v-else-if="err" class="error-state">{{ err }} <button class="retry-btn" @click="load">{{ T("retry") }}</button></div><div v-else><div class="detail-title">{{ t.name }}</div><div class="detail-meta"><span v-if="t.peerCount>0" style="color:#1e8e3e;font-weight:500;">{{ t.peerCount }} peers</span><span>{{ fmtSize(t.totalLength) }}</span><span>{{ t.fileCount }} files</span><span>{{ fmtDate(t.createdAt) }}</span><span v-if="catInfo(t.name).cat">{{ catInfo(t.name).cat }}</span></div><div class="detail-actions"><a :href="magnet" class="btn-primary">🧲 {{ T("download_magnet") }}</a><button class="btn-secondary" :class="{copied:cpd}" @click="cp">{{ cpd?"✓ "+T("copied"):T("copy_link") }}</button></div><div class="hash-row"><span>{{ t.infoHash }}</span><button class="hash-copy-btn" @click="cph">{{ T("copy_link") }}</button></div><div v-if="t.files&&t.files.length" class="file-section"><div class="file-header"><h3>{{ T("file_list") }} <span style="color:var(--text-muted);font-weight:400;">({{ t.files.length }})</span></h3><input class="file-search" :placeholder="T(\'filter_files\')" v-model="ff" /></div><table class="file-table"><thead><tr><th class="file-num-col">#</th><th class="sortable" @click="sf(\'name\')">{{ T("sort_name") }}{{ sb==="name"?(sa?" ↑":" ↓"):"" }}</th><th class="sortable file-size-col" @click="sf(\'size\')">{{ T("sort_size") }}{{ sb==="size"?(sa?" ↑":" ↓"):"" }}</th></tr></thead><tbody><tr v-for="(f,idx) in pf" :key="f.pathText"><td class="file-num-col">{{ idx+1+(fp-1)*50 }}</td><td><span class="file-type-icon">{{ fileIcon(f.pathText) }}</span>{{ f.pathText }}</td><td class="file-size-col">{{ fmtSize(f.length) }}</td></tr></tbody></table><div v-if="fi.length>50" class="pagination"><button :disabled="fp<=1" @click="fp--">{{ T("prev_page") }}</button><span class="page-info">{{ fp }}/{{ ftp }}</span><button :disabled="fp>=ftp" @click="fp++">{{ T("next_page") }}</button></div></div></div></div>',
+    data: function () { return { t: {}, loading: true, err: '', cpd: false, ff: '', fp: 1, sb: '', sa: true }; },
     computed: {
-        magnet: function(){ return magnetLink(this.torrent.infoHash, this.torrent.name); },
-        allFiles: function(){ return (this.torrent.files||[]).slice(0,500); },
-        filteredFiles: function(){
-            var self=this;
-            var list = self.allFiles;
-            if (self.fileFilter) {
-                var q = self.fileFilter.toLowerCase();
-                list = list.filter(function(f){ return f.pathText.toLowerCase().indexOf(q)>=0; });
-            }
-            if (self.sortBy === 'name') {
-                list = list.slice().sort(function(a,b){ return self.sortAsc ? a.pathText.localeCompare(b.pathText) : b.pathText.localeCompare(a.pathText); });
-            } else if (self.sortBy === 'size') {
-                list = list.slice().sort(function(a,b){ return self.sortAsc ? a.length - b.length : b.length - a.length; });
-            }
-            return list;
+        magnet: function () { return magnetLink(this.t.infoHash, this.t.name); },
+        fi: function () {
+            var s = this, l = (s.t.files || []).slice(0, 500);
+            if (s.ff) { var q = s.ff.toLowerCase(); l = l.filter(function (f) { return f.pathText.toLowerCase().indexOf(q) >= 0; }); }
+            if (s.sb === 'name') l = l.slice().sort(function (a, b) { return s.sa ? a.pathText.localeCompare(b.pathText) : b.pathText.localeCompare(a.pathText); });
+            else if (s.sb === 'size') l = l.slice().sort(function (a, b) { return s.sa ? a.length - b.length : b.length - a.length; });
+            return l;
         },
-        pagedFiles: function(){
-            var s = (this.filePage-1) * this.filePageSize;
-            return this.filteredFiles.slice(s, s + this.filePageSize);
-        },
-        fileTotalPages: function(){ return Math.max(1, Math.ceil(this.filteredFiles.length / this.filePageSize)); }
+        pf: function () { var s = (this.fp - 1) * 50; return this.fi.slice(s, s + 50); },
+        ftp: function () { return Math.max(1, Math.ceil(this.fi.length / 50)); }
     },
-    watch: { fileFilter: function(){ this.filePage = 1; } },
-    mounted: function(){ this.loadDetail(); },
+    watch: { ff: function () { this.fp = 1; } },
+    mounted: function () { this.load(); },
     methods: {
-        T:T, fmtSize:fmtSize, fmtDate:fmtDate, fmtRelative:fmtRelative, fileIcon:fileIcon, catInfo:detectCategory,
-        loadDetail: function(){
-            var self=this; self.loading=true; self.error='';
-            fetch(API + '/api/v1/torrents/' + this.$route.params.infoHash)
-                .then(function(r){if(!r.ok)throw new Error(r.status===404?T('torrent_not_found'):T('server_error'));return r.json();})
-                .then(function(d){self.torrent=d;})
-                .catch(function(e){self.error=e.message;})
-                .finally(function(){self.loading=false;});
+        T: T, fmtSize: fmtSize, fmtDate: fmtDate, fileIcon: fileIcon, catInfo: detectCategory,
+        load: function () {
+            var s = this; s.loading = true; s.err = '';
+            fetch(API + '/api/v1/torrents/' + this.$route.params.infoHash).then(function (r) { if (!r.ok) throw new Error(r.status === 404 ? T('torrent_not_found') : T('server_error')); return r.json(); }).then(function (d) { s.t = d; document.title = d.name + ' - Cherry'; }).catch(function (e) { s.err = e.message; }).finally(function () { s.loading = false; });
         },
-        copyMagnet: function(){ var self=this; copyText(this.magnet, T('link_copied')); self.copied=true; setTimeout(function(){self.copied=false;},2000); },
-        copyHash: function(){ copyText(this.torrent.infoHash, T('hash_copied')); },
-        uploadTorrent: function(e){
-            var self = this;
-            var f = e.target.files[0];
-            if (!f) return;
-            self.uploading = true; self.uploadResult = '';
-            var fd = new FormData();
-            fd.append('file', f);
-            fetch(API + '/api/v1/torrents/upload', { method: 'POST', body: fd })
-                .then(function(r){ return r.ok ? r.json() : r.json().then(function(e){ throw new Error(e.detail || 'Upload failed'); }); })
-                .then(function(d){
-                    if (d.status === 'duplicate') self.uploadResult = 'Already in database';
-                    else { self.uploadResult = 'Added! Reloading...'; setTimeout(function(){ window.location.reload(); }, 1000); }
-                })
-                .catch(function(e){ self.uploadResult = 'Error: ' + e.message; })
-                .finally(function(){ self.uploading = false; });
-        },
-        sortFiles: function(field){
-            if (this.sortBy === field) { this.sortAsc = !this.sortAsc; }
-            else { this.sortBy = field; this.sortAsc = true; }
-        }
+        cp: function () { var s = this; copyText(s.magnet); s.cpd = true; setTimeout(function () { s.cpd = false; }, 2000); },
+        cph: function () { copyText(this.t.infoHash); },
+        sf: function (f) { if (this.sb === f) { this.sa = !this.sa; } else { this.sb = f; this.sa = true; } }
     }
 };
 
 var RecentPage = {
-    template: '\
-<div>\
-    <h2 style="font-size:1.15rem;font-weight:600;margin-bottom:14px;">{{ T("recent_title") }}</h2>\
-    <div v-if="loading">\
-        <div class="skel-card" v-for="_ in 5"><div class="skeleton skel-line long"></div><div class="skeleton skel-line mid"></div><div class="skeleton skel-line short"></div></div>\
-    </div>\
-    <div v-else-if="error" class="error-state"><p>{{ error }}</p><button class="btn-retry" @click="fetchData">{{ T("retry") }}</button></div>\
-    <div v-else class="result-list">\
-        <div v-for="item in items" :key="item.infoHash" class="result-card" @click="$router.push(\'/torrent/\' + item.infoHash)">\
-            <div class="result-top">\
-                <div class="result-icon">{{ catInfo(item.name).icon }}</div>\
-                <div class="result-body">\
-                    <div class="result-name">{{ item.name }}</div>\
-                    <div class="result-tags">\
-                        <span v-if="catInfo(item.name).cat" class="tag tag-cat">{{ catInfo(item.name).cat }}</span>\
-                        <span class="tag tag-size">{{ fmtSize(item.totalLength) }}</span>\
-                        <span v-if="item.fileCount>1" class="tag tag-files">{{ item.fileCount }} files</span>\
-                        <span v-if="item.peerCount>0" class="tag tag-health">{{ item.peerCount }} peers</span>\
-                        <span v-if="item.isPrivate" class="tag tag-private">{{ T("private_torrent") }}</span>\
-                    </div>\
-                </div>\
-            </div>\
-            <div class="result-footer">\
-                <span>{{ fmtRelative(item.createdAt) }} &middot; <span class="result-hash">{{ item.infoHash.slice(0,12) }}...</span></span>\
-                <button class="result-copy" @click.stop="copyMagnet(item)">🧲 {{ T("copy_magnet") }}</button>\
-            </div>\
-        </div>\
-    </div>\
-</div>',
-    data: function(){ return { items:[], loading:true, error:'' }; },
-    mounted: function(){ this.fetchData(); },
-    methods: {
-        T:T, fmtSize:fmtSize, fmtRelative:fmtRelative, catInfo:detectCategory,
-        fetchData: function(){
-            var self=this; self.loading=true;
-            fetch(API+'/api/v1/torrents/recent')
-                .then(function(r){if(!r.ok)throw new Error('Failed');return r.json();})
-                .then(function(d){self.items=d||[];})
-                .catch(function(e){self.error=e.message;})
-                .finally(function(){self.loading=false;});
-        },
-        copyMagnet: function(item){ copyText(magnetLink(item.infoHash,item.name), T('link_copied')); }
-    }
+    template: '<div class="result-header"><span class="result-count">{{ items.length }}</span> recent torrents</div><div v-if="loading"><div class="skeleton skel-line long"></div><div class="skeleton skel-line mid"></div></div><div v-else-if="err" class="error-state">{{ err }}</div><div v-else><div v-for="item in items" :key="item.infoHash" class="result-item" @click="$router.push(\'/torrent/\'+item.infoHash)"><div class="result-title">{{ item.name }}</div><div class="result-tags"><span v-if="catInfo(item.name).cat" class="tag tag-cat">{{ catInfo(item.name).cat }}</span><span class="tag tag-size">{{ fmtSize(item.totalLength) }}</span><span v-if="item.fileCount>1" class="tag tag-files">{{ item.fileCount }} files</span><span v-if="item.peerCount>0" class="tag tag-health">{{ item.peerCount }} peers</span></div><div class="result-footer"><span>{{ fmtRelative(item.createdAt) }}</span><span>{{ item.infoHash.slice(0,12) }}...</span><button class="result-copy-btn" @click.stop="cp(item)">🧲 {{ T("copy_magnet") }}</button></div></div></div></div>',
+    data: function () { return { items: [], loading: true, err: '' }; },
+    mounted: function () { var s = this; document.title = 'Recent - Cherry'; fetch(API + '/api/v1/torrents/recent').then(function (r) { return r.json(); }).then(function (d) { s.items = d || []; }).catch(function (e) { s.err = e.message; }).finally(function () { s.loading = false; }); },
+    methods: { T: T, fmtSize: fmtSize, fmtRelative: fmtRelative, catInfo: detectCategory, cp: function (i) { copyText(magnetLink(i.infoHash, i.name)); } }
 };
 
 // ---- Router ----
-var router = VueRouter.createRouter({
-    history: VueRouter.createWebHistory(),
-    routes:[
-        { path:'/', component:HomePage },
-        { path:'/search', component:SearchPage },
-        { path:'/recent', component:RecentPage },
-        { path:'/torrent/:infoHash', component:DetailPage }
-    ]
-});
+var router = VueRouter.createRouter({ history: VueRouter.createWebHistory(), routes: [{ path: '/', component: HomePage }, { path: '/search', component: SearchPage }, { path: '/recent', component: RecentPage }, { path: '/torrent/:infoHash', component: DetailPage }] });
 
 // ---- Root App ----
 var App = {
-    template: '\
-<nav class="topbar">\
-    <a href="/" class="logo">🍒 Cherry</a>\
-    <a href="/recent" class="nav-link">{{ T("nav_recent") }}</a>\
-    <span style="flex:1;"></span>\
-    <span class="lang-switch" @click="switchLang" :title="lang==\'zh\'?\'Switch to English\':\'切换到中文\'">{{ T("lang_label") }}</span>\
-</nav>\
-<main class="main"><router-view /></main>',
-    data: function(){ return { lang:lang }; },
-    methods: {
-        T:T, switchLang:switchLang
-    }
+    template: '<nav class="topbar"><a href="/" class="logo">🍒 Cherry</a><div class="search-wrap"><input type="text" class="search-input" :placeholder="T(\'search_placeholder\')" v-model="q" @keydown.enter="doSearch" ref="navInp" /><button class="search-btn" @click="doSearch">{{ T("search_btn") }}</button></div><div class="nav-links"><a href="/recent">Recent</a></div><span class="lang-switch" @click="switchLang">{{ T("lang_label") }}</span></nav><main class="main"><router-view /></main>',
+    data: function () { return { q: '', lang: lang }; },
+    watch: { '$route.query.q': function (v) { if (v) this.q = v; } },
+    mounted: function () { var s = this; document.addEventListener('keydown', function (e) { if ((e.ctrlKey || e.metaKey) && e.key === 'k') { e.preventDefault(); s.$refs.navInp && s.$refs.navInp.focus(); } }); },
+    methods: { T: T, switchLang: switchLang, doSearch: function () { var q = this.q.trim(); if (!q) return; saveHistory(q); this.$router.push({ path: '/search', query: { q: q } }); } }
 };
 
 var app = Vue.createApp(App);

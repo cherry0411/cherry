@@ -27,7 +27,8 @@ public class MeiliSearchClient
             limit = pageSize,
             sort = new[] { sort },
             filter = filter,
-            attributesToRetrieve = new[] { "infoHash" }
+            attributesToRetrieve = new[] { "infoHash" },
+            matchingStrategy = SearchHelper.IsCjkQuery(query) ? "all" : "last"
         });
 
         var content = new StringContent(body, System.Text.Encoding.UTF8, "application/json");
@@ -51,4 +52,16 @@ public class MeiliHit
 {
     [JsonPropertyName("infoHash")]
     public string InfoHash { get; set; } = string.Empty;
+}
+
+// Helper: returns true if query contains CJK characters (needs stricter matching)
+public static class SearchHelper
+{
+    public static bool IsCjkQuery(string query)
+    {
+        foreach (var c in query)
+            if (c >= 0x4E00 && c <= 0x9FFF) // CJK Unified Ideographs
+                return true;
+        return false;
+    }
 }
