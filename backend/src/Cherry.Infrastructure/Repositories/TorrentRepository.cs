@@ -1,6 +1,7 @@
 using Cherry.Domain.Entities;
 using Cherry.Domain.Interfaces;
 using Cherry.Infrastructure.Data;
+using Cherry.Infrastructure.Search;
 using Microsoft.EntityFrameworkCore;
 using Npgsql;
 
@@ -9,10 +10,12 @@ namespace Cherry.Infrastructure.Repositories;
 public class TorrentRepository : ITorrentRepository
 {
     private readonly AppDbContext _db;
+    private readonly MeiliSearchClient? _meili;
 
-    public TorrentRepository(AppDbContext db)
+    public TorrentRepository(AppDbContext db, MeiliSearchClient? meili = null)
     {
         _db = db;
+        _meili = meili;
     }
 
     public async Task<long> BulkInsertTorrentsAsync(List<Torrent> torrents, CancellationToken ct = default)
@@ -157,6 +160,28 @@ public class TorrentRepository : ITorrentRepository
     public async Task<(List<Torrent> Items, long Total)> SearchAsync(
         string query, int page, int pageSize, string? fileType = null, CancellationToken ct = default)
     {
+        // Try Meilisearch first
+        if (_meili != null)
+        {
+            var result = await _meili.SearchAsync(query, page, pageSize, fileType, ct);
+            if (result is { Hits.Count: > 0 })
+            {
+                var hashes = result.Hits.Select(h => h.InfoHash).ToList();
+                var dbItems = await _db.Torrents
+                    .AsNoTracking()
+                    .Where(t => hashes.Contains(t.InfoHash))
+                    .ToListAsync(ct);
+                // Preserve Meilisearch order
+                var ordered = hashes
+                    .Select(h => dbItems.FirstOrDefault(t => t.InfoHash == h))
+                    .Where(t => t != null)
+                    .Cast<Torrent>()
+                    .ToList();
+                return (ordered, result.EstimatedTotalHits);
+            }
+        }
+
+        // Fallback: PG trigram
         var baseQuery = _db.Torrents
             .AsNoTracking()
             .Where(t => EF.Functions.TrigramsSimilarityDistance(t.Name, query) < 0.95);
@@ -168,17 +193,9 @@ public class TorrentRepository : ITorrentRepository
         }
 
         var total = await baseQuery.LongCountAsync(ct);
-
-        // Ranking: relevance × popularity
-        // Tier 3: relevant + popular; Tier 2: relevant; Tier 1: popular; Tier 0: rest
         var items = await baseQuery
-            .OrderByDescending(t =>
-                (EF.Functions.TrigramsSimilarityDistance(t.Name, query) < 0.7 && t.PeerCount > 10) ? 3
-                : EF.Functions.TrigramsSimilarityDistance(t.Name, query) < 0.7 ? 2
-                : t.PeerCount > 10 ? 1
-                : 0)
-            .ThenByDescending(t => t.PeerCount)
-            .ThenBy(t => EF.Functions.TrigramsSimilarityDistance(t.Name, query))
+            .OrderByDescending(t => t.PeerCount)
+            .ThenByDescending(t => t.CreatedAt)
             .Skip((page - 1) * pageSize)
             .Take(pageSize)
             .ToListAsync(ct);

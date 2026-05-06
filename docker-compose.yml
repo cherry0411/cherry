@@ -27,6 +27,7 @@ services:
     environment:
       ConnectionStrings__Default: >-
         Host=postgres;Port=5432;Database=${POSTGRES_DB:-cherry};Username=${POSTGRES_USER:-cherry};Password=${POSTGRES_PASSWORD:-cH3rry_pg_7xK9mQw2};Pooling=true;MaxPoolSize=64
+      MeiliSearch__Url: http://meilisearch:7700
     volumes:
       - apidata:/app/data
     ports:
@@ -47,6 +48,16 @@ services:
       - "80:80"
     depends_on:
       - api
+
+  meilisearch:
+    image: getmeili/meilisearch:latest
+    restart: unless-stopped
+    environment:
+      MEILI_NO_ANALYTICS: "true"
+    volumes:
+      - meili_data:/meili_data
+    ports:
+      - "127.0.0.1:7700:7700"
 
   crawler:
     build: ./go/cherry-picker
@@ -231,3 +242,4 @@ services:
 volumes:
   pgdata:
   apidata:
+  meili_data:

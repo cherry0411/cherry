@@ -23,6 +23,17 @@ builder.Services.AddDbContextPool<AppDbContext>(options =>
     });
 }, poolSize: 64);
 
+// MeiliSearch (optional — falls back to PG trigram if not configured)
+var meiliUrl = builder.Configuration["MeiliSearch:Url"];
+if (!string.IsNullOrWhiteSpace(meiliUrl))
+{
+    builder.Services.AddHttpClient<Cherry.Infrastructure.Search.MeiliSearchClient>(c =>
+    {
+        c.BaseAddress = new Uri(meiliUrl);
+        c.Timeout = TimeSpan.FromSeconds(5);
+    });
+}
+
 // Core services
 var dedupPath = Path.Combine(builder.Environment.ContentRootPath, "data", "cuckoo.dat");
 var dedup = new CuckooFilter(capacity: 100_000_000, persistPath: dedupPath);
