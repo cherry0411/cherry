@@ -21,7 +21,9 @@
       "Bash(ls /c/Program*/Go/bin/)",
       "Read(//mnt/**)",
       "Bash(cmd /c \"where go\")",
-      "Bash(cmd *)"
+      "Bash(cmd *)",
+      "WebFetch(domain:github.com)",
+      "WebSearch"
     ]
   }
 }
