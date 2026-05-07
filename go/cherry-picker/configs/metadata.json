@@ -2,7 +2,7 @@
   "role": "metadata",
   "instance_id": "metadata-1",
   "listen_addr": ":20002",
-  "event_queue": 131072,
+  "event_queue": 32768,
   "dedupe": {
     "peer_ttl": "10m",
     "metadata_ttl": "30m"
@@ -14,8 +14,8 @@
   "metadata": {
     "enabled": true,
     "black_list_size": 131072,
-    "request_queue_size": 131072,
-    "worker_queue_size": 1536
+    "request_queue_size": 32768,
+    "worker_queue_size": 768
   },
   "exporter": {
     "kind": "http",

@@ -36,6 +36,7 @@ type DiscoveryConfig struct {
 	PacketJobs     int
 	MaxNodes       int
 	RefreshNodes   int
+	QueryFanout    int
 }
 
 type MetadataConfig struct {
@@ -89,6 +90,7 @@ func Load() (Config, error) {
 			PacketJobs:     getenvInt("CHERRY_PICKER_DHT_PACKET_JOBS", defaultPacketJobs()),
 			MaxNodes:       getenvInt("CHERRY_PICKER_DHT_MAX_NODES", defaultMaxNodes()),
 			RefreshNodes:   getenvInt("CHERRY_PICKER_DHT_REFRESH_NODES", defaultRefreshNodes()),
+			QueryFanout:    getenvInt("CHERRY_PICKER_DHT_QUERY_FANOUT", defaultQueryFanout()),
 		},
 		Metadata: MetadataConfig{
 			Enabled:          getenvBool("CHERRY_PICKER_METADATA_ENABLED", true),
@@ -140,6 +142,7 @@ func loadFromFile(path string) (Config, error) {
 			PacketJobs:     intOrDefault(raw.Discovery.PacketJobs, 65536),
 			MaxNodes:       intOrDefault(raw.Discovery.MaxNodes, 50000),
 			RefreshNodes:   intOrDefault(raw.Discovery.RefreshNodes, 2048),
+			QueryFanout:    intOrDefault(raw.Discovery.QueryFanout, defaultQueryFanout()),
 		},
 		Metadata: MetadataConfig{
 			Enabled:          raw.Metadata.Enabled,
@@ -197,6 +200,9 @@ func normalize(cfg Config) Config {
 	}
 	if cfg.Discovery.RefreshNodes <= 0 {
 		cfg.Discovery.RefreshNodes = defaultRefreshNodes()
+	}
+	if cfg.Discovery.QueryFanout <= 0 {
+		cfg.Discovery.QueryFanout = defaultQueryFanout()
 	}
 	if cfg.Metadata.BlackListSize <= 0 {
 		cfg.Metadata.BlackListSize = 131072
@@ -268,6 +274,7 @@ type fileDiscoveryConfig struct {
 	PacketJobs     int    `json:"packet_jobs"`
 	MaxNodes       int    `json:"max_nodes"`
 	RefreshNodes   int    `json:"refresh_nodes"`
+	QueryFanout    int    `json:"query_fanout"`
 }
 
 type fileMetadataConfig struct {
@@ -306,78 +313,89 @@ func cpuScale() int {
 }
 
 func defaultEventQueue() int {
-	value := cpuScale() * 16384
-	if value < 65536 {
-		return 65536
+	value := cpuScale() * 4096
+	if value < 16384 {
+		return 16384
 	}
-	if value > 262144 {
-		return 262144
+	if value > 65536 {
+		return 65536
 	}
 	return value
 }
 
 func defaultPacketWorkers() int {
-	value := cpuScale() * 128
-	if value < 512 {
-		return 512
+	value := cpuScale() * 64
+	if value < 256 {
+		return 256
 	}
-	if value > 2048 {
-		return 2048
+	if value > 1024 {
+		return 1024
 	}
 	return value
 }
 
 func defaultPacketJobs() int {
-	value := defaultPacketWorkers() * 256
-	if value < 65536 {
-		return 65536
+	value := defaultPacketWorkers() * 128
+	if value < 32768 {
+		return 32768
 	}
-	if value > 524288 {
-		return 524288
+	if value > 131072 {
+		return 131072
 	}
 	return value
 }
 
 func defaultMaxNodes() int {
-	value := cpuScale() * 25000
-	if value < 100000 {
-		return 100000
+	value := cpuScale() * 12000
+	if value < 50000 {
+		return 50000
 	}
-	if value > 400000 {
-		return 400000
+	if value > 150000 {
+		return 150000
 	}
 	return value
 }
 
 func defaultRefreshNodes() int {
-	value := cpuScale() * 512
-	if value < 4096 {
-		return 4096
+	value := cpuScale() * 64
+	if value < 256 {
+		return 256
 	}
-	if value > 16384 {
-		return 16384
+	if value > 1024 {
+		return 1024
+	}
+	return value
+}
+
+func defaultQueryFanout() int {
+	value := cpuScale() * 8
+	if value < 32 {
+		return 32
+	}
+	if value > 128 {
+		return 128
 	}
 	return value
 }
 
 func defaultMetadataWorkers() int {
-	value := cpuScale() * 64
-	if value < 512 {
-		return 512
+	value := cpuScale() * 32
+	if value < 256 {
+		return 256
 	}
-	if value > 2048 {
-		return 2048
+	if value > 768 {
+		return 768
 	}
 	return value
 }
 
 func defaultMetadataRequestQueue() int {
-	value := defaultMetadataWorkers() * 128
-	if value < 65536 {
-		return 65536
+	value := defaultMetadataWorkers() * 64
+	if value < 16384 {
+		return 16384
 	}
-	if value > 262144 {
-		return 262144
+	if value > 65536 {
+		return 65536
 	}
 	return value
 }

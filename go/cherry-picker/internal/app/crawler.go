@@ -41,8 +41,10 @@ import (
 
 // lruCapConfig 保存各 LRU 的容量配置。
 type lruCapConfig struct {
-	infohashSeen        int // peer 去重 LRU 容量
+	infohashSeen        int // infohash 去重 LRU 容量
+	peerSeen            int // peer 去重 LRU 容量
 	metadataRequestSeen int // metadata 请求去重 LRU 容量
+	metadataResultSeen  int // metadata 结果去重 LRU 容量
 	remoteKnown         int // 远端已知 hash LRU 容量
 }
 
@@ -101,19 +103,16 @@ func New(cfg config.Config, logger *log.Logger) *Application {
 	if logger == nil {
 		logger = log.Default()
 	}
-	// LRU 容量配置（可从环境变量扩展，这里用合理默认值）
+	lruCaps := newLRUCaps(cfg)
 	return &Application{
 		cfg:    cfg,
 		logger: logger,
 
-		// peer/infohash 去重：10min TTL 下高流量约 50-100万次/min，用 500k 避免内存爆炸
-		infohashSeen: cache.NewLRU(500_000),
-		peerSeen:     cache.NewLRU(500_000),
-		// metadata 请求去重：30min TTL 下容量更大
-		metadataRequestSeen: cache.NewLRU(1_000_000),
-		metadataResultSeen:  cache.NewLRU(1_000_000),
-		// 远端已知 hash：API check 的结果，容量 100万
-		remoteKnown: cache.NewLRU(1_000_000),
+		infohashSeen:        cache.NewLRU(lruCaps.infohashSeen),
+		peerSeen:            cache.NewLRU(lruCaps.peerSeen),
+		metadataRequestSeen: cache.NewLRU(lruCaps.metadataRequestSeen),
+		metadataResultSeen:  cache.NewLRU(lruCaps.metadataResultSeen),
+		remoteKnown:         cache.NewLRU(lruCaps.remoteKnown),
 
 		peerCounts: make(map[string]int, 4096),
 		apiClient:  &http.Client{Timeout: 10 * time.Second},
@@ -153,6 +152,7 @@ func (a *Application) Run(ctx context.Context) error {
 	dhtConfig.PacketJobLimit = a.cfg.Discovery.PacketJobs
 	dhtConfig.MaxNodes = a.cfg.Discovery.MaxNodes
 	dhtConfig.RefreshNodeNum = a.cfg.Discovery.RefreshNodes
+	dhtConfig.GetPeersFanout = a.cfg.Discovery.QueryFanout
 
 	dhtConfig.OnGetPeers = func(infoHash, ip string, port int) {
 		ihHex := hex.EncodeToString([]byte(infoHash))
@@ -179,7 +179,9 @@ func (a *Application) Run(ctx context.Context) error {
 	go a.emitStats(ctx, events, stats, a.dht)
 	go a.flushPeerCountsLoop(ctx)
 	go a.pollPendingRequests(ctx)
-	go a.autoTuneLoop(ctx)
+	if a.cfg.AutoTune {
+		go a.autoTuneLoop(ctx)
+	}
 	debug.SetGCPercent(200)
 
 	go a.dht.Run()
@@ -335,10 +337,8 @@ func (a *Application) pollPendingRequests(ctx context.Context) {
 func (a *Application) autoTuneLoop(ctx context.Context) {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
-
-	// 内存阈值（字节）
-	const pauseThreshold = 500 * 1024 * 1024  // 500 MB → 暂停
-	const resumeThreshold = 300 * 1024 * 1024 // 300 MB → 恢复
+	pauseThreshold, resumeThreshold := a.autoTuneThresholds()
+	a.logger.Printf("autotune: enabled pause=%dMB resume=%dMB", pauseThreshold/1024/1024, resumeThreshold/1024/1024)
 
 	for {
 		select {
@@ -371,6 +371,84 @@ func (a *Application) autoTuneLoop(ctx context.Context) {
 			}
 		}
 	}
+}
+
+func newLRUCaps(cfg config.Config) lruCapConfig {
+	cpuScale := runtime.GOMAXPROCS(0)
+	if cpuScale < 1 {
+		cpuScale = 1
+	}
+
+	peerCap := clampInt(cpuScale*20_000, 80_000, 200_000)
+	infohashCap := clampInt(cpuScale*24_000, 100_000, 240_000)
+	metadataRequestCap := clampInt(cpuScale*36_000, 150_000, 320_000)
+	metadataResultCap := clampInt(cpuScale*28_000, 120_000, 240_000)
+	remoteKnownCap := clampInt(cpuScale*36_000, 150_000, 320_000)
+
+	switch cfg.Role {
+	case "discovery":
+		metadataRequestCap = 64_000
+		metadataResultCap = 64_000
+	case "metadata":
+		peerCap /= 2
+		infohashCap /= 2
+	}
+
+	return lruCapConfig{
+		infohashSeen:        infohashCap,
+		peerSeen:            peerCap,
+		metadataRequestSeen: metadataRequestCap,
+		metadataResultSeen:  metadataResultCap,
+		remoteKnown:         remoteKnownCap,
+	}
+}
+
+func (a *Application) autoTuneThresholds() (pauseThreshold uint64, resumeThreshold uint64) {
+	if memoryLimit := debug.SetMemoryLimit(-1); memoryLimit > 0 && memoryLimit < 1<<60 {
+		pauseThreshold = uint64(memoryLimit * 80 / 100)
+		resumeThreshold = uint64(memoryLimit * 64 / 100)
+		return pauseThreshold, resumeThreshold
+	}
+
+	pauseThreshold = 768 * 1024 * 1024
+	if a.cfg.Role != "discovery" {
+		pauseThreshold = 1024 * 1024 * 1024
+	}
+	pauseThreshold += uint64(maxInt(a.cfg.EventQueue-16_384, 0)) * 1024
+	pauseThreshold += uint64(maxInt(a.cfg.Metadata.RequestQueueSize-16_384, 0)) * 256
+	pauseThreshold += uint64(maxInt(a.cfg.Metadata.WorkerQueueSize-256, 0)) * 512 * 1024
+	pauseThreshold = clampUint64(pauseThreshold, 768*1024*1024, 3*1024*1024*1024)
+
+	resumeThreshold = pauseThreshold * 70 / 100
+	resumeThreshold = clampUint64(resumeThreshold, 512*1024*1024, pauseThreshold-128*1024*1024)
+	return pauseThreshold, resumeThreshold
+}
+
+func clampInt(value, minValue, maxValue int) int {
+	if value < minValue {
+		return minValue
+	}
+	if value > maxValue {
+		return maxValue
+	}
+	return value
+}
+
+func maxInt(left, right int) int {
+	if left > right {
+		return left
+	}
+	return right
+}
+
+func clampUint64(value, minValue, maxValue uint64) uint64 {
+	if value < minValue {
+		return minValue
+	}
+	if value > maxValue {
+		return maxValue
+	}
+	return value
 }
 
 // --- 事件提交 ---

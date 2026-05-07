@@ -502,8 +502,16 @@ func (rt *routingTable) RemoveByAddr(address string) {
 // Fresh sends findNode to all nodes in the expired nodes.
 func (rt *routingTable) Fresh() {
 	now := time.Now()
+	refreshBudget := rt.dht.RefreshNodeNum
+	if refreshBudget <= 0 {
+		return
+	}
 
 	for e := range rt.cachedKBuckets.Iter() {
+		if refreshBudget <= 0 {
+			break
+		}
+
 		bucket := e.Value.(*kbucket)
 		if now.Sub(bucket.LastChanged()) < rt.dht.KBucketExpiredAfter ||
 			bucket.nodes.Len() == 0 {
@@ -512,12 +520,16 @@ func (rt *routingTable) Fresh() {
 
 		i := 0
 		for e := range bucket.nodes.Iter() {
-			if i < rt.dht.RefreshNodeNum {
+			if i < rt.dht.RefreshNodeNum && refreshBudget > 0 {
 				no := e.Value.(*node)
 				rt.dht.transactionManager.findNode(no, bucket.RandomChildID())
 				rt.clearQueue.PushBack(no)
+				refreshBudget--
 			}
 			i++
+			if refreshBudget <= 0 {
+				break
+			}
 		}
 	}
 
@@ -579,7 +591,7 @@ func getTopK(queue []interface{}, id *bitmap, k int) []interface{} {
 		node := value.(*node)
 		distance := id.Xor(node.id)
 		if topkHeap.Len() == k {
-			var last = topkHeap[topkHeap.Len() - 1]
+			var last = topkHeap[topkHeap.Len()-1]
 			if last.distance.Compare(distance, maxPrefixLength) == 1 {
 				item := &heapItem{
 					distance,

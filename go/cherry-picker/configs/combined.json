@@ -2,7 +2,7 @@
   "role": "combined",
   "instance_id": "combined-1",
   "listen_addr": ":20003",
-  "event_queue": 131072,
+  "event_queue": 32768,
   "dedupe": {
     "peer_ttl": "10m",
     "metadata_ttl": "30m"
@@ -14,8 +14,8 @@
   "metadata": {
     "enabled": true,
     "black_list_size": 131072,
-    "request_queue_size": 131072,
-    "worker_queue_size": 1024
+    "request_queue_size": 32768,
+    "worker_queue_size": 512
   },
   "exporter": {
     "kind": "http",

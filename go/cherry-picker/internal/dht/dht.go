@@ -72,6 +72,8 @@ type Config struct {
 	PacketWorkerLimit int
 	// the nodes num to be fresh in a kbucket
 	RefreshNodeNum int
+	// max nodes queried per get_peers target in crawl mode
+	GetPeersFanout int
 }
 
 // NewStandardConfig returns a Config pointer with default values.
@@ -99,6 +101,7 @@ func NewStandardConfig() *Config {
 		PacketJobLimit:       1024,
 		PacketWorkerLimit:    256,
 		RefreshNodeNum:       8,
+		GetPeersFanout:       8,
 	}
 }
 
@@ -110,10 +113,11 @@ func NewCrawlConfig() *Config {
 	config.CheckKBucketPeriod = time.Second // 每秒刷新（原 5s）
 	config.KBucketSize = math.MaxInt32
 	config.Mode = CrawlMode
-	config.RefreshNodeNum = 2048           // 每次刷新联系的节点数（原 256）
-	config.MaxNodes = 50_000              // 路由表上限（原 5000）
-	config.PacketJobLimit = 65_536        // 数据包 channel 容量（原 1024）
-	config.PacketWorkerLimit = 512        // 包处理 goroutine 数（原 256）
+	config.RefreshNodeNum = 256    // 每轮刷新总预算，避免全表扫描式洪泛
+	config.GetPeersFanout = 64     // 每个目标只打最接近的一小批节点，减少无效流量
+	config.MaxNodes = 50_000       // 路由表上限（原 5000）
+	config.PacketJobLimit = 65_536 // 数据包 channel 容量（原 1024）
+	config.PacketWorkerLimit = 512 // 包处理 goroutine 数（原 256）
 	// 更多 bootstrap 节点，加快初始入网
 	config.PrimeNodes = append(config.PrimeNodes,
 		"router.bitcomet.com:6881",
@@ -145,10 +149,10 @@ type DHT struct {
 }
 
 type packetStats struct {
-	received atomic.Uint64
-	enqueued atomic.Uint64
-	dropped  atomic.Uint64
-	handled  atomic.Uint64
+	received     atomic.Uint64
+	enqueued     atomic.Uint64
+	dropped      atomic.Uint64
+	handled      atomic.Uint64
 	decodeErrors atomic.Uint64
 }
 
@@ -173,10 +177,10 @@ func New(config *Config) *DHT {
 	}
 
 	d := &DHT{
-		Config:       config,
-		node:         node,
-		blackList:    newBlackList(config.BlackListMaxSize),
-		packets:      make(chan packet, config.PacketJobLimit),
+		Config:    config,
+		node:      node,
+		blackList: newBlackList(config.BlackListMaxSize),
+		packets:   make(chan packet, config.PacketJobLimit),
 		packetPool: sync.Pool{
 			New: func() interface{} {
 				return make([]byte, 8192)
@@ -344,13 +348,27 @@ func (dht *DHT) GetPeers(infoHash string) error {
 	}
 
 	neighbors := dht.routingTable.GetNeighbors(
-		newBitmapFromString(infoHash), dht.routingTable.Len())
+		newBitmapFromString(infoHash), dht.getPeersFanout())
 
 	for _, no := range neighbors {
 		dht.transactionManager.getPeers(no, infoHash)
 	}
 
 	return nil
+}
+
+func (dht *DHT) getPeersFanout() int {
+	fanout := dht.GetPeersFanout
+	if fanout <= 0 {
+		fanout = dht.K
+	}
+	if fanout < 1 {
+		fanout = 1
+	}
+	if total := dht.routingTable.Len(); total > 0 && fanout > total {
+		fanout = total
+	}
+	return fanout
 }
 
 // Run starts the dht.
