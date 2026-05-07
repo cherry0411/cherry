@@ -108,12 +108,20 @@ public class IngestService : IHostedService
         catch { /* best-effort */ }
     }
 
-    public Task StopAsync(CancellationToken cancellationToken)
+    public async Task StopAsync(CancellationToken cancellationToken)
     {
         _meiliTimer?.Dispose();
+
+        // Final flush of buffered Meilisearch docs
+        using var scope = _scopeFactory.CreateScope();
+        var meiliUrl = scope.ServiceProvider.GetRequiredService<IConfiguration>()["MeiliSearch:Url"];
+        if (!string.IsNullOrWhiteSpace(meiliUrl))
+        {
+            await FlushMeiliQueueAsync(meiliUrl);
+        }
+
         _cts.Cancel();
         _channel.Writer.Complete();
-        return Task.CompletedTask;
     }
 
     private async Task ProcessLoop(CancellationToken ct)
