@@ -7,7 +7,6 @@ COPY src/Cherry.Domain/Cherry.Domain.csproj src/Cherry.Domain/
 COPY src/Cherry.Application/Cherry.Application.csproj src/Cherry.Application/
 COPY src/Cherry.Infrastructure/Cherry.Infrastructure.csproj src/Cherry.Infrastructure/
 COPY src/Cherry.Api/Cherry.Api.csproj src/Cherry.Api/
-COPY nuget.config ./
 RUN dotnet restore src/Cherry.Api/Cherry.Api.csproj
 
 # Layer 2: copy source and publish (only runs when source changes)
