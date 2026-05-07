@@ -4,23 +4,24 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
 )
 
 type Config struct {
-	Role          string
-	InstanceID    string
-	ListenAddr    string
-	EventQueue    int
-	BrokerURL     string
-	Dedupe        DedupeConfig
-	Discovery     DiscoveryConfig
-	Metadata      MetadataConfig
-	Exporter      ExporterConfig
-	AutoTune      bool
-	TargetCPU     float64
+	Role       string
+	InstanceID string
+	ListenAddr string
+	EventQueue int
+	BrokerURL  string
+	Dedupe     DedupeConfig
+	Discovery  DiscoveryConfig
+	Metadata   MetadataConfig
+	Exporter   ExporterConfig
+	AutoTune   bool
+	TargetCPU  float64
 }
 
 type DedupeConfig struct {
@@ -73,7 +74,7 @@ func Load() (Config, error) {
 		Role:       strings.ToLower(getenvDefault("CHERRY_PICKER_ROLE", "combined")),
 		InstanceID: instanceID,
 		ListenAddr: getenvDefault("CHERRY_PICKER_LISTEN_ADDR", ":6881"),
-		EventQueue: getenvInt("CHERRY_PICKER_EVENT_QUEUE", 4096),
+		EventQueue: getenvInt("CHERRY_PICKER_EVENT_QUEUE", defaultEventQueue()),
 		BrokerURL:  getenvDefault("CHERRY_PICKER_BROKER_URL", ""),
 		AutoTune:   getenvBool("CHERRY_PICKER_AUTO_TUNE", false),
 		TargetCPU:  float64(getenvInt("CHERRY_PICKER_TARGET_CPU", 80)) / 100.0,
@@ -84,23 +85,23 @@ func Load() (Config, error) {
 		Discovery: DiscoveryConfig{
 			Mode:           strings.ToLower(getenvDefault("CHERRY_PICKER_DHT_MODE", "crawl")),
 			EmitPeerEvents: getenvBool("CHERRY_PICKER_EMIT_PEER_EVENTS", true),
-			PacketWorkers:  getenvInt("CHERRY_PICKER_DHT_PACKET_WORKERS", 512),
-			PacketJobs:     getenvInt("CHERRY_PICKER_DHT_PACKET_JOBS", 65536),
-			MaxNodes:       getenvInt("CHERRY_PICKER_DHT_MAX_NODES", 50000),
-			RefreshNodes:   getenvInt("CHERRY_PICKER_DHT_REFRESH_NODES", 2048),
+			PacketWorkers:  getenvInt("CHERRY_PICKER_DHT_PACKET_WORKERS", defaultPacketWorkers()),
+			PacketJobs:     getenvInt("CHERRY_PICKER_DHT_PACKET_JOBS", defaultPacketJobs()),
+			MaxNodes:       getenvInt("CHERRY_PICKER_DHT_MAX_NODES", defaultMaxNodes()),
+			RefreshNodes:   getenvInt("CHERRY_PICKER_DHT_REFRESH_NODES", defaultRefreshNodes()),
 		},
 		Metadata: MetadataConfig{
 			Enabled:          getenvBool("CHERRY_PICKER_METADATA_ENABLED", true),
-			BlackListSize:    getenvInt("CHERRY_PICKER_METADATA_BLACKLIST", 65536),
-			RequestQueueSize: getenvInt("CHERRY_PICKER_METADATA_REQUEST_QUEUE", 65536),
-			WorkerQueueSize:  getenvInt("CHERRY_PICKER_METADATA_WORKERS", 512),
+			BlackListSize:    getenvInt("CHERRY_PICKER_METADATA_BLACKLIST", 131072),
+			RequestQueueSize: getenvInt("CHERRY_PICKER_METADATA_REQUEST_QUEUE", defaultMetadataRequestQueue()),
+			WorkerQueueSize:  getenvInt("CHERRY_PICKER_METADATA_WORKERS", defaultMetadataWorkers()),
 		},
 		Exporter: ExporterConfig{
 			Kind:          strings.ToLower(getenvDefault("CHERRY_PICKER_EXPORTER", "stdout")),
 			FilePath:      getenvDefault("CHERRY_PICKER_EXPORTER_FILE", ""),
 			HTTPEndpoint:  getenvDefault("CHERRY_PICKER_EXPORTER_URL", ""),
-			BatchSize:     getenvInt("CHERRY_PICKER_EXPORTER_BATCH", 128),
-			FlushInterval: getenvDuration("CHERRY_PICKER_EXPORTER_FLUSH", 2*time.Second),
+			BatchSize:     getenvInt("CHERRY_PICKER_EXPORTER_BATCH", 512),
+			FlushInterval: getenvDuration("CHERRY_PICKER_EXPORTER_FLUSH", 500*time.Millisecond),
 			HTTPTimeout:   getenvDuration("CHERRY_PICKER_EXPORTER_TIMEOUT", 5*time.Second),
 			HTTPRetries:   getenvInt("CHERRY_PICKER_EXPORTER_HTTP_RETRIES", 3),
 			RetryBackoff:  getenvDuration("CHERRY_PICKER_EXPORTER_RETRY_BACKOFF", time.Second),
@@ -174,7 +175,7 @@ func normalize(cfg Config) Config {
 		cfg.ListenAddr = ":6881"
 	}
 	if cfg.EventQueue <= 0 {
-		cfg.EventQueue = 4096
+		cfg.EventQueue = defaultEventQueue()
 	}
 	if cfg.Dedupe.PeerTTL <= 0 {
 		cfg.Dedupe.PeerTTL = 10 * time.Minute
@@ -186,34 +187,34 @@ func normalize(cfg Config) Config {
 		cfg.Discovery.Mode = "crawl"
 	}
 	if cfg.Discovery.PacketWorkers <= 0 {
-		cfg.Discovery.PacketWorkers = 512
+		cfg.Discovery.PacketWorkers = defaultPacketWorkers()
 	}
 	if cfg.Discovery.PacketJobs <= 0 {
-		cfg.Discovery.PacketJobs = 65536
+		cfg.Discovery.PacketJobs = defaultPacketJobs()
 	}
 	if cfg.Discovery.MaxNodes <= 0 {
-		cfg.Discovery.MaxNodes = 50000
+		cfg.Discovery.MaxNodes = defaultMaxNodes()
 	}
 	if cfg.Discovery.RefreshNodes <= 0 {
-		cfg.Discovery.RefreshNodes = 2048
+		cfg.Discovery.RefreshNodes = defaultRefreshNodes()
 	}
 	if cfg.Metadata.BlackListSize <= 0 {
-		cfg.Metadata.BlackListSize = 65536
+		cfg.Metadata.BlackListSize = 131072
 	}
 	if cfg.Metadata.RequestQueueSize <= 0 {
-		cfg.Metadata.RequestQueueSize = 65536
+		cfg.Metadata.RequestQueueSize = defaultMetadataRequestQueue()
 	}
 	if cfg.Metadata.WorkerQueueSize <= 0 {
-		cfg.Metadata.WorkerQueueSize = 512
+		cfg.Metadata.WorkerQueueSize = defaultMetadataWorkers()
 	}
 	if cfg.Exporter.Kind == "" {
 		cfg.Exporter.Kind = "stdout"
 	}
 	if cfg.Exporter.BatchSize <= 0 {
-		cfg.Exporter.BatchSize = 128
+		cfg.Exporter.BatchSize = 512
 	}
 	if cfg.Exporter.FlushInterval <= 0 {
-		cfg.Exporter.FlushInterval = 2 * time.Second
+		cfg.Exporter.FlushInterval = 500 * time.Millisecond
 	}
 	if cfg.Exporter.HTTPTimeout <= 0 {
 		cfg.Exporter.HTTPTimeout = 5 * time.Second
@@ -292,6 +293,91 @@ type fileExporterConfig struct {
 func intOrDefault(value, fallback int) int {
 	if value <= 0 {
 		return fallback
+	}
+	return value
+}
+
+func cpuScale() int {
+	cpus := runtime.NumCPU()
+	if cpus < 1 {
+		return 1
+	}
+	return cpus
+}
+
+func defaultEventQueue() int {
+	value := cpuScale() * 16384
+	if value < 65536 {
+		return 65536
+	}
+	if value > 262144 {
+		return 262144
+	}
+	return value
+}
+
+func defaultPacketWorkers() int {
+	value := cpuScale() * 128
+	if value < 512 {
+		return 512
+	}
+	if value > 2048 {
+		return 2048
+	}
+	return value
+}
+
+func defaultPacketJobs() int {
+	value := defaultPacketWorkers() * 256
+	if value < 65536 {
+		return 65536
+	}
+	if value > 524288 {
+		return 524288
+	}
+	return value
+}
+
+func defaultMaxNodes() int {
+	value := cpuScale() * 25000
+	if value < 100000 {
+		return 100000
+	}
+	if value > 400000 {
+		return 400000
+	}
+	return value
+}
+
+func defaultRefreshNodes() int {
+	value := cpuScale() * 512
+	if value < 4096 {
+		return 4096
+	}
+	if value > 16384 {
+		return 16384
+	}
+	return value
+}
+
+func defaultMetadataWorkers() int {
+	value := cpuScale() * 64
+	if value < 512 {
+		return 512
+	}
+	if value > 2048 {
+		return 2048
+	}
+	return value
+}
+
+func defaultMetadataRequestQueue() int {
+	value := defaultMetadataWorkers() * 128
+	if value < 65536 {
+		return 65536
+	}
+	if value > 262144 {
+		return 262144
 	}
 	return value
 }

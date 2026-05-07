@@ -2,7 +2,7 @@
   "role": "discovery",
   "instance_id": "discovery-1",
   "listen_addr": ":20001",
-  "event_queue": 8192,
+  "event_queue": 131072,
   "dedupe": {
     "peer_ttl": "10m",
     "metadata_ttl": "30m"
@@ -13,15 +13,15 @@
   },
   "metadata": {
     "enabled": false,
-    "black_list_size": 65536,
-    "request_queue_size": 4096,
-    "worker_queue_size": 256
+    "black_list_size": 131072,
+    "request_queue_size": 65536,
+    "worker_queue_size": 512
   },
   "exporter": {
     "kind": "file",
     "file_path": "events-discovery.jsonl",
-    "batch_size": 256,
-    "flush_interval": "2s",
+    "batch_size": 1024,
+    "flush_interval": "500ms",
     "http_timeout": "5s",
     "http_retries": 3,
     "retry_backoff": "1s"

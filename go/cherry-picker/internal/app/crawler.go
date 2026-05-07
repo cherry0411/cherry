@@ -21,6 +21,7 @@ import (
 	"net/http"
 	"path/filepath"
 	"runtime"
+	"runtime/debug"
 	"sort"
 	"strings"
 	"sync"
@@ -40,9 +41,9 @@ import (
 
 // lruCapConfig 保存各 LRU 的容量配置。
 type lruCapConfig struct {
-	infohashSeen       int // peer 去重 LRU 容量
+	infohashSeen        int // peer 去重 LRU 容量
 	metadataRequestSeen int // metadata 请求去重 LRU 容量
-	remoteKnown        int // 远端已知 hash LRU 容量
+	remoteKnown         int // 远端已知 hash LRU 容量
 }
 
 // Application 是爬虫应用实例，封装所有状态（不使用全局变量）。
@@ -83,7 +84,17 @@ type runtimeStats struct {
 	metadataEventsDeduped   atomic.Uint64
 	metadataRequestsQueued  atomic.Uint64
 	metadataRequestsDeduped atomic.Uint64
+	checkBatchesQueued      atomic.Uint64
+	checkBatchesDropped     atomic.Uint64
+	checkBatchesProcessed   atomic.Uint64
 }
+
+const (
+	checkBatchSize         = 512
+	checkFlushInterval     = 250 * time.Millisecond
+	checkWorkerBacklog     = 64
+	defaultCheckWorkersCap = 16
+)
 
 // New 创建一个新的 Application 实例。
 func New(cfg config.Config, logger *log.Logger) *Application {
@@ -96,13 +107,13 @@ func New(cfg config.Config, logger *log.Logger) *Application {
 		logger: logger,
 
 		// peer/infohash 去重：10min TTL 下高流量约 50-100万次/min，用 500k 避免内存爆炸
-		infohashSeen:        cache.NewLRU(500_000),
-		peerSeen:            cache.NewLRU(500_000),
+		infohashSeen: cache.NewLRU(500_000),
+		peerSeen:     cache.NewLRU(500_000),
 		// metadata 请求去重：30min TTL 下容量更大
 		metadataRequestSeen: cache.NewLRU(1_000_000),
 		metadataResultSeen:  cache.NewLRU(1_000_000),
 		// 远端已知 hash：API check 的结果，容量 100万
-		remoteKnown:         cache.NewLRU(1_000_000),
+		remoteKnown: cache.NewLRU(1_000_000),
 
 		peerCounts: make(map[string]int, 4096),
 		apiClient:  &http.Client{Timeout: 10 * time.Second},
@@ -124,7 +135,7 @@ func (a *Application) Run(ctx context.Context) error {
 
 	// checkQueue：批量向 API 检查 hash 是否已存在，容量从 4096 增大到 100000
 	checkQueue := make(chan string, 100_000)
-	go a.runCheckLoop(ctx, checkQueue)
+	go a.runCheckLoop(ctx, checkQueue, stats)
 
 	// peer wire metadata 下载器
 	downloader := dht.NewWire(a.cfg.Metadata.BlackListSize, a.cfg.Metadata.RequestQueueSize, a.cfg.Metadata.WorkerQueueSize)
@@ -169,6 +180,7 @@ func (a *Application) Run(ctx context.Context) error {
 	go a.flushPeerCountsLoop(ctx)
 	go a.pollPendingRequests(ctx)
 	go a.autoTuneLoop(ctx)
+	debug.SetGCPercent(200)
 
 	go a.dht.Run()
 	a.logger.Printf("started: instance=%s udp=%s workers=%d nodes=%d",
@@ -183,27 +195,60 @@ func (a *Application) Run(ctx context.Context) error {
 // --- 内部 goroutine ---
 
 // runCheckLoop 每2秒批量向 API 检查哪些 hash 已存在，结果写入 remoteKnown LRU。
-func (a *Application) runCheckLoop(ctx context.Context, checkQueue <-chan string) {
-	ticker := time.NewTicker(2 * time.Second)
+func (a *Application) runCheckLoop(ctx context.Context, checkQueue <-chan string, stats *runtimeStats) {
+	workerCount := a.checkWorkerCount()
+	batchQueue := make(chan []string, workerCount*checkWorkerBacklog)
+	var wg sync.WaitGroup
+	for i := 0; i < workerCount; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for batch := range batchQueue {
+				a.checkBatchExists(batch)
+				stats.checkBatchesProcessed.Add(1)
+			}
+		}()
+	}
+
+	ticker := time.NewTicker(checkFlushInterval)
 	defer ticker.Stop()
-	buf := make([]string, 0, 100)
+	buf := make([]string, 0, checkBatchSize)
+	seen := make(map[string]struct{}, checkBatchSize)
 
 	flush := func() {
 		if len(buf) == 0 {
 			return
 		}
-		a.checkBatchExists(buf)
+		batch := append([]string(nil), buf...)
+		select {
+		case batchQueue <- batch:
+			stats.checkBatchesQueued.Add(1)
+		default:
+			stats.checkBatchesDropped.Add(1)
+		}
 		buf = buf[:0]
+		clear(seen)
 	}
+	defer func() {
+		flush()
+		close(batchQueue)
+		wg.Wait()
+	}()
 
 	for {
 		select {
 		case <-ctx.Done():
-			flush()
 			return
 		case h := <-checkQueue:
+			if h == "" {
+				continue
+			}
+			if _, ok := seen[h]; ok {
+				continue
+			}
+			seen[h] = struct{}{}
 			buf = append(buf, h)
-			if len(buf) >= 50 {
+			if len(buf) >= checkBatchSize {
 				flush()
 			}
 		case <-ticker.C:
@@ -292,7 +337,7 @@ func (a *Application) autoTuneLoop(ctx context.Context) {
 	defer ticker.Stop()
 
 	// 内存阈值（字节）
-	const pauseThreshold  = 500 * 1024 * 1024 // 500 MB → 暂停
+	const pauseThreshold = 500 * 1024 * 1024  // 500 MB → 暂停
 	const resumeThreshold = 300 * 1024 * 1024 // 300 MB → 恢复
 
 	for {
@@ -472,6 +517,9 @@ func (a *Application) emitStats(ctx context.Context, events chan<- pipeline.Even
 					"peer_events_deduped":       stats.peerEventsDeduped.Load(),
 					"metadata_requests_queued":  stats.metadataRequestsQueued.Load(),
 					"metadata_requests_deduped": stats.metadataRequestsDeduped.Load(),
+					"check_batches_queued":      stats.checkBatchesQueued.Load(),
+					"check_batches_dropped":     stats.checkBatchesDropped.Load(),
+					"check_batches_processed":   stats.checkBatchesProcessed.Load(),
 					"metadata_events_sent":      stats.metadataEventsSent.Load(),
 					"metadata_events_dropped":   stats.metadataEventsDropped.Load(),
 					"metadata_events_deduped":   stats.metadataEventsDeduped.Load(),
@@ -503,6 +551,20 @@ func (a *Application) baseURL() string {
 		return url[:idx]
 	}
 	return url
+}
+
+func (a *Application) checkWorkerCount() int {
+	workers := runtime.GOMAXPROCS(0)
+	if workers < 4 {
+		workers = 4
+	}
+	if metaWorkers := a.cfg.Metadata.WorkerQueueSize / 128; metaWorkers > workers {
+		workers = metaWorkers
+	}
+	if workers > defaultCheckWorkersCap {
+		workers = defaultCheckWorkersCap
+	}
+	return workers
 }
 
 func (a *Application) checkBatchExists(hashes []string) {

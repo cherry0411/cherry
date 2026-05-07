@@ -81,6 +81,12 @@ Both units expect:
 
 Adjust those paths if your deployment layout differs.
 
+## Throughput notes
+
+- Hot-path dedupe now uses a sharded LRU to avoid a single global mutex under heavy announce/get_peers fan-in.
+- Remote existence checks are batched in parallel workers, so metadata enqueue no longer waits behind one slow `/check` loop.
+- Checked-in configs are intentionally aggressive. On a small host, prefer overriding `CHERRY_PICKER_DHT_PACKET_WORKERS`, `CHERRY_PICKER_METADATA_WORKERS`, and `CHERRY_PICKER_EVENT_QUEUE` downward.
+
 ## Current validation
 
 - `go test ./...` passes.

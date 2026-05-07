@@ -171,10 +171,10 @@ type Response struct {
 //   - Run() 改为 semaphore 等待模式（不再丢弃请求）
 type Wire struct {
 	blackList    *blackList
-	queue        *cache.LRU    // 有界 LRU，替代原来的 syncedMap
+	queue        *cache.LRU // 有界 LRU，替代原来的 syncedMap
 	requests     chan Request
 	responses    chan Response
-	workerTokens chan struct{}  // semaphore：控制并发 goroutine 数量
+	workerTokens chan struct{} // semaphore：控制并发 goroutine 数量
 }
 
 // NewWire 创建一个 Wire 实例。
@@ -182,6 +182,12 @@ type Wire struct {
 //   - requestQueueSize: 请求队列大小（channel 容量）
 //   - workerQueueSize: 最大并发下载 goroutine 数量
 func NewWire(blackListSize, requestQueueSize, workerQueueSize int) *Wire {
+	if workerQueueSize <= 0 {
+		workerQueueSize = 1
+	}
+	if requestQueueSize <= 0 {
+		requestQueueSize = workerQueueSize * 128
+	}
 	// queue 容量设置为 workerQueueSize 的 4 倍，避免频繁淘汰正在下载的 key
 	queueCap := workerQueueSize * 4
 	if queueCap < 4096 {
@@ -191,7 +197,7 @@ func NewWire(blackListSize, requestQueueSize, workerQueueSize int) *Wire {
 		blackList:    newBlackList(blackListSize),
 		queue:        cache.NewLRU(queueCap),
 		requests:     make(chan Request, requestQueueSize),
-		responses:    make(chan Response, 1024),
+		responses:    make(chan Response, workerQueueSize*2),
 		workerTokens: make(chan struct{}, workerQueueSize),
 	}
 }
@@ -244,10 +250,8 @@ func (wire *Wire) requestPieces(
 // fetchMetadata 连接 peer，通过 extension protocol 下载 info dict。
 // 完成后（成功或失败）都会从 queue 中删除 key，避免泄漏。
 func (wire *Wire) fetchMetadata(r Request, key string) {
-	// 确保无论如何退出都从 queue 中删除 key（修复内存泄漏）
-	defer wire.queue.Set(key) // LRU 的 Set 会将其移至头部等待自然淘汰
-	// 注：我们不直接提供 Delete 接口，改为 touchNoop；实际由 Contains 判断是否仍在处理
-	// 真正的删除由 LRU 超容量淘汰完成。key 存在表示"正在处理或已处理过"。
+	// 请求完成后释放 inflight 去重键，允许同一 peer 在后续重新尝试。
+	defer wire.queue.Delete(key)
 
 	var (
 		length       int
