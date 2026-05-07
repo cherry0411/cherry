@@ -96,7 +96,24 @@ const (
 	checkFlushInterval     = 250 * time.Millisecond
 	checkWorkerBacklog     = 64
 	defaultCheckWorkersCap = 16
+	autoTunePauseSamples   = 3
+	autoTuneResumeSamples  = 2
+	autoTuneMinPause       = 45 * time.Second
 )
+
+type autoTuneAction uint8
+
+const (
+	autoTuneNoop autoTuneAction = iota
+	autoTunePause
+	autoTuneResume
+)
+
+type autoTuneController struct {
+	overLimitSamples  int
+	underLimitSamples int
+	pausedAt          time.Time
+}
 
 // New 创建一个新的 Application 实例。
 func New(cfg config.Config, logger *log.Logger) *Application {
@@ -152,7 +169,6 @@ func (a *Application) Run(ctx context.Context) error {
 	dhtConfig.PacketJobLimit = a.cfg.Discovery.PacketJobs
 	dhtConfig.MaxNodes = a.cfg.Discovery.MaxNodes
 	dhtConfig.RefreshNodeNum = a.cfg.Discovery.RefreshNodes
-	dhtConfig.GetPeersFanout = a.cfg.Discovery.QueryFanout
 
 	dhtConfig.OnGetPeers = func(infoHash, ip string, port int) {
 		ihHex := hex.EncodeToString([]byte(infoHash))
@@ -338,6 +354,7 @@ func (a *Application) autoTuneLoop(ctx context.Context) {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 	pauseThreshold, resumeThreshold := a.autoTuneThresholds()
+	controller := &autoTuneController{}
 	a.logger.Printf("autotune: enabled pause=%dMB resume=%dMB", pauseThreshold/1024/1024, resumeThreshold/1024/1024)
 
 	for {
@@ -348,29 +365,63 @@ func (a *Application) autoTuneLoop(ctx context.Context) {
 			var ms runtime.MemStats
 			runtime.ReadMemStats(&ms)
 
+			heapAlloc := ms.HeapAlloc
 			heapInUse := ms.HeapInuse
 			paused := a.metaPaused.Load()
+			action := controller.nextAction(time.Now(), paused, heapAlloc, pauseThreshold, resumeThreshold)
 
-			switch {
-			case heapInUse > pauseThreshold && !paused:
+			switch action {
+			case autoTunePause:
 				a.metaPaused.Store(true)
-				runtime.GC()
-				a.logger.Printf("autotune: metadata paused (heap=%dMB > %dMB), GC triggered",
-					heapInUse/1024/1024, pauseThreshold/1024/1024)
-
-			case heapInUse < resumeThreshold && paused:
+				debug.FreeOSMemory()
+				a.logger.Printf("autotune: metadata paused (heap_alloc=%dMB > %dMB, heap_inuse=%dMB)",
+					heapAlloc/1024/1024, pauseThreshold/1024/1024, heapInUse/1024/1024)
+			case autoTuneResume:
 				a.metaPaused.Store(false)
-				a.logger.Printf("autotune: metadata resumed (heap=%dMB < %dMB)",
-					heapInUse/1024/1024, resumeThreshold/1024/1024)
-
+				a.logger.Printf("autotune: metadata resumed (heap_alloc=%dMB < %dMB, heap_inuse=%dMB)",
+					heapAlloc/1024/1024, resumeThreshold/1024/1024, heapInUse/1024/1024)
 			default:
-				a.logger.Printf("autotune: heap=%dMB paused=%v seenSizes=[ih=%d peer=%d metaReq=%d remote=%d]",
-					heapInUse/1024/1024, paused,
+				a.logger.Printf("autotune: heap_alloc=%dMB heap_inuse=%dMB paused=%v seenSizes=[ih=%d peer=%d metaReq=%d remote=%d]",
+					heapAlloc/1024/1024, heapInUse/1024/1024, paused,
 					a.infohashSeen.Len(), a.peerSeen.Len(),
 					a.metadataRequestSeen.Len(), a.remoteKnown.Len())
 			}
 		}
 	}
+}
+
+func (c *autoTuneController) nextAction(now time.Time, paused bool, heapAlloc, pauseThreshold, resumeThreshold uint64) autoTuneAction {
+	if paused {
+		c.overLimitSamples = 0
+		if c.pausedAt.IsZero() {
+			c.pausedAt = now
+		}
+		if heapAlloc < resumeThreshold {
+			c.underLimitSamples++
+		} else {
+			c.underLimitSamples = 0
+		}
+		if c.underLimitSamples >= autoTuneResumeSamples && now.Sub(c.pausedAt) >= autoTuneMinPause {
+			c.underLimitSamples = 0
+			c.pausedAt = time.Time{}
+			return autoTuneResume
+		}
+		return autoTuneNoop
+	}
+
+	c.pausedAt = time.Time{}
+	c.underLimitSamples = 0
+	if heapAlloc > pauseThreshold {
+		c.overLimitSamples++
+	} else {
+		c.overLimitSamples = 0
+	}
+	if c.overLimitSamples >= autoTunePauseSamples {
+		c.overLimitSamples = 0
+		c.pausedAt = now
+		return autoTunePause
+	}
+	return autoTuneNoop
 }
 
 func newLRUCaps(cfg config.Config) lruCapConfig {

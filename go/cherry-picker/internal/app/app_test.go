@@ -4,6 +4,7 @@ import (
 	"io"
 	"log"
 	"testing"
+	"time"
 
 	"cherry-picker/internal/config"
 	dht "cherry-picker/internal/dht"
@@ -117,5 +118,35 @@ func TestNormalizeMetadataSingleFile(t *testing.T) {
 	}
 	if metadata.Files[0].Length != 4865957888 {
 		t.Fatalf("File.Length = %d, want 4865957888", metadata.Files[0].Length)
+	}
+}
+
+func TestAutoTuneControllerRequiresSustainedPressure(t *testing.T) {
+	controller := &autoTuneController{}
+	now := time.Unix(1_700_000_000, 0)
+	pauseThreshold := uint64(100)
+	resumeThreshold := uint64(70)
+
+	for i := 0; i < autoTunePauseSamples-1; i++ {
+		if action := controller.nextAction(now.Add(time.Duration(i)*time.Second), false, 101, pauseThreshold, resumeThreshold); action != autoTuneNoop {
+			t.Fatalf("sample %d action = %v, want noop", i, action)
+		}
+	}
+	if action := controller.nextAction(now.Add(autoTunePauseSamples*time.Second), false, 101, pauseThreshold, resumeThreshold); action != autoTunePause {
+		t.Fatalf("pause action = %v, want pause", action)
+	}
+}
+
+func TestAutoTuneControllerWaitsBeforeResume(t *testing.T) {
+	controller := &autoTuneController{pausedAt: time.Unix(1_700_000_000, 0)}
+	now := controller.pausedAt
+	pauseThreshold := uint64(100)
+	resumeThreshold := uint64(70)
+
+	if action := controller.nextAction(now.Add(10*time.Second), true, 60, pauseThreshold, resumeThreshold); action != autoTuneNoop {
+		t.Fatalf("early resume action = %v, want noop", action)
+	}
+	if action := controller.nextAction(now.Add(autoTuneMinPause), true, 60, pauseThreshold, resumeThreshold); action != autoTuneResume {
+		t.Fatalf("resume action = %v, want resume", action)
 	}
 }

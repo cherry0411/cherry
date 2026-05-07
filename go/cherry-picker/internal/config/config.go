@@ -36,7 +36,6 @@ type DiscoveryConfig struct {
 	PacketJobs     int
 	MaxNodes       int
 	RefreshNodes   int
-	QueryFanout    int
 }
 
 type MetadataConfig struct {
@@ -90,7 +89,6 @@ func Load() (Config, error) {
 			PacketJobs:     getenvInt("CHERRY_PICKER_DHT_PACKET_JOBS", defaultPacketJobs()),
 			MaxNodes:       getenvInt("CHERRY_PICKER_DHT_MAX_NODES", defaultMaxNodes()),
 			RefreshNodes:   getenvInt("CHERRY_PICKER_DHT_REFRESH_NODES", defaultRefreshNodes()),
-			QueryFanout:    getenvInt("CHERRY_PICKER_DHT_QUERY_FANOUT", defaultQueryFanout()),
 		},
 		Metadata: MetadataConfig{
 			Enabled:          getenvBool("CHERRY_PICKER_METADATA_ENABLED", true),
@@ -142,7 +140,6 @@ func loadFromFile(path string) (Config, error) {
 			PacketJobs:     intOrDefault(raw.Discovery.PacketJobs, 65536),
 			MaxNodes:       intOrDefault(raw.Discovery.MaxNodes, 50000),
 			RefreshNodes:   intOrDefault(raw.Discovery.RefreshNodes, 2048),
-			QueryFanout:    intOrDefault(raw.Discovery.QueryFanout, defaultQueryFanout()),
 		},
 		Metadata: MetadataConfig{
 			Enabled:          raw.Metadata.Enabled,
@@ -200,9 +197,6 @@ func normalize(cfg Config) Config {
 	}
 	if cfg.Discovery.RefreshNodes <= 0 {
 		cfg.Discovery.RefreshNodes = defaultRefreshNodes()
-	}
-	if cfg.Discovery.QueryFanout <= 0 {
-		cfg.Discovery.QueryFanout = defaultQueryFanout()
 	}
 	if cfg.Metadata.BlackListSize <= 0 {
 		cfg.Metadata.BlackListSize = 131072
@@ -274,7 +268,6 @@ type fileDiscoveryConfig struct {
 	PacketJobs     int    `json:"packet_jobs"`
 	MaxNodes       int    `json:"max_nodes"`
 	RefreshNodes   int    `json:"refresh_nodes"`
-	QueryFanout    int    `json:"query_fanout"`
 }
 
 type fileMetadataConfig struct {
@@ -357,23 +350,12 @@ func defaultMaxNodes() int {
 }
 
 func defaultRefreshNodes() int {
-	value := cpuScale() * 64
-	if value < 256 {
-		return 256
-	}
-	if value > 1024 {
+	value := cpuScale() * 256
+	if value < 1024 {
 		return 1024
 	}
-	return value
-}
-
-func defaultQueryFanout() int {
-	value := cpuScale() * 8
-	if value < 32 {
-		return 32
-	}
-	if value > 128 {
-		return 128
+	if value > 8192 {
+		return 8192
 	}
 	return value
 }
