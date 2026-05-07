@@ -527,6 +527,10 @@ func clampUint64(value, minValue, maxValue uint64) uint64 {
 // --- 事件提交 ---
 
 func (a *Application) submitInfohashEvent(events chan<- pipeline.Event, ihHex, ip string, port int, source string, stats *runtimeStats) {
+	if !a.shouldEmitPeerEvents() {
+		return
+	}
+
 	key := buildInfohashSourceKey(ihHex, source, ip, port)
 	// LRU.Set 返回 false = 已存在（已见过）
 	if !a.infohashSeen.Set(key) {
@@ -545,6 +549,10 @@ func (a *Application) submitInfohashEvent(events chan<- pipeline.Event, ihHex, i
 }
 
 func (a *Application) submitPeerEvent(events chan<- pipeline.Event, ihHex, ip string, port int, source string, stats *runtimeStats) {
+	if !a.shouldEmitPeerEvents() {
+		return
+	}
+
 	key := buildInfohashPeerKey(ihHex, ip, port)
 	if !a.peerSeen.Set(key) {
 		stats.peerEventsDeduped.Add(1)
@@ -678,6 +686,9 @@ func (a *Application) emitStats(ctx context.Context, events chan<- pipeline.Even
 			}
 			a.logRuntimeDelta(current, previous)
 			previous = current
+			if !a.shouldEmitWorkerStats() {
+				continue
+			}
 			a.submitEvent(events, pipeline.Event{
 				Type:       pipeline.EventWorkerStats,
 				Timestamp:  time.Now().UTC(),
@@ -782,6 +793,23 @@ func (a *Application) shouldExportEvent(event pipeline.Event) bool {
 		return true
 	}
 	return event.Type == pipeline.EventMetadataFetched && event.Metadata != nil
+}
+
+func (a *Application) shouldEmitPeerEvents() bool {
+	if !a.cfg.Discovery.EmitPeerEvents {
+		return false
+	}
+	if a.cfg.Exporter.Kind != "http" {
+		return true
+	}
+	return !strings.Contains(a.cfg.Exporter.HTTPEndpoint, "/api/v1/torrents/batch")
+}
+
+func (a *Application) shouldEmitWorkerStats() bool {
+	if a.cfg.Exporter.Kind != "http" {
+		return true
+	}
+	return !strings.Contains(a.cfg.Exporter.HTTPEndpoint, "/api/v1/torrents/batch")
 }
 
 func (a *Application) checkWorkerCount() int {

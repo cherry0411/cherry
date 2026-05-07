@@ -18,6 +18,12 @@ func testLogger() *log.Logger {
 func defaultTestConfig() config.Config {
 	return config.Config{
 		InstanceID: "test",
+		Exporter: config.ExporterConfig{
+			Kind: "stdout",
+		},
+		Discovery: config.DiscoveryConfig{
+			EmitPeerEvents: true,
+		},
 	}
 }
 
