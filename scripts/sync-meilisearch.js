@@ -39,11 +39,10 @@ async function main() {
             filterableAttributes: ['fileCount', 'totalLength', 'isPrivate', 'peerCount'],
             typoTolerance: { minWordSizeForTypos: { oneTypo: 5, twoTypos: 8 }, disableOnWords: [], disableOnAttributes: [] },
             rankingRules: [
-                'words',
-                'exactness',
-                'proximity',
                 'sort',
-                'createdAt:desc'
+                'createdAt:desc',
+                'words',
+                'exactness'
             ]
         })
     });

@@ -1,3 +1,4 @@
+using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 
@@ -10,6 +11,28 @@ public class MeiliSearchClient
     public MeiliSearchClient(HttpClient http)
     {
         _http = http;
+    }
+
+    public async Task EnsureIndexAsync(CancellationToken ct)
+    {
+        var settings = JsonSerializer.Serialize(new
+        {
+            searchableAttributes = new[] { "name" },
+            sortableAttributes = new[] { "createdAt", "fileCount", "peerCount", "totalLength" },
+            filterableAttributes = new[] { "fileCount", "totalLength", "isPrivate", "peerCount" },
+            rankingRules = new[] { "sort", "createdAt:desc", "words", "exactness" },
+            typoTolerance = new
+            {
+                minWordSizeForTypos = new { oneTypo = 5, twoTypos = 8 },
+                disableOnWords = Array.Empty<string>(),
+                disableOnAttributes = Array.Empty<string>()
+            }
+        });
+        var content = new StringContent(settings, Encoding.UTF8, "application/json");
+        // Create index if not exists, then update settings
+        var body = JsonSerializer.Serialize(new { uid = "torrents", primaryKey = "infoHash" });
+        await _http.PostAsync("/indexes", new StringContent(body, Encoding.UTF8, "application/json"), ct);
+        await _http.PatchAsync("/indexes/torrents/settings", content, ct);
     }
 
     public async Task IndexDocumentsAsync(List<Cherry.Domain.Entities.Torrent> torrents, CancellationToken ct)
@@ -78,8 +101,9 @@ public static class SearchHelper
     public static bool IsCjkQuery(string query)
     {
         foreach (var c in query)
-            if (c >= 0x4E00 && c <= 0x9FFF) // CJK Unified Ideographs
+            if (c >= 0x4E00 && c <= 0x9FFF)
                 return true;
         return false;
     }
 }
+

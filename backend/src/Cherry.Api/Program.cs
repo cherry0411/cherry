@@ -86,6 +86,18 @@ await using (var scope = app.Services.CreateAsyncScope())
     }
 }
 
+// Init Meilisearch index settings
+if (!string.IsNullOrWhiteSpace(meiliUrl))
+{
+    try
+    {
+        using var meiliScope = app.Services.CreateScope();
+        var meiliInit = meiliScope.ServiceProvider.GetService<Cherry.Infrastructure.Search.MeiliSearchClient>();
+        if (meiliInit != null) await meiliInit.EnsureIndexAsync(CancellationToken.None);
+    }
+    catch { }
+}
+
 // CORS — allow independent frontend deployment
 app.UseCors(policy => policy
     .AllowAnyOrigin()
