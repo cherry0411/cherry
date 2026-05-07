@@ -1,7 +1,11 @@
 using System.Threading.Channels;
 using Cherry.Application.Dtos;
 using Cherry.Domain.Entities;
+using System.Net.Http;
+using System.Text;
+using System.Text.Json;
 using Cherry.Domain.Interfaces;
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
@@ -140,5 +144,31 @@ public class IngestService : IHostedService
         var sources = events.Select(e => e.InstanceId).Distinct().OrderBy(s => s);
         _logger.LogInformation("Batch processed: {Total} events → {Inserted} new from [{Sources}]", events.Count, inserted, string.Join(", ", sources));
 
+        // Sync to Meilisearch
+        if (inserted > 0)
+        {
+            var meiliUrl = scope.ServiceProvider.GetRequiredService<IConfiguration>()["MeiliSearch:Url"];
+            if (!string.IsNullOrWhiteSpace(meiliUrl))
+            {
+                try
+                {
+                    var docs = torrents.Select(t => new
+                    {
+                        infoHash = t.InfoHash,
+                        name = t.Name,
+                        totalLength = t.TotalLength,
+                        fileCount = t.FileCount,
+                        isPrivate = t.IsPrivate,
+                        peerCount = t.PeerCount,
+                        createdAt = new DateTimeOffset(t.CreatedAt).ToUnixTimeMilliseconds()
+                    });
+                    var json = JsonSerializer.Serialize(docs);
+                    using var client = new HttpClient { Timeout = TimeSpan.FromSeconds(5) };
+                    await client.PostAsync($"{meiliUrl}/indexes/torrents/documents",
+                        new StringContent(json, Encoding.UTF8, "application/json"), ct);
+                }
+                catch { /* best-effort */ }
             }
+        }
+    }
 }
