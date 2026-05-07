@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Threading.Channels;
 using Cherry.Application.Dtos;
 using Cherry.Domain.Entities;
@@ -19,6 +20,8 @@ public class IngestService : IHostedService
     private readonly ILogger<IngestService> _logger;
     private readonly Channel<CrawlerEvent> _channel;
     private readonly CancellationTokenSource _cts = new();
+    private readonly ConcurrentQueue<object> _meiliQueue = new();
+    private Timer? _meiliTimer;
 
     public IngestService(IServiceScopeFactory scopeFactory, IDedupFilter dedup, ILogger<IngestService> logger)
     {
@@ -75,11 +78,39 @@ public class IngestService : IHostedService
     public Task StartAsync(CancellationToken cancellationToken)
     {
         _ = ProcessLoop(_cts.Token);
+        _meiliTimer = new Timer(_ => FlushMeiliTimer(), null, TimeSpan.FromSeconds(10), TimeSpan.FromSeconds(10));
         return Task.CompletedTask;
+    }
+
+    private void FlushMeiliTimer()
+    {
+        if (_meiliQueue.IsEmpty) return;
+        using var scope = _scopeFactory.CreateScope();
+        var meiliUrl = scope.ServiceProvider.GetRequiredService<IConfiguration>()["MeiliSearch:Url"];
+        if (string.IsNullOrWhiteSpace(meiliUrl)) return;
+        _ = FlushMeiliQueueAsync(meiliUrl);
+    }
+
+    private async Task FlushMeiliQueueAsync(string meiliUrl)
+    {
+        var batch = new List<object>();
+        while (_meiliQueue.TryDequeue(out var doc) && batch.Count < 200)
+            batch.Add(doc);
+        if (batch.Count == 0) return;
+
+        try
+        {
+            var json = JsonSerializer.Serialize(batch);
+            using var client = new HttpClient { Timeout = TimeSpan.FromSeconds(10) };
+            await client.PostAsync($"{meiliUrl}/indexes/torrents/documents",
+                new StringContent(json, Encoding.UTF8, "application/json"));
+        }
+        catch { /* best-effort */ }
     }
 
     public Task StopAsync(CancellationToken cancellationToken)
     {
+        _meiliTimer?.Dispose();
         _cts.Cancel();
         _channel.Writer.Complete();
         return Task.CompletedTask;
@@ -144,15 +175,15 @@ public class IngestService : IHostedService
         var sources = events.Select(e => e.InstanceId).Distinct().OrderBy(s => s);
         _logger.LogInformation("Batch processed: {Total} events → {Inserted} new from [{Sources}]", events.Count, inserted, string.Join(", ", sources));
 
-        // Sync to Meilisearch
+        // Sync to Meilisearch — buffer and flush in bulk
         if (inserted > 0)
         {
             var meiliUrl = scope.ServiceProvider.GetRequiredService<IConfiguration>()["MeiliSearch:Url"];
             if (!string.IsNullOrWhiteSpace(meiliUrl))
             {
-                try
+                foreach (var t in torrents)
                 {
-                    var docs = torrents.Select(t => new
+                    _meiliQueue.Enqueue(new
                     {
                         infoHash = t.InfoHash,
                         name = t.Name,
@@ -162,12 +193,13 @@ public class IngestService : IHostedService
                         peerCount = t.PeerCount,
                         createdAt = new DateTimeOffset(t.CreatedAt).ToUnixTimeMilliseconds()
                     });
-                    var json = JsonSerializer.Serialize(docs);
-                    using var client = new HttpClient { Timeout = TimeSpan.FromSeconds(5) };
-                    await client.PostAsync($"{meiliUrl}/indexes/torrents/documents",
-                        new StringContent(json, Encoding.UTF8, "application/json"), ct);
                 }
-                catch { /* best-effort */ }
+
+                // Flush immediately if queue exceeds threshold
+                if (_meiliQueue.Count >= 50)
+                {
+                    _ = FlushMeiliQueueAsync(meiliUrl);
+                }
             }
         }
     }
