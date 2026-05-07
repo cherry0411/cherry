@@ -27,8 +27,14 @@ public class IngestService : IHostedService
         });
     }
 
+    public int QueueDepth => _channel.Reader.Count;
+
     public async Task<BatchIngestResponse> SubmitBatchAsync(BatchIngestRequest request, CancellationToken ct)
     {
+        // 背压保护：channel 超 80% 时拒绝新请求，让爬虫退避
+        if (_channel.Reader.Count > 80_000)
+            return new BatchIngestResponse(0, 0, 0, Backpressure: true);
+
         var accepted = 0;
         var duplicates = 0;
         var errors = 0;

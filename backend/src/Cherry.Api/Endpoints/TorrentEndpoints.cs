@@ -364,6 +364,8 @@ public static class TorrentEndpoints
             return Results.BadRequest(new { error = "No events provided" });
 
         var result = await ingestService.SubmitBatchAsync(request, ct);
+        if (result.Backpressure)
+            return Results.StatusCode(429);
         return Results.Ok(result);
     }
 

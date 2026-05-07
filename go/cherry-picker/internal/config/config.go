@@ -53,6 +53,8 @@ type ExporterConfig struct {
 	HTTPTimeout   time.Duration
 	HTTPRetries   int
 	RetryBackoff  time.Duration
+	WalDir        string // WAL 本地缓冲目录，空 = 不启用
+	APIKey        string // X-API-Key 认证头，空 = 不发送
 }
 
 func Load() (Config, error) {
@@ -82,16 +84,16 @@ func Load() (Config, error) {
 		Discovery: DiscoveryConfig{
 			Mode:           strings.ToLower(getenvDefault("CHERRY_PICKER_DHT_MODE", "crawl")),
 			EmitPeerEvents: getenvBool("CHERRY_PICKER_EMIT_PEER_EVENTS", true),
-			PacketWorkers:  getenvInt("CHERRY_PICKER_DHT_PACKET_WORKERS", 256),
-			PacketJobs:     getenvInt("CHERRY_PICKER_DHT_PACKET_JOBS", 1024),
-			MaxNodes:       getenvInt("CHERRY_PICKER_DHT_MAX_NODES", 5000),
-			RefreshNodes:   getenvInt("CHERRY_PICKER_DHT_REFRESH_NODES", 256),
+			PacketWorkers:  getenvInt("CHERRY_PICKER_DHT_PACKET_WORKERS", 512),
+			PacketJobs:     getenvInt("CHERRY_PICKER_DHT_PACKET_JOBS", 65536),
+			MaxNodes:       getenvInt("CHERRY_PICKER_DHT_MAX_NODES", 50000),
+			RefreshNodes:   getenvInt("CHERRY_PICKER_DHT_REFRESH_NODES", 2048),
 		},
 		Metadata: MetadataConfig{
 			Enabled:          getenvBool("CHERRY_PICKER_METADATA_ENABLED", true),
 			BlackListSize:    getenvInt("CHERRY_PICKER_METADATA_BLACKLIST", 65536),
-			RequestQueueSize: getenvInt("CHERRY_PICKER_METADATA_REQUEST_QUEUE", 4096),
-			WorkerQueueSize:  getenvInt("CHERRY_PICKER_METADATA_WORKERS", 256),
+			RequestQueueSize: getenvInt("CHERRY_PICKER_METADATA_REQUEST_QUEUE", 65536),
+			WorkerQueueSize:  getenvInt("CHERRY_PICKER_METADATA_WORKERS", 512),
 		},
 		Exporter: ExporterConfig{
 			Kind:          strings.ToLower(getenvDefault("CHERRY_PICKER_EXPORTER", "stdout")),
@@ -102,6 +104,8 @@ func Load() (Config, error) {
 			HTTPTimeout:   getenvDuration("CHERRY_PICKER_EXPORTER_TIMEOUT", 5*time.Second),
 			HTTPRetries:   getenvInt("CHERRY_PICKER_EXPORTER_HTTP_RETRIES", 3),
 			RetryBackoff:  getenvDuration("CHERRY_PICKER_EXPORTER_RETRY_BACKOFF", time.Second),
+			WalDir:        getenvDefault("CHERRY_PICKER_WAL_DIR", ""),
+			APIKey:        getenvDefault("CHERRY_API_KEY", ""),
 		},
 	}
 
@@ -131,10 +135,10 @@ func loadFromFile(path string) (Config, error) {
 		Discovery: DiscoveryConfig{
 			Mode:           strings.ToLower(strings.TrimSpace(raw.Discovery.Mode)),
 			EmitPeerEvents: raw.Discovery.EmitPeerEvents,
-			PacketWorkers:  intOrDefault(raw.Discovery.PacketWorkers, 256),
-			PacketJobs:     intOrDefault(raw.Discovery.PacketJobs, 1024),
-			MaxNodes:       intOrDefault(raw.Discovery.MaxNodes, 5000),
-			RefreshNodes:   intOrDefault(raw.Discovery.RefreshNodes, 256),
+			PacketWorkers:  intOrDefault(raw.Discovery.PacketWorkers, 512),
+			PacketJobs:     intOrDefault(raw.Discovery.PacketJobs, 65536),
+			MaxNodes:       intOrDefault(raw.Discovery.MaxNodes, 50000),
+			RefreshNodes:   intOrDefault(raw.Discovery.RefreshNodes, 2048),
 		},
 		Metadata: MetadataConfig{
 			Enabled:          raw.Metadata.Enabled,
@@ -151,6 +155,8 @@ func loadFromFile(path string) (Config, error) {
 			HTTPTimeout:   parseDuration(raw.Exporter.HTTPTimeout),
 			HTTPRetries:   raw.Exporter.HTTPRetries,
 			RetryBackoff:  parseDuration(raw.Exporter.RetryBackoff),
+			WalDir:        strings.TrimSpace(raw.Exporter.WalDir),
+			APIKey:        strings.TrimSpace(raw.Exporter.APIKey),
 		},
 	}
 
@@ -180,25 +186,25 @@ func normalize(cfg Config) Config {
 		cfg.Discovery.Mode = "crawl"
 	}
 	if cfg.Discovery.PacketWorkers <= 0 {
-		cfg.Discovery.PacketWorkers = 256
+		cfg.Discovery.PacketWorkers = 512
 	}
 	if cfg.Discovery.PacketJobs <= 0 {
-		cfg.Discovery.PacketJobs = 1024
+		cfg.Discovery.PacketJobs = 65536
 	}
 	if cfg.Discovery.MaxNodes <= 0 {
-		cfg.Discovery.MaxNodes = 5000
+		cfg.Discovery.MaxNodes = 50000
 	}
 	if cfg.Discovery.RefreshNodes <= 0 {
-		cfg.Discovery.RefreshNodes = 256
+		cfg.Discovery.RefreshNodes = 2048
 	}
 	if cfg.Metadata.BlackListSize <= 0 {
 		cfg.Metadata.BlackListSize = 65536
 	}
 	if cfg.Metadata.RequestQueueSize <= 0 {
-		cfg.Metadata.RequestQueueSize = 4096
+		cfg.Metadata.RequestQueueSize = 65536
 	}
 	if cfg.Metadata.WorkerQueueSize <= 0 {
-		cfg.Metadata.WorkerQueueSize = 256
+		cfg.Metadata.WorkerQueueSize = 512
 	}
 	if cfg.Exporter.Kind == "" {
 		cfg.Exporter.Kind = "stdout"
@@ -279,6 +285,8 @@ type fileExporterConfig struct {
 	HTTPTimeout   string `json:"http_timeout"`
 	HTTPRetries   int    `json:"http_retries"`
 	RetryBackoff  string `json:"retry_backoff"`
+	WalDir        string `json:"wal_dir"`
+	APIKey        string `json:"api_key"`
 }
 
 func intOrDefault(value, fallback int) int {

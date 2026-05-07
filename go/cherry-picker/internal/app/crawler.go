@@ -1,0 +1,692 @@
+// Package app 实现 Cherry DHT 爬虫的核心应用逻辑（高性能重写版）。
+//
+// 主要修复（相比 app.go）：
+//  1. seenSet（无限增长 map）→ 有界 LRU cache，内存严格上限
+//  2. remoteKnown sync.Map（无限增长）→ 有界 LRU cache
+//  3. peerCounts sync.Map（高并发内存碎片）→ mutex + map，定期 swap 替换
+//  4. checkQueue 容量从 4096 增大到 100000
+//  5. 消除全局变量，所有状态内聚到 Application 结构体
+//  6. 自适应调优：根据内存压力自动暂停/恢复 metadata 请求入队
+package app
+
+import (
+	"bytes"
+	"context"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log"
+	"net/http"
+	"path/filepath"
+	"runtime"
+	"sort"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+	"unicode/utf8"
+
+	"cherry-picker/internal/cache"
+	"cherry-picker/internal/config"
+	dht "cherry-picker/internal/dht"
+	"cherry-picker/internal/export"
+	"cherry-picker/internal/pipeline"
+
+	"golang.org/x/text/encoding/simplifiedchinese"
+	"golang.org/x/text/transform"
+)
+
+// lruCapConfig 保存各 LRU 的容量配置。
+type lruCapConfig struct {
+	infohashSeen       int // peer 去重 LRU 容量
+	metadataRequestSeen int // metadata 请求去重 LRU 容量
+	remoteKnown        int // 远端已知 hash LRU 容量
+}
+
+// Application 是爬虫应用实例，封装所有状态（不使用全局变量）。
+type Application struct {
+	cfg    config.Config
+	logger *log.Logger
+	dht    *dht.DHT
+
+	// 有界 LRU，替代无限增长的 seenSet / remoteKnown
+	infohashSeen        *cache.LRU // infohash 去重（peer 发现）
+	peerSeen            *cache.LRU // peer 去重（peer 事件）
+	metadataRequestSeen *cache.LRU // metadata 请求去重
+	metadataResultSeen  *cache.LRU // metadata 结果去重
+	remoteKnown         *cache.LRU // 远端 API 已确认存在的 hash
+
+	// peerCounts：替代 sync.Map，用 mutex+map 减少内存碎片。
+	// 每60秒 flush 时原子替换整个 map，避免在高并发 LoadOrStore 下 sync.Map 的 dirty 翻倍问题。
+	peerCountsMu sync.Mutex
+	peerCounts   map[string]int
+
+	// 自适应调优：内存压力高时暂停 metadata 请求入队
+	metaPaused atomic.Bool
+
+	// API 客户端（不再是全局变量）
+	apiClient *http.Client
+}
+
+// runtimeStats 运行时统计（原子计数器）。
+type runtimeStats struct {
+	infohashEventsSent      atomic.Uint64
+	infohashEventsDropped   atomic.Uint64
+	infohashEventsDeduped   atomic.Uint64
+	peerEventsDropped       atomic.Uint64
+	metadataEventsDropped   atomic.Uint64
+	peerEventsSent          atomic.Uint64
+	metadataEventsSent      atomic.Uint64
+	peerEventsDeduped       atomic.Uint64
+	metadataEventsDeduped   atomic.Uint64
+	metadataRequestsQueued  atomic.Uint64
+	metadataRequestsDeduped atomic.Uint64
+}
+
+// New 创建一个新的 Application 实例。
+func New(cfg config.Config, logger *log.Logger) *Application {
+	if logger == nil {
+		logger = log.Default()
+	}
+	// LRU 容量配置（可从环境变量扩展，这里用合理默认值）
+	return &Application{
+		cfg:    cfg,
+		logger: logger,
+
+		// peer/infohash 去重：10min TTL 下高流量约 50-100万次/min，用 500k 避免内存爆炸
+		infohashSeen:        cache.NewLRU(500_000),
+		peerSeen:            cache.NewLRU(500_000),
+		// metadata 请求去重：30min TTL 下容量更大
+		metadataRequestSeen: cache.NewLRU(1_000_000),
+		metadataResultSeen:  cache.NewLRU(1_000_000),
+		// 远端已知 hash：API check 的结果，容量 100万
+		remoteKnown:         cache.NewLRU(1_000_000),
+
+		peerCounts: make(map[string]int, 4096),
+		apiClient:  &http.Client{Timeout: 10 * time.Second},
+	}
+}
+
+// Run 启动爬虫，阻塞直到 ctx 取消。
+func (a *Application) Run(ctx context.Context) error {
+	events := make(chan pipeline.Event, a.cfg.EventQueue)
+	sink, err := export.NewSink(a.cfg.Exporter)
+	if err != nil {
+		return err
+	}
+
+	exporter := export.NewBatchExporter(a.logger, sink, a.cfg.Exporter.BatchSize, a.cfg.Exporter.FlushInterval, events)
+	go func() { _ = exporter.Run(ctx) }()
+
+	stats := &runtimeStats{}
+
+	// checkQueue：批量向 API 检查 hash 是否已存在，容量从 4096 增大到 100000
+	checkQueue := make(chan string, 100_000)
+	go a.runCheckLoop(ctx, checkQueue)
+
+	// peer wire metadata 下载器
+	downloader := dht.NewWire(a.cfg.Metadata.BlackListSize, a.cfg.Metadata.RequestQueueSize, a.cfg.Metadata.WorkerQueueSize)
+	go a.consumeMetadata(ctx, downloader, events, stats)
+	go downloader.Run()
+	a.logger.Printf("metadata workers: %d, queue: %d", a.cfg.Metadata.WorkerQueueSize, a.cfg.Metadata.RequestQueueSize)
+
+	// DHT 配置
+	dhtConfig := dht.NewCrawlConfig()
+	if a.cfg.Discovery.Mode == "standard" {
+		dhtConfig = dht.NewStandardConfig()
+	}
+	dhtConfig.Address = a.cfg.ListenAddr
+	dhtConfig.PacketWorkerLimit = a.cfg.Discovery.PacketWorkers
+	dhtConfig.PacketJobLimit = a.cfg.Discovery.PacketJobs
+	dhtConfig.MaxNodes = a.cfg.Discovery.MaxNodes
+	dhtConfig.RefreshNodeNum = a.cfg.Discovery.RefreshNodes
+
+	dhtConfig.OnGetPeers = func(infoHash, ip string, port int) {
+		ihHex := hex.EncodeToString([]byte(infoHash))
+		a.submitInfohashEvent(events, ihHex, ip, port, "get_peers", stats)
+	}
+	dhtConfig.OnGetPeersResponse = func(infoHash string, peer *dht.Peer) {
+		ihHex := hex.EncodeToString([]byte(infoHash))
+		if a.cfg.Role != "metadata" {
+			a.submitPeerEvent(events, ihHex, peer.IP.String(), peer.Port, "get_peers_response", stats)
+		}
+		a.queueMetadataRequest(downloader, ihHex, peer.IP.String(), peer.Port, stats, checkQueue)
+	}
+	dhtConfig.OnAnnouncePeer = func(infoHash, ip string, port int) {
+		ihHex := hex.EncodeToString([]byte(infoHash))
+		if a.cfg.Role != "metadata" {
+			a.submitPeerEvent(events, ihHex, ip, port, "announce_peer", stats)
+		}
+		a.queueMetadataRequest(downloader, ihHex, ip, port, stats, checkQueue)
+	}
+
+	a.dht = dht.New(dhtConfig)
+
+	// 后台 goroutines
+	go a.emitStats(ctx, events, stats, a.dht)
+	go a.flushPeerCountsLoop(ctx)
+	go a.pollPendingRequests(ctx)
+	go a.autoTuneLoop(ctx)
+
+	go a.dht.Run()
+	a.logger.Printf("started: instance=%s udp=%s workers=%d nodes=%d",
+		a.cfg.InstanceID, a.cfg.ListenAddr,
+		a.cfg.Metadata.WorkerQueueSize, a.cfg.Discovery.MaxNodes)
+
+	<-ctx.Done()
+	a.logger.Printf("shutdown")
+	return nil
+}
+
+// --- 内部 goroutine ---
+
+// runCheckLoop 每2秒批量向 API 检查哪些 hash 已存在，结果写入 remoteKnown LRU。
+func (a *Application) runCheckLoop(ctx context.Context, checkQueue <-chan string) {
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+	buf := make([]string, 0, 100)
+
+	flush := func() {
+		if len(buf) == 0 {
+			return
+		}
+		a.checkBatchExists(buf)
+		buf = buf[:0]
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			flush()
+			return
+		case h := <-checkQueue:
+			buf = append(buf, h)
+			if len(buf) >= 50 {
+				flush()
+			}
+		case <-ticker.C:
+			flush()
+		}
+	}
+}
+
+// flushPeerCountsLoop 每60秒将累积的 peer counts 批量上报到 API。
+func (a *Application) flushPeerCountsLoop(ctx context.Context) {
+	ticker := time.NewTicker(60 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			a.flushPeerCounts()
+			return
+		case <-ticker.C:
+			a.flushPeerCounts()
+		}
+	}
+}
+
+// flushPeerCounts 原子替换 peerCounts map 并批量上报，避免上报期间的锁竞争。
+func (a *Application) flushPeerCounts() {
+	a.peerCountsMu.Lock()
+	if len(a.peerCounts) == 0 {
+		a.peerCountsMu.Unlock()
+		return
+	}
+	counts := a.peerCounts
+	a.peerCounts = make(map[string]int, 4096)
+	a.peerCountsMu.Unlock()
+
+	body, _ := json.Marshal(map[string]interface{}{"hashes": counts})
+	req, err := http.NewRequest(http.MethodPost,
+		a.baseURL()+"/api/v1/torrents/peers",
+		bytes.NewReader(body))
+	if err != nil {
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if a.cfg.Exporter.APIKey != "" {
+		req.Header.Set("X-API-Key", a.cfg.Exporter.APIKey)
+	}
+	resp, err := a.apiClient.Do(req)
+	if err != nil {
+		return
+	}
+	resp.Body.Close()
+}
+
+// pollPendingRequests 每30秒拉取 API 中待抓取的 infohash 列表，触发 DHT get_peers。
+func (a *Application) pollPendingRequests(ctx context.Context) {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			resp, err := a.apiClient.Get(a.baseURL() + "/api/v1/torrents/pending")
+			if err != nil {
+				continue
+			}
+			var pending []string
+			if json.NewDecoder(resp.Body).Decode(&pending) != nil {
+				resp.Body.Close()
+				continue
+			}
+			resp.Body.Close()
+			for _, h := range pending {
+				a.dht.GetPeers(h)
+			}
+		}
+	}
+}
+
+// autoTuneLoop 每30秒采样内存和队列状态，动态调整 metadata 入队。
+//
+// 策略：
+//   - HeapInuse > 500MB → 暂停 metadata 请求入队，强制 GC，等内存降下来
+//   - HeapInuse < 300MB → 恢复入队
+func (a *Application) autoTuneLoop(ctx context.Context) {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	// 内存阈值（字节）
+	const pauseThreshold  = 500 * 1024 * 1024 // 500 MB → 暂停
+	const resumeThreshold = 300 * 1024 * 1024 // 300 MB → 恢复
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			var ms runtime.MemStats
+			runtime.ReadMemStats(&ms)
+
+			heapInUse := ms.HeapInuse
+			paused := a.metaPaused.Load()
+
+			switch {
+			case heapInUse > pauseThreshold && !paused:
+				a.metaPaused.Store(true)
+				runtime.GC()
+				a.logger.Printf("autotune: metadata paused (heap=%dMB > %dMB), GC triggered",
+					heapInUse/1024/1024, pauseThreshold/1024/1024)
+
+			case heapInUse < resumeThreshold && paused:
+				a.metaPaused.Store(false)
+				a.logger.Printf("autotune: metadata resumed (heap=%dMB < %dMB)",
+					heapInUse/1024/1024, resumeThreshold/1024/1024)
+
+			default:
+				a.logger.Printf("autotune: heap=%dMB paused=%v seenSizes=[ih=%d peer=%d metaReq=%d remote=%d]",
+					heapInUse/1024/1024, paused,
+					a.infohashSeen.Len(), a.peerSeen.Len(),
+					a.metadataRequestSeen.Len(), a.remoteKnown.Len())
+			}
+		}
+	}
+}
+
+// --- 事件提交 ---
+
+func (a *Application) submitInfohashEvent(events chan<- pipeline.Event, ihHex, ip string, port int, source string, stats *runtimeStats) {
+	key := fmt.Sprintf("%s|%s|%s|%d", ihHex, source, ip, port)
+	// LRU.Set 返回 false = 已存在（已见过）
+	if !a.infohashSeen.Set(key) {
+		stats.infohashEventsDeduped.Add(1)
+		return
+	}
+	a.submitEvent(events, pipeline.Event{
+		Type:       pipeline.EventPeerDiscovered,
+		Timestamp:  time.Now().UTC(),
+		InstanceID: a.cfg.InstanceID,
+		Source:     source,
+		InfoHash:   ihHex,
+		IP:         ip,
+		Port:       port,
+	}, stats.infohashEventsDropped.Add, stats.infohashEventsSent.Add)
+}
+
+func (a *Application) submitPeerEvent(events chan<- pipeline.Event, ihHex, ip string, port int, source string, stats *runtimeStats) {
+	key := fmt.Sprintf("%s|%s|%d", ihHex, ip, port)
+	if !a.peerSeen.Set(key) {
+		stats.peerEventsDeduped.Add(1)
+		return
+	}
+	a.submitEvent(events, pipeline.Event{
+		Type:       pipeline.EventPeerDiscovered,
+		Timestamp:  time.Now().UTC(),
+		InstanceID: a.cfg.InstanceID,
+		Source:     source,
+		InfoHash:   ihHex,
+		IP:         ip,
+		Port:       port,
+	}, stats.peerEventsDropped.Add, stats.peerEventsSent.Add)
+}
+
+func (a *Application) queueMetadataRequest(downloader *dht.Wire, ihHex, ip string, port int, stats *runtimeStats, checkQueue chan<- string) {
+	requestKey := fmt.Sprintf("%s|%s|%d", ihHex, ip, port)
+	if !a.metadataRequestSeen.Set(requestKey) {
+		stats.metadataRequestsDeduped.Add(1)
+		// 累加 peer count（该 hash 再次被目击，但不重复下载）
+		a.incPeerCount(ihHex)
+		return
+	}
+
+	// 已被远端 API 确认存在：跳过下载，只累加 peer count
+	if a.remoteKnown.Contains(ihHex) {
+		stats.metadataRequestsDeduped.Add(1)
+		a.incPeerCount(ihHex)
+		return
+	}
+
+	infoHashBytes, err := hex.DecodeString(ihHex)
+	if err != nil {
+		return
+	}
+
+	// 加入远端检查队列（non-blocking，满了就跳过，不阻塞 UDP 处理）
+	select {
+	case checkQueue <- ihHex:
+	default:
+	}
+
+	// 自适应调优：内存压力高时暂停 metadata 入队
+	if a.metaPaused.Load() {
+		return
+	}
+
+	stats.metadataRequestsQueued.Add(1)
+	downloader.Request(infoHashBytes, ip, port)
+}
+
+func (a *Application) incPeerCount(ihHex string) {
+	a.peerCountsMu.Lock()
+	a.peerCounts[ihHex]++
+	a.peerCountsMu.Unlock()
+}
+
+func (a *Application) consumeMetadata(ctx context.Context, downloader *dht.Wire, events chan<- pipeline.Event, stats *runtimeStats) {
+	responses := downloader.Response()
+	var ok, fail uint64
+	logTicker := time.NewTicker(30 * time.Second)
+	defer logTicker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-logTicker.C:
+			a.logger.Printf("metadata download: ok=%d fail=%d (30s)", ok, fail)
+			ok, fail = 0, 0
+		case response := <-responses:
+			ihHex := hex.EncodeToString(response.InfoHash)
+			responseKey := fmt.Sprintf("%s|%s|%d", ihHex, response.IP, response.Port)
+			if !a.metadataResultSeen.Set(responseKey) {
+				stats.metadataEventsDeduped.Add(1)
+				fail++
+				continue
+			}
+			metadata, err := normalizeMetadata(response.MetadataInfo)
+			if err != nil {
+				stats.metadataEventsDeduped.Add(1)
+				fail++
+				continue
+			}
+			ok++
+			a.submitEvent(events, pipeline.Event{
+				Type:       pipeline.EventMetadataFetched,
+				Timestamp:  time.Now().UTC(),
+				InstanceID: a.cfg.InstanceID,
+				Source:     "peer_wire",
+				InfoHash:   ihHex,
+				IP:         response.IP,
+				Port:       response.Port,
+				Metadata:   metadata,
+			}, stats.metadataEventsDropped.Add, stats.metadataEventsSent.Add)
+		}
+	}
+}
+
+func (a *Application) emitStats(ctx context.Context, events chan<- pipeline.Event, stats *runtimeStats, node *dht.DHT) {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			packetStats := node.PacketStats()
+			a.submitEvent(events, pipeline.Event{
+				Type:       pipeline.EventWorkerStats,
+				Timestamp:  time.Now().UTC(),
+				InstanceID: a.cfg.InstanceID,
+				Source:     "runtime",
+				Stats: map[string]uint64{
+					"infohash_events_sent":      stats.infohashEventsSent.Load(),
+					"infohash_events_dropped":   stats.infohashEventsDropped.Load(),
+					"infohash_events_deduped":   stats.infohashEventsDeduped.Load(),
+					"peer_events_sent":          stats.peerEventsSent.Load(),
+					"peer_events_dropped":       stats.peerEventsDropped.Load(),
+					"peer_events_deduped":       stats.peerEventsDeduped.Load(),
+					"metadata_requests_queued":  stats.metadataRequestsQueued.Load(),
+					"metadata_requests_deduped": stats.metadataRequestsDeduped.Load(),
+					"metadata_events_sent":      stats.metadataEventsSent.Load(),
+					"metadata_events_dropped":   stats.metadataEventsDropped.Load(),
+					"metadata_events_deduped":   stats.metadataEventsDeduped.Load(),
+					"dht_packets_received":      packetStats.Received,
+					"dht_packets_enqueued":      packetStats.Enqueued,
+					"dht_packets_dropped":       packetStats.Dropped,
+					"dht_packets_handled":       packetStats.Handled,
+					"dht_packet_decode_errors":  packetStats.DecodeErrors,
+				},
+			}, func(delta uint64) uint64 { return delta }, func(delta uint64) uint64 { return delta })
+		}
+	}
+}
+
+func (a *Application) submitEvent(events chan<- pipeline.Event, event pipeline.Event, onDrop func(uint64) uint64, onSuccess func(uint64) uint64) {
+	select {
+	case events <- event:
+		onSuccess(1)
+	default:
+		onDrop(1)
+	}
+}
+
+// --- 辅助函数 ---
+
+func (a *Application) baseURL() string {
+	url := a.cfg.Exporter.HTTPEndpoint
+	if idx := strings.Index(url, "/api/"); idx > 0 {
+		return url[:idx]
+	}
+	return url
+}
+
+func (a *Application) checkBatchExists(hashes []string) {
+	if len(hashes) == 0 {
+		return
+	}
+	url := a.baseURL() + "/api/v1/torrents/check?hashes=" + strings.Join(hashes, ",")
+	resp, err := a.apiClient.Get(url)
+	if err != nil {
+		return
+	}
+	defer resp.Body.Close()
+	var found []string
+	if json.NewDecoder(resp.Body).Decode(&found) == nil {
+		for _, h := range found {
+			a.remoteKnown.Set(h) // 添加到有界 LRU，超容量时自动淘汰最旧的
+		}
+	}
+}
+
+// --- metadata 解析（与原 app.go 完全一致）---
+
+func normalizeMetadata(data []byte) (*pipeline.Metadata, error) {
+	decoded, err := dht.Decode(data)
+	if err != nil {
+		return nil, err
+	}
+
+	info, ok := decoded.(map[string]interface{})
+	if !ok {
+		return nil, errUnexpectedMetadata
+	}
+
+	metadata := &pipeline.Metadata{}
+	if name := firstString(info, "name.utf-8", "name"); name != "" {
+		metadata.Name = fixEncoding(name)
+	}
+	if length, ok := asInt64(info["length"]); ok {
+		metadata.Length = length
+	}
+	if pieceLength, ok := asInt64(info["piece length"]); ok {
+		metadata.PieceLength = int(pieceLength)
+	}
+	if private, ok := asBool(info["private"]); ok {
+		metadata.Private = private
+	}
+	if files, ok := info["files"].([]interface{}); ok {
+		metadata.Files = make([]pipeline.MetadataFile, 0, len(files))
+		for _, file := range files {
+			item, ok := file.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			entry := pipeline.MetadataFile{}
+			if length, ok := asInt64(item["length"]); ok {
+				entry.Length = length
+			}
+			if path := pathParts(item); len(path) > 0 {
+				entry.Path = path
+				clean := make([]string, 0, len(path))
+				for _, p := range path {
+					p = fixEncoding(p)
+					if p != "" && !isPaddingFile(p) {
+						clean = append(clean, p)
+					}
+				}
+				if len(clean) == 0 {
+					continue
+				}
+				entry.Path = clean
+				entry.PathText = filepath.ToSlash(filepath.Join(clean...))
+			}
+			metadata.Files = append(metadata.Files, entry)
+		}
+	}
+
+	if len(metadata.Files) == 0 && metadata.Name != "" && metadata.Length > 0 {
+		metadata.Files = []pipeline.MetadataFile{{
+			Path:     []string{metadata.Name},
+			PathText: metadata.Name,
+			Length:   metadata.Length,
+		}}
+	}
+	if metadata.Length == 0 && len(metadata.Files) > 0 {
+		var total int64
+		for _, f := range metadata.Files {
+			total += f.Length
+		}
+		metadata.Length = total
+	}
+	metadata.FileCount = len(metadata.Files)
+	if metadata.FileCount > 1 {
+		sort.Slice(metadata.Files, func(i, j int) bool {
+			return metadata.Files[i].PathText < metadata.Files[j].PathText
+		})
+	}
+	if metadata.Name == "" && metadata.FileCount > 0 {
+		metadata.Name = metadata.Files[0].Path[0]
+	}
+	if metadata.Name == "" || metadata.Length <= 0 {
+		return nil, errUnexpectedMetadata
+	}
+	return metadata, nil
+}
+
+func isPaddingFile(name string) bool {
+	return len(name) > 10 && strings.HasPrefix(name, "_____padding_file_")
+}
+
+func fixEncoding(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" || utf8.ValidString(s) {
+		return s
+	}
+	decoded, err := io.ReadAll(transform.NewReader(
+		strings.NewReader(s),
+		simplifiedchinese.GBK.NewDecoder(),
+	))
+	if err == nil {
+		result := string(decoded)
+		if utf8.ValidString(result) {
+			return strings.TrimSpace(result)
+		}
+	}
+	return strings.ToValidUTF8(s, "")
+}
+
+func firstString(values map[string]interface{}, keys ...string) string {
+	for _, key := range keys {
+		if value, ok := values[key].(string); ok {
+			value = strings.TrimSpace(value)
+			if value != "" {
+				return value
+			}
+		}
+	}
+	return ""
+}
+
+func asInt64(value interface{}) (int64, bool) {
+	switch typed := value.(type) {
+	case int:
+		return int64(typed), true
+	case int64:
+		return typed, true
+	case uint64:
+		return int64(typed), true
+	case float64:
+		return int64(typed), true
+	default:
+		return 0, false
+	}
+}
+
+func asBool(value interface{}) (bool, bool) {
+	if intValue, ok := asInt64(value); ok {
+		return intValue != 0, true
+	}
+	if boolValue, ok := value.(bool); ok {
+		return boolValue, true
+	}
+	return false, false
+}
+
+func pathParts(values map[string]interface{}) []string {
+	for _, key := range []string{"path.utf-8", "path"} {
+		raw, ok := values[key].([]interface{})
+		if !ok {
+			continue
+		}
+		parts := make([]string, 0, len(raw))
+		for _, part := range raw {
+			if str, ok := part.(string); ok {
+				str = strings.TrimSpace(str)
+				if str != "" {
+					parts = append(parts, str)
+				}
+			}
+		}
+		if len(parts) > 0 {
+			return parts
+		}
+	}
+	return nil
+}
+
+var errUnexpectedMetadata = errors.New("unexpected metadata payload")

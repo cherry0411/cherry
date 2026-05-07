@@ -16,7 +16,12 @@
       "Bash(git push *)",
       "Bash(git add *)",
       "Bash(node -e \"require\\('./cherry-spider.js'\\)\")",
-      "Bash(node -c frontend/app.js)"
+      "Bash(node -c frontend/app.js)",
+      "Bash(where go *)",
+      "Bash(ls /c/Program*/Go/bin/)",
+      "Read(//mnt/**)",
+      "Bash(cmd /c \"where go\")",
+      "Bash(cmd *)"
     ]
   }
 }

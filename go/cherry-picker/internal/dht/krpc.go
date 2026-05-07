@@ -168,12 +168,16 @@ type transactionManager struct {
 
 // newTransactionManager returns new transactionManager pointer.
 func newTransactionManager(maxCursor uint64, dht *DHT) *transactionManager {
+	queueSize := dht.PacketJobLimit
+	if queueSize < 1024 {
+		queueSize = 1024
+	}
 	return &transactionManager{
 		RWMutex:      &sync.RWMutex{},
 		transactions: newSyncedMap(),
 		index:        newSyncedMap(),
 		maxCursor:    maxCursor,
-		queryChan:    make(chan *query, 1024),
+		queryChan:    make(chan *query, queueSize),
 		dht:          dht,
 	}
 }
@@ -281,6 +285,21 @@ func (tm *transactionManager) filterOne(
 // When timeout, it will retry `try - 1` times, which means it will query
 // `try` times totally.
 func (tm *transactionManager) query(q *query, try int) {
+	// 爬虫模式：火发即忘，不等待响应，不跟踪事务。
+	// 对于 get_peers 请求，将 info_hash 存入环形缓冲，供响应到达时还原。
+	if tm.dht.IsCrawlMode() {
+		if q.data["q"] == getPeersType {
+			if a, ok := q.data["a"].(map[string]interface{}); ok {
+				if ih, ok := a["info_hash"].(string); ok && len(ih) == 20 {
+					idx := crawlTxIdx(q.data["t"].(string))
+					copy(tm.dht.crawlTxBuf[idx][:], ih)
+				}
+			}
+		}
+		send(tm.dht, q.node.addr, q.data)
+		return
+	}
+
 	transID := q.data["t"].(string)
 	trans := tm.newTransaction(transID, q)
 
@@ -309,11 +328,12 @@ func (tm *transactionManager) query(q *query, try int) {
 
 // run starts to listen and consume the query chan.
 func (tm *transactionManager) run() {
-	var q *query
-
 	for {
-		select {
-		case q = <-tm.queryChan:
+		q := <-tm.queryChan
+		if tm.dht.IsCrawlMode() {
+			// 爬虫模式：query() 火发即忘，同步调用省去 goroutine 分配开销
+			tm.query(q, tm.dht.Try)
+		} else {
 			go tm.query(q, tm.dht.Try)
 		}
 	}
@@ -325,12 +345,26 @@ func (tm *transactionManager) sendQuery(
 
 	// If the target is self, then stop.
 	if no.id != nil && no.id.RawString() == tm.dht.node.id.RawString() ||
-		tm.getByIndex(tm.genIndexKey(queryType, no.addr.String())) != nil ||
 		tm.dht.blackList.in(no.addr.IP.String(), no.addr.Port) {
 		return
 	}
 
-	data := makeQuery(tm.genTransID(), queryType, a)
+	// 标准模式：跳过重复未完成查询（同地址+类型）
+	// 爬虫模式：省去此检查，尽量多发出查询
+	if !tm.dht.IsCrawlMode() &&
+		tm.getByIndex(tm.genIndexKey(queryType, no.addr.String())) != nil {
+		return
+	}
+
+	// 爬虫模式用无锁原子计数器生成事务 ID，减少锁竞争
+	var txID string
+	if tm.dht.IsCrawlMode() {
+		txID = tm.dht.crawlGenTxID()
+	} else {
+		txID = tm.genTransID()
+	}
+
+	data := makeQuery(txID, queryType, a)
 	tm.queryChan <- &query{
 		node: no,
 		data: data,
@@ -476,36 +510,36 @@ func handleRequest(dht *DHT, addr *net.UDPAddr,
 			"id": dht.id(id),
 		}))
 	case findNodeType:
-		if dht.IsStandardMode() {
-			if err := ParseKey(a, "target", "string"); err != nil {
-				send(dht, addr, makeError(t, protocolError, err.Error()))
-				return
-			}
-
-			target := a["target"].(string)
-			if len(target) != 20 {
-				send(dht, addr, makeError(t, protocolError, "invalid target"))
-				return
-			}
-
-			var nodes string
-			targetID := newBitmapFromString(target)
-
-			no, _ := dht.routingTable.GetNodeKBucktByID(targetID)
-			if no != nil {
-				nodes = no.CompactNodeInfo()
-			} else {
-				nodes = strings.Join(
-					dht.routingTable.GetNeighborCompactInfos(targetID, dht.K),
-					"",
-				)
-			}
-
-			send(dht, addr, makeResponse(t, map[string]interface{}{
-				"id":    dht.id(target),
-				"nodes": nodes,
-			}))
+		// 标准模式和爬虫模式均响应 find_node。
+		// 爬虫模式响应可让其他节点把我们留在路由表中，从而持续向我们发送更多查询。
+		if err := ParseKey(a, "target", "string"); err != nil {
+			send(dht, addr, makeError(t, protocolError, err.Error()))
+			return
 		}
+
+		target := a["target"].(string)
+		if len(target) != 20 {
+			send(dht, addr, makeError(t, protocolError, "invalid target"))
+			return
+		}
+
+		var nodes string
+		targetID := newBitmapFromString(target)
+
+		no, _ := dht.routingTable.GetNodeKBucktByID(targetID)
+		if no != nil {
+			nodes = no.CompactNodeInfo()
+		} else {
+			nodes = strings.Join(
+				dht.routingTable.GetNeighborCompactInfos(targetID, dht.K),
+				"",
+			)
+		}
+
+		send(dht, addr, makeResponse(t, map[string]interface{}{
+			"id":    dht.id(target),
+			"nodes": nodes,
+		}))
 	case getPeersType:
 		if err := ParseKey(a, "info_hash", "string"); err != nil {
 			send(dht, addr, makeError(t, protocolError, err.Error()))
@@ -520,10 +554,15 @@ func handleRequest(dht *DHT, addr *net.UDPAddr,
 		}
 
 		if dht.IsCrawlMode() {
+			// 爬虫模式：
+			//   1. 返回真实邻居节点（而非空串），让对方把我们视为有价值的节点
+			//   2. 使用固定 token（crawlToken）避免 tokenManager 映射表无限增长
+			nodes := strings.Join(dht.routingTable.GetNeighborCompactInfos(
+				newBitmapFromString(infoHash), dht.K), "")
 			send(dht, addr, makeResponse(t, map[string]interface{}{
 				"id":    dht.id(infoHash),
-				"token": dht.tokenManager.token(addr),
-				"nodes": "",
+				"token": crawlToken,
+				"nodes": nodes,
 			}))
 		} else if peers := dht.peersManager.GetPeers(
 			infoHash, dht.K); len(peers) > 0 {
@@ -564,7 +603,7 @@ func handleRequest(dht *DHT, addr *net.UDPAddr,
 		port := a["port"].(int)
 		token := a["token"].(string)
 
-		if !dht.tokenManager.check(addr, token) {
+		if !dht.IsCrawlMode() && !dht.tokenManager.check(addr, token) {
 			//			send(dht, addr, makeError(t, protocolError, "invalid token"))
 			return
 		}
@@ -577,11 +616,11 @@ func handleRequest(dht *DHT, addr *net.UDPAddr,
 
 		if dht.IsStandardMode() {
 			dht.peersManager.Insert(infoHash, newPeer(addr.IP, port, token))
-
-			send(dht, addr, makeResponse(t, map[string]interface{}{
-				"id": dht.id(id),
-			}))
 		}
+		// 两种模式均需响应，否则对方会重试
+		send(dht, addr, makeResponse(t, map[string]interface{}{
+			"id": dht.id(id),
+		}))
 
 		if dht.OnAnnouncePeer != nil {
 			dht.OnAnnouncePeer(infoHash, addr.IP.String(), port)
@@ -646,6 +685,11 @@ func findOn(dht *DHT, r map[string]interface{}, target *bitmap,
 // handleResponse handles responses received from udp.
 func handleResponse(dht *DHT, addr *net.UDPAddr,
 	response map[string]interface{}) (success bool) {
+
+	// 爬虫模式：使用无事务路径处理响应
+	if dht.IsCrawlMode() {
+		return handleResponseCrawl(dht, addr, response)
+	}
 
 	t := response["t"].(string)
 

@@ -1,27 +1,56 @@
 package app
 
 import (
+	"io"
+	"log"
 	"testing"
-	"time"
 
+	"cherry-picker/internal/config"
 	dht "cherry-picker/internal/dht"
 	"cherry-picker/internal/pipeline"
 )
 
+func testLogger() *log.Logger {
+	return log.New(io.Discard, "", 0)
+}
+
+func defaultTestConfig() config.Config {
+	return config.Config{
+		InstanceID: "test",
+	}
+}
+
 func TestSubmitInfohashEventKeepsDistinctSources(t *testing.T) {
-	application := &Application{}
+	app := New(defaultTestConfig(), testLogger())
 	events := make(chan pipeline.Event, 4)
-	seen := newSeenSet(time.Minute)
 	stats := &runtimeStats{}
 
-	application.submitInfohashEvent(events, "abc", "1.1.1.1", 6881, "get_peers", seen, stats)
-	application.submitInfohashEvent(events, "abc", "1.1.1.1", 6881, "get_peers_response", seen, stats)
+	// 不同 source → 应该各发送一次
+	app.submitInfohashEvent(events, "abc123", "1.1.1.1", 6881, "get_peers", stats)
+	app.submitInfohashEvent(events, "abc123", "1.1.1.1", 6881, "get_peers_response", stats)
 
 	if got := len(events); got != 2 {
 		t.Fatalf("len(events) = %d, want 2", got)
 	}
 	if got := stats.infohashEventsDeduped.Load(); got != 0 {
 		t.Fatalf("infohash deduped = %d, want 0", got)
+	}
+}
+
+func TestSubmitInfohashEventDeduplicates(t *testing.T) {
+	app := New(defaultTestConfig(), testLogger())
+	events := make(chan pipeline.Event, 4)
+	stats := &runtimeStats{}
+
+	// 完全相同的事件 → 第二次应该被去重
+	app.submitInfohashEvent(events, "abc123", "1.1.1.1", 6881, "get_peers", stats)
+	app.submitInfohashEvent(events, "abc123", "1.1.1.1", 6881, "get_peers", stats)
+
+	if got := len(events); got != 1 {
+		t.Fatalf("len(events) = %d, want 1", got)
+	}
+	if got := stats.infohashEventsDeduped.Load(); got != 1 {
+		t.Fatalf("infohash deduped = %d, want 1", got)
 	}
 }
 

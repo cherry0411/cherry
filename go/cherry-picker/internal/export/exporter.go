@@ -40,12 +40,18 @@ func NewSink(cfg config.ExporterConfig) (Sink, error) {
 		if cfg.HTTPEndpoint == "" {
 			return nil, errors.New("http exporter requires CHERRY_PICKER_EXPORTER_URL")
 		}
-		return &httpSink{
+		inner := &httpSink{
 			client:       &http.Client{Timeout: cfg.HTTPTimeout},
 			url:          cfg.HTTPEndpoint,
 			retries:      cfg.HTTPRetries,
 			retryBackoff: cfg.RetryBackoff,
-		}, nil
+			apiKey:       cfg.APIKey,
+		}
+		// 如果配置了 WAL 目录，用 walSink 包装 httpSink
+		if cfg.WalDir != "" {
+			return newWalSink(inner, cfg.WalDir)
+		}
+		return inner, nil
 	default:
 		return nil, fmt.Errorf("unsupported exporter kind %q", cfg.Kind)
 	}
@@ -159,6 +165,7 @@ type httpSink struct {
 	url          string
 	retries      int
 	retryBackoff time.Duration
+	apiKey       string
 	logger       *log.Logger
 }
 
@@ -180,10 +187,27 @@ func (s *httpSink) WriteBatch(ctx context.Context, batch []pipeline.Event) error
 			return err
 		}
 		request.Header.Set("Content-Type", "application/json")
+		if s.apiKey != "" {
+			request.Header.Set("X-API-Key", s.apiKey)
+		}
 
 		response, err := s.client.Do(request)
 		if err == nil {
-			if response.StatusCode < 300 {
+			statusCode := response.StatusCode
+			// 背压：服务端 channel 满，退避 30s 后重试（不计入重试次数）
+			if statusCode == 429 {
+				response.Body.Close()
+				log.Printf("api backpressure (429), backing off 30s")
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-time.After(30 * time.Second):
+				}
+				// 重置 attempt 计数，429 不算一次失败
+				attempt--
+				continue
+			}
+			if statusCode < 300 {
 				var result struct {
 					Accepted   int `json:"accepted"`
 					Duplicates int `json:"duplicates"`

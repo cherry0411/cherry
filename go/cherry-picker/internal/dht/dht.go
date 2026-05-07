@@ -102,16 +102,23 @@ func NewStandardConfig() *Config {
 	}
 }
 
-// NewCrawlConfig returns a config in crawling mode.
+// NewCrawlConfig returns a config in crawling mode, tuned for maximum throughput.
 func NewCrawlConfig() *Config {
 	config := NewStandardConfig()
 	config.NodeExpriedAfter = 0
 	config.KBucketExpiredAfter = 0
-	config.CheckKBucketPeriod = time.Second * 5
+	config.CheckKBucketPeriod = time.Second // 每秒刷新（原 5s）
 	config.KBucketSize = math.MaxInt32
 	config.Mode = CrawlMode
-	config.RefreshNodeNum = 256
-
+	config.RefreshNodeNum = 2048           // 每次刷新联系的节点数（原 256）
+	config.MaxNodes = 50_000              // 路由表上限（原 5000）
+	config.PacketJobLimit = 65_536        // 数据包 channel 容量（原 1024）
+	config.PacketWorkerLimit = 512        // 包处理 goroutine 数（原 256）
+	// 更多 bootstrap 节点，加快初始入网
+	config.PrimeNodes = append(config.PrimeNodes,
+		"router.bitcomet.com:6881",
+		"dht.aelitis.com:6881",
+	)
 	return config
 }
 
@@ -129,6 +136,12 @@ type DHT struct {
 	packets            chan packet
 	packetPool         sync.Pool
 	stats              packetStats
+
+	// crawl 模式轻量级事务环形缓冲（无锁，1.28MB）。
+	// 存储 get_peers 出站请求的 info_hash，用于响应到达时还原原始 info_hash
+	// 并触发 OnGetPeersResponse 回调。索引为 16 位计数器取模。
+	crawlTxBuf [1 << 16][20]byte
+	crawlTxCtr atomic.Uint32
 }
 
 type packetStats struct {
@@ -207,6 +220,11 @@ func (dht *DHT) init() {
 	}
 
 	dht.conn = listener.(*net.UDPConn)
+
+	// 扩大内核 socket 缓冲区，减少高流量下的内核级丢包
+	dht.conn.SetReadBuffer(8 * 1024 * 1024)  // 8MB 接收缓冲
+	dht.conn.SetWriteBuffer(4 * 1024 * 1024) // 4MB 发送缓冲
+
 	dht.routingTable = newRoutingTable(dht.KBucketSize, dht)
 	dht.peersManager = newPeersManager(dht)
 	dht.tokenManager = newTokenManager(dht.TokenExpiredAfter, dht)
@@ -296,6 +314,15 @@ func (dht *DHT) id(target string) string {
 		return dht.node.id.RawString()
 	}
 	return target[:15] + dht.node.id.RawString()[15:]
+}
+
+// crawlGenTxID 生成 2 字节爬虫模式事务 ID（无锁，原子计数器）。
+// 相比 transactionManager.genTransID() 省去互斥锁开销，适合高频出站请求。
+// 返回的字符串可通过 crawlTxIdx() 还原为 crawlTxBuf 的索引。
+func (dht *DHT) crawlGenTxID() string {
+	ctr := dht.crawlTxCtr.Add(1)
+	idx := uint16(ctr)
+	return string([]byte{byte(idx >> 8), byte(idx)})
 }
 
 // GetPeers returns peers who have announced having infoHash.
