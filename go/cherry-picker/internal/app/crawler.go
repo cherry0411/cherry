@@ -15,7 +15,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -23,6 +22,7 @@ import (
 	"runtime"
 	"runtime/debug"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -527,7 +527,7 @@ func clampUint64(value, minValue, maxValue uint64) uint64 {
 // --- 事件提交 ---
 
 func (a *Application) submitInfohashEvent(events chan<- pipeline.Event, ihHex, ip string, port int, source string, stats *runtimeStats) {
-	key := fmt.Sprintf("%s|%s|%s|%d", ihHex, source, ip, port)
+	key := buildInfohashSourceKey(ihHex, source, ip, port)
 	// LRU.Set 返回 false = 已存在（已见过）
 	if !a.infohashSeen.Set(key) {
 		stats.infohashEventsDeduped.Add(1)
@@ -545,7 +545,7 @@ func (a *Application) submitInfohashEvent(events chan<- pipeline.Event, ihHex, i
 }
 
 func (a *Application) submitPeerEvent(events chan<- pipeline.Event, ihHex, ip string, port int, source string, stats *runtimeStats) {
-	key := fmt.Sprintf("%s|%s|%d", ihHex, ip, port)
+	key := buildInfohashPeerKey(ihHex, ip, port)
 	if !a.peerSeen.Set(key) {
 		stats.peerEventsDeduped.Add(1)
 		return
@@ -562,7 +562,7 @@ func (a *Application) submitPeerEvent(events chan<- pipeline.Event, ihHex, ip st
 }
 
 func (a *Application) queueMetadataRequest(downloader *dht.Wire, ihHex, ip string, port int, stats *runtimeStats, checkQueue chan<- string) {
-	requestKey := fmt.Sprintf("%s|%s|%d", ihHex, ip, port)
+	requestKey := buildInfohashPeerKey(ihHex, ip, port)
 	if !a.metadataRequestSeen.Set(requestKey) {
 		stats.metadataRequestsDeduped.Add(1)
 		// 累加 peer count（该 hash 再次被目击，但不重复下载）
@@ -618,7 +618,7 @@ func (a *Application) consumeMetadata(ctx context.Context, downloader *dht.Wire,
 			ok, fail = 0, 0
 		case response := <-responses:
 			ihHex := hex.EncodeToString(response.InfoHash)
-			responseKey := fmt.Sprintf("%s|%s|%d", ihHex, response.IP, response.Port)
+			responseKey := buildInfohashPeerKey(ihHex, response.IP, response.Port)
 			if !a.metadataResultSeen.Set(responseKey) {
 				stats.metadataEventsDeduped.Add(1)
 				fail++
@@ -729,7 +729,33 @@ func (a *Application) logRuntimeDelta(current, previous statsSnapshot) {
 	)
 }
 
+func buildInfohashSourceKey(ihHex, source, ip string, port int) string {
+	b := make([]byte, 0, len(ihHex)+len(source)+len(ip)+16)
+	b = append(b, ihHex...)
+	b = append(b, '|')
+	b = append(b, source...)
+	b = append(b, '|')
+	b = append(b, ip...)
+	b = append(b, '|')
+	b = strconv.AppendInt(b, int64(port), 10)
+	return string(b)
+}
+
+func buildInfohashPeerKey(ihHex, ip string, port int) string {
+	b := make([]byte, 0, len(ihHex)+len(ip)+14)
+	b = append(b, ihHex...)
+	b = append(b, '|')
+	b = append(b, ip...)
+	b = append(b, '|')
+	b = strconv.AppendInt(b, int64(port), 10)
+	return string(b)
+}
+
 func (a *Application) submitEvent(events chan<- pipeline.Event, event pipeline.Event, onDrop func(uint64) uint64, onSuccess func(uint64) uint64) {
+	if !a.shouldExportEvent(event) {
+		return
+	}
+
 	select {
 	case events <- event:
 		onSuccess(1)
@@ -746,6 +772,16 @@ func (a *Application) baseURL() string {
 		return url[:idx]
 	}
 	return url
+}
+
+func (a *Application) shouldExportEvent(event pipeline.Event) bool {
+	if a.cfg.Exporter.Kind != "http" {
+		return true
+	}
+	if !strings.Contains(a.cfg.Exporter.HTTPEndpoint, "/api/v1/torrents/batch") {
+		return true
+	}
+	return event.Type == pipeline.EventMetadataFetched && event.Metadata != nil
 }
 
 func (a *Application) checkWorkerCount() int {

@@ -89,8 +89,6 @@ func (be *BatchExporter) Run(ctx context.Context) error {
 		defer cancel()
 		if err := be.sink.WriteBatch(flushCtx, batch); err != nil {
 			be.logger.Printf("export batch failed: %v", err)
-			} else {
-				be.logger.Printf("export: %d events sent", len(batch))
 		}
 		batch = batch[:0]
 	}
@@ -215,7 +213,6 @@ func (s *httpSink) WriteBatch(ctx context.Context, batch []pipeline.Event) error
 				}
 				json.NewDecoder(response.Body).Decode(&result)
 				response.Body.Close()
-				log.Printf("api response: %d accepted, %d duplicates, %d errors", result.Accepted, result.Duplicates, result.Errors)
 				return nil
 			}
 			response.Body.Close()
