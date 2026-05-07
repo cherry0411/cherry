@@ -17,6 +17,7 @@ type node struct {
 	id             *bitmap
 	addr           *net.UDPAddr
 	lastActiveTime time.Time
+	compactInfo    string
 }
 
 // newNode returns a node pointer.
@@ -30,7 +31,13 @@ func newNode(id, network, address string) (*node, error) {
 		return nil, err
 	}
 
-	return &node{newBitmapFromString(id), addr, time.Now()}, nil
+	bm := newBitmapFromString(id)
+	return &node{
+		id:             bm,
+		addr:           addr,
+		lastActiveTime: time.Now(),
+		compactInfo:    id + compactIPPortInfo(addr.IP, addr.Port),
+	}, nil
 }
 
 // newNodeFromCompactInfo parses compactNodeInfo and returns a node pointer.
@@ -57,9 +64,7 @@ func (node *node) CompactIPPortInfo() string {
 // CompactNodeInfo returns "Compact node info".
 // See http://www.bittorrent.org/beps/bep_0005.html.
 func (node *node) CompactNodeInfo() string {
-	return strings.Join([]string{
-		node.id.RawString(), node.CompactIPPortInfo(),
-	}, "")
+	return node.compactInfo
 }
 
 // Peer represents a peer contact.
@@ -416,20 +421,26 @@ func (rt *routingTable) Insert(nd *node) bool {
 
 // GetNeighbors returns the size-length nodes closest to id.
 func (rt *routingTable) GetNeighbors(id *bitmap, size int) []*node {
-	rt.RLock()
-	nodes := make([]interface{}, 0, rt.cachedNodes.Len())
-	for item := range rt.cachedNodes.Iter() {
-		nodes = append(nodes, item.val.(*node))
+	nodes := rt.AllNodes()
+	if len(nodes) == 0 {
+		return nil
 	}
-	rt.RUnlock()
-
-	neighbors := getTopK(nodes, id, size)
-	result := make([]*node, len(neighbors))
-
-	for i, nd := range neighbors {
-		result[i] = nd.(*node)
+	if size <= 0 || size >= len(nodes) {
+		return nodes
 	}
-	return result
+	return getTopKNodes(nodes, id, size)
+}
+
+// AllNodes returns a snapshot of all cached nodes without additional sorting.
+func (rt *routingTable) AllNodes() []*node {
+	rt.cachedNodes.RLock()
+	defer rt.cachedNodes.RUnlock()
+
+	nodes := make([]*node, 0, len(rt.cachedNodes.data))
+	for _, val := range rt.cachedNodes.data {
+		nodes = append(nodes, val.(*node))
+	}
+	return nodes
 }
 
 // GetNeighborIds return the size-length compact node info closest to id.
@@ -438,7 +449,7 @@ func (rt *routingTable) GetNeighborCompactInfos(id *bitmap, size int) []string {
 	infos := make([]string, len(neighbors))
 
 	for i, no := range neighbors {
-		infos[i] = no.CompactNodeInfo()
+		infos[i] = no.compactInfo
 	}
 
 	return infos
@@ -540,8 +551,8 @@ func (rt *routingTable) Len() int {
 
 // Implementation of heap with heap.Interface.
 type heapItem struct {
-	distance *bitmap
-	value    interface{}
+	target *bitmap
+	value  *node
 }
 
 type topKHeap []*heapItem
@@ -551,7 +562,7 @@ func (kHeap topKHeap) Len() int {
 }
 
 func (kHeap topKHeap) Less(i, j int) bool {
-	return kHeap[i].distance.Compare(kHeap[j].distance, maxPrefixLength) == 1
+	return compareDistanceToTarget(kHeap[i].value.id, kHeap[j].value.id, kHeap[i].target) == 1
 }
 
 func (kHeap topKHeap) Swap(i, j int) {
@@ -569,38 +580,65 @@ func (kHeap *topKHeap) Pop() interface{} {
 	return x
 }
 
-// getTopK solves the top-k problem with heap. It's time complexity is
-// O(n*log(k)). When n is large, time complexity will be too high, need to be
-// optimized.
-func getTopK(queue []interface{}, id *bitmap, k int) []interface{} {
+// getTopKNodes solves the top-k problem with heap. It's time complexity is
+// O(n*log(k)).
+func getTopKNodes(queue []*node, id *bitmap, k int) []*node {
+	if k <= 0 || len(queue) == 0 {
+		return nil
+	}
+	if k >= len(queue) {
+		return queue
+	}
+
 	topkHeap := make(topKHeap, 0, k+1)
 
 	for _, value := range queue {
-		node := value.(*node)
-		distance := id.Xor(node.id)
 		if topkHeap.Len() == k {
 			var last = topkHeap[topkHeap.Len()-1]
-			if last.distance.Compare(distance, maxPrefixLength) == 1 {
+			if compareDistanceToTarget(last.value.id, value.id, id) == 1 {
 				item := &heapItem{
-					distance,
-					value,
+					target: id,
+					value:  value,
 				}
 				heap.Push(&topkHeap, item)
 				heap.Pop(&topkHeap)
 			}
 		} else {
 			item := &heapItem{
-				distance,
-				value,
+				target: id,
+				value:  value,
 			}
 			heap.Push(&topkHeap, item)
 		}
 	}
 
-	tops := make([]interface{}, topkHeap.Len())
+	tops := make([]*node, topkHeap.Len())
 	for i := len(tops) - 1; i >= 0; i-- {
 		tops[i] = heap.Pop(&topkHeap).(*heapItem).value
 	}
 
 	return tops
+}
+
+func compareDistanceToTarget(left, right, target *bitmap) int {
+	for i := 0; i < len(target.data); i++ {
+		leftDistance := left.data[i] ^ target.data[i]
+		rightDistance := right.data[i] ^ target.data[i]
+		if leftDistance > rightDistance {
+			return 1
+		}
+		if leftDistance < rightDistance {
+			return -1
+		}
+	}
+	return 0
+}
+
+func compactIPPortInfo(ip net.IP, port int) string {
+	ip4 := ip.To4()
+	if ip4 == nil {
+		return ""
+	}
+	buf := [6]byte{ip4[0], ip4[1], ip4[2], ip4[3], byte(port >> 8), byte(port)}
+	return string(buf[:])
 }

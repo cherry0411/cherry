@@ -91,6 +91,28 @@ type runtimeStats struct {
 	checkBatchesProcessed   atomic.Uint64
 }
 
+type statsSnapshot struct {
+	infohashEventsSent      uint64
+	infohashEventsDropped   uint64
+	infohashEventsDeduped   uint64
+	peerEventsSent          uint64
+	peerEventsDropped       uint64
+	peerEventsDeduped       uint64
+	metadataRequestsQueued  uint64
+	metadataRequestsDeduped uint64
+	checkBatchesQueued      uint64
+	checkBatchesDropped     uint64
+	checkBatchesProcessed   uint64
+	metadataEventsSent      uint64
+	metadataEventsDropped   uint64
+	metadataEventsDeduped   uint64
+	dhtPacketsReceived      uint64
+	dhtPacketsEnqueued      uint64
+	dhtPacketsDropped       uint64
+	dhtPacketsHandled       uint64
+	dhtPacketDecodeErrors   uint64
+}
+
 const (
 	checkBatchSize         = 512
 	checkFlushInterval     = 250 * time.Millisecond
@@ -626,41 +648,85 @@ func (a *Application) consumeMetadata(ctx context.Context, downloader *dht.Wire,
 func (a *Application) emitStats(ctx context.Context, events chan<- pipeline.Event, stats *runtimeStats, node *dht.DHT) {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
+	var previous statsSnapshot
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
 			packetStats := node.PacketStats()
+			current := statsSnapshot{
+				infohashEventsSent:      stats.infohashEventsSent.Load(),
+				infohashEventsDropped:   stats.infohashEventsDropped.Load(),
+				infohashEventsDeduped:   stats.infohashEventsDeduped.Load(),
+				peerEventsSent:          stats.peerEventsSent.Load(),
+				peerEventsDropped:       stats.peerEventsDropped.Load(),
+				peerEventsDeduped:       stats.peerEventsDeduped.Load(),
+				metadataRequestsQueued:  stats.metadataRequestsQueued.Load(),
+				metadataRequestsDeduped: stats.metadataRequestsDeduped.Load(),
+				checkBatchesQueued:      stats.checkBatchesQueued.Load(),
+				checkBatchesDropped:     stats.checkBatchesDropped.Load(),
+				checkBatchesProcessed:   stats.checkBatchesProcessed.Load(),
+				metadataEventsSent:      stats.metadataEventsSent.Load(),
+				metadataEventsDropped:   stats.metadataEventsDropped.Load(),
+				metadataEventsDeduped:   stats.metadataEventsDeduped.Load(),
+				dhtPacketsReceived:      packetStats.Received,
+				dhtPacketsEnqueued:      packetStats.Enqueued,
+				dhtPacketsDropped:       packetStats.Dropped,
+				dhtPacketsHandled:       packetStats.Handled,
+				dhtPacketDecodeErrors:   packetStats.DecodeErrors,
+			}
+			a.logRuntimeDelta(current, previous)
+			previous = current
 			a.submitEvent(events, pipeline.Event{
 				Type:       pipeline.EventWorkerStats,
 				Timestamp:  time.Now().UTC(),
 				InstanceID: a.cfg.InstanceID,
 				Source:     "runtime",
 				Stats: map[string]uint64{
-					"infohash_events_sent":      stats.infohashEventsSent.Load(),
-					"infohash_events_dropped":   stats.infohashEventsDropped.Load(),
-					"infohash_events_deduped":   stats.infohashEventsDeduped.Load(),
-					"peer_events_sent":          stats.peerEventsSent.Load(),
-					"peer_events_dropped":       stats.peerEventsDropped.Load(),
-					"peer_events_deduped":       stats.peerEventsDeduped.Load(),
-					"metadata_requests_queued":  stats.metadataRequestsQueued.Load(),
-					"metadata_requests_deduped": stats.metadataRequestsDeduped.Load(),
-					"check_batches_queued":      stats.checkBatchesQueued.Load(),
-					"check_batches_dropped":     stats.checkBatchesDropped.Load(),
-					"check_batches_processed":   stats.checkBatchesProcessed.Load(),
-					"metadata_events_sent":      stats.metadataEventsSent.Load(),
-					"metadata_events_dropped":   stats.metadataEventsDropped.Load(),
-					"metadata_events_deduped":   stats.metadataEventsDeduped.Load(),
-					"dht_packets_received":      packetStats.Received,
-					"dht_packets_enqueued":      packetStats.Enqueued,
-					"dht_packets_dropped":       packetStats.Dropped,
-					"dht_packets_handled":       packetStats.Handled,
-					"dht_packet_decode_errors":  packetStats.DecodeErrors,
+					"infohash_events_sent":      current.infohashEventsSent,
+					"infohash_events_dropped":   current.infohashEventsDropped,
+					"infohash_events_deduped":   current.infohashEventsDeduped,
+					"peer_events_sent":          current.peerEventsSent,
+					"peer_events_dropped":       current.peerEventsDropped,
+					"peer_events_deduped":       current.peerEventsDeduped,
+					"metadata_requests_queued":  current.metadataRequestsQueued,
+					"metadata_requests_deduped": current.metadataRequestsDeduped,
+					"check_batches_queued":      current.checkBatchesQueued,
+					"check_batches_dropped":     current.checkBatchesDropped,
+					"check_batches_processed":   current.checkBatchesProcessed,
+					"metadata_events_sent":      current.metadataEventsSent,
+					"metadata_events_dropped":   current.metadataEventsDropped,
+					"metadata_events_deduped":   current.metadataEventsDeduped,
+					"dht_packets_received":      current.dhtPacketsReceived,
+					"dht_packets_enqueued":      current.dhtPacketsEnqueued,
+					"dht_packets_dropped":       current.dhtPacketsDropped,
+					"dht_packets_handled":       current.dhtPacketsHandled,
+					"dht_packet_decode_errors":  current.dhtPacketDecodeErrors,
 				},
 			}, func(delta uint64) uint64 { return delta }, func(delta uint64) uint64 { return delta })
 		}
 	}
+}
+
+func (a *Application) logRuntimeDelta(current, previous statsSnapshot) {
+	a.logger.Printf(
+		"runtime 30s: dht_recv=%d handled=%d dropped=%d decode_err=%d peer_sent=%d peer_drop=%d peer_dedup=%d meta_req=%d meta_req_dedup=%d meta_sent=%d meta_drop=%d meta_dedup=%d check_drop=%d paused=%v",
+		current.dhtPacketsReceived-previous.dhtPacketsReceived,
+		current.dhtPacketsHandled-previous.dhtPacketsHandled,
+		current.dhtPacketsDropped-previous.dhtPacketsDropped,
+		current.dhtPacketDecodeErrors-previous.dhtPacketDecodeErrors,
+		current.peerEventsSent-previous.peerEventsSent,
+		current.peerEventsDropped-previous.peerEventsDropped,
+		current.peerEventsDeduped-previous.peerEventsDeduped,
+		current.metadataRequestsQueued-previous.metadataRequestsQueued,
+		current.metadataRequestsDeduped-previous.metadataRequestsDeduped,
+		current.metadataEventsSent-previous.metadataEventsSent,
+		current.metadataEventsDropped-previous.metadataEventsDropped,
+		current.metadataEventsDeduped-previous.metadataEventsDeduped,
+		current.checkBatchesDropped-previous.checkBatchesDropped,
+		a.metaPaused.Load(),
+	)
 }
 
 func (a *Application) submitEvent(events chan<- pipeline.Event, event pipeline.Event, onDrop func(uint64) uint64, onSuccess func(uint64) uint64) {

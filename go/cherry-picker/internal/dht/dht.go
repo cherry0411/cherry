@@ -343,8 +343,7 @@ func (dht *DHT) GetPeers(infoHash string) error {
 		infoHash = string(data)
 	}
 
-	neighbors := dht.routingTable.GetNeighbors(
-		newBitmapFromString(infoHash), dht.routingTable.Len())
+	neighbors := dht.routingTable.AllNodes()
 
 	for _, no := range neighbors {
 		dht.transactionManager.getPeers(no, infoHash)
