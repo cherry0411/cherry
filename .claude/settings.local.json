@@ -23,7 +23,17 @@
       "Bash(cmd /c \"where go\")",
       "Bash(cmd *)",
       "WebFetch(domain:github.com)",
-      "WebSearch"
+      "WebSearch",
+      "Read(//usr/local/go/bin/**)",
+      "Read(//c/Users/chase.ren/go/bin/**)",
+      "Read(//d//**)",
+      "Bash(\"/c/Program Files/Go/bin/go\" build ./...)",
+      "Bash(GOFLAGS=\"-mod=vendor\" \"/c/Program Files/Go/bin/go\" build ./...)",
+      "Bash(GONOSUMCHECK=\"*\" GOFLAGS=\"-mod=mod\" GOPROXY=\"off\" \"/c/Program Files/Go/bin/go\" build ./...)",
+      "Bash(GOPROXY=\"https://goproxy.cn,direct\" \"/c/Program Files/Go/bin/go\" build ./...)",
+      "Bash(GOPROXY=\"https://goproxy.cn,direct\" /c/Program Files/Go/bin/go vet *)",
+      "Bash(echo exit:$? *)",
+      "Bash(python *)"
     ]
   }
 }

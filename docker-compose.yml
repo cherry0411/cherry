@@ -10,19 +10,19 @@ x-crawler-base: &crawler-base
 
 x-crawler-env: &crawler-env
   CHERRY_PICKER_ROLE: combined
-  CHERRY_PICKER_EVENT_QUEUE: "4096"
+  CHERRY_PICKER_EVENT_QUEUE: "8192"
   CHERRY_PICKER_DEDUPE_PEER_TTL: "10m"
   CHERRY_PICKER_DEDUPE_METADATA_TTL: "30m"
   CHERRY_PICKER_DHT_MODE: crawl
   CHERRY_PICKER_EMIT_PEER_EVENTS: "true"
-  CHERRY_PICKER_DHT_PACKET_WORKERS: "64"
-  CHERRY_PICKER_DHT_PACKET_JOBS: "2048"
+  CHERRY_PICKER_DHT_PACKET_WORKERS: "8"
+  CHERRY_PICKER_DHT_PACKET_JOBS: "512"
   CHERRY_PICKER_DHT_MAX_NODES: "5000"
-  CHERRY_PICKER_DHT_REFRESH_NODES: "128"
+  CHERRY_PICKER_DHT_REFRESH_NODES: "64"
   CHERRY_PICKER_METADATA_ENABLED: "true"
   CHERRY_PICKER_METADATA_BLACKLIST: "65536"
-  CHERRY_PICKER_METADATA_REQUEST_QUEUE: "32768"
-  CHERRY_PICKER_METADATA_WORKERS: "256"
+  CHERRY_PICKER_METADATA_REQUEST_QUEUE: "65536"
+  CHERRY_PICKER_METADATA_WORKERS: "512"
   CHERRY_PICKER_EXPORTER: http
   CHERRY_PICKER_EXPORTER_URL: http://127.0.0.1:5070/api/v1/torrents/batch
   CHERRY_PICKER_EXPORTER_BATCH: "128"
@@ -94,69 +94,14 @@ services:
     <<: *crawler-base
     environment:
       <<: *crawler-env
-      CHERRY_PICKER_INSTANCE_ID: docker-crawler-1
-      CHERRY_PICKER_LISTEN_ADDR: ":20003"
-      CHERRY_PICKER_NODE_ID_FILE: /data/node_id
+      CHERRY_PICKER_INSTANCE_ID: docker-crawler
+      CHERRY_PICKER_LISTEN_ADDRS: ":20003,:20004,:20005,:20006,:20007,:20008,:20009,:20010,:20011,:20012,:20013,:20014,:20015,:20016,:20017,:20018,:20019,:20020,:20021,:20022"
+      CHERRY_PICKER_NODE_ID_DIR: /data/nodes
     volumes:
-      - crawler1-data:/data
-
-  crawler-2:
-    <<: *crawler-base
-    environment:
-      <<: *crawler-env
-      CHERRY_PICKER_INSTANCE_ID: docker-crawler-2
-      CHERRY_PICKER_LISTEN_ADDR: ":20004"
-      CHERRY_PICKER_NODE_ID_FILE: /data/node_id
-    volumes:
-      - crawler2-data:/data
-
-  crawler-3:
-    <<: *crawler-base
-    environment:
-      <<: *crawler-env
-      CHERRY_PICKER_INSTANCE_ID: docker-crawler-3
-      CHERRY_PICKER_LISTEN_ADDR: ":20005"
-      CHERRY_PICKER_NODE_ID_FILE: /data/node_id
-    volumes:
-      - crawler3-data:/data
-
-  crawler-4:
-    <<: *crawler-base
-    environment:
-      <<: *crawler-env
-      CHERRY_PICKER_INSTANCE_ID: docker-crawler-4
-      CHERRY_PICKER_LISTEN_ADDR: ":20006"
-      CHERRY_PICKER_NODE_ID_FILE: /data/node_id
-    volumes:
-      - crawler4-data:/data
-
-  crawler-5:
-    <<: *crawler-base
-    environment:
-      <<: *crawler-env
-      CHERRY_PICKER_INSTANCE_ID: docker-crawler-5
-      CHERRY_PICKER_LISTEN_ADDR: ":20007"
-      CHERRY_PICKER_NODE_ID_FILE: /data/node_id
-    volumes:
-      - crawler5-data:/data
-
-  crawler-6:
-    <<: *crawler-base
-    environment:
-      <<: *crawler-env
-      CHERRY_PICKER_INSTANCE_ID: docker-crawler-6
-      CHERRY_PICKER_LISTEN_ADDR: ":20008"
-      CHERRY_PICKER_NODE_ID_FILE: /data/node_id
-    volumes:
-      - crawler6-data:/data
+      - crawler-data:/data
 
 volumes:
   pgdata:
   apidata:
   meili_data:
-  crawler1-data:
-  crawler2-data:
-  crawler3-data:
-  crawler4-data:
-  crawler5-data:
-  crawler6-data:
+  crawler-data:

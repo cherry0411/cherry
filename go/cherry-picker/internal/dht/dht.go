@@ -8,6 +8,7 @@ import (
 	"math"
 	"net"
 	"os"
+	"path/filepath"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -244,8 +245,8 @@ func (dht *DHT) init() {
 
 func (dht *DHT) startPacketWorkers() {
 	workers := dht.PacketWorkerLimit
-	if dht.IsCrawlMode() {
-		// 爬虫模式：worker 数 = CPU 核数×2，避免 512 goroutine 的锁竞争
+	if dht.IsCrawlMode() && workers <= 0 {
+		// 爬虫模式默认值：CPU×2，未显式配置时才生效
 		workers = runtime.NumCPU() * 2
 		if workers < 8 {
 			workers = 8
@@ -344,6 +345,7 @@ func loadOrGenerateNodeID(path string) string {
 			}
 		}
 		id := randomString(20)
+		_ = os.MkdirAll(filepath.Dir(path), 0700)
 		_ = os.WriteFile(path, []byte(hex.EncodeToString([]byte(id))+"\n"), 0600)
 		return id
 	}

@@ -13,8 +13,9 @@ import (
 type Config struct {
 	Role       string
 	InstanceID string
-	ListenAddr string
-	EventQueue int
+	ListenAddr  string
+	ListenAddrs string
+	EventQueue  int
 	BrokerURL  string
 	Dedupe     DedupeConfig
 	Discovery  DiscoveryConfig
@@ -37,6 +38,7 @@ type DiscoveryConfig struct {
 	MaxNodes       int
 	RefreshNodes   int
 	NodeIDFile     string
+	NodeIDDir      string
 }
 
 type MetadataConfig struct {
@@ -74,7 +76,8 @@ func Load() (Config, error) {
 	cfg := Config{
 		Role:       strings.ToLower(getenvDefault("CHERRY_PICKER_ROLE", "combined")),
 		InstanceID: instanceID,
-		ListenAddr: getenvDefault("CHERRY_PICKER_LISTEN_ADDR", ":6881"),
+		ListenAddr:  getenvDefault("CHERRY_PICKER_LISTEN_ADDR", ":6881"),
+		ListenAddrs: getenvDefault("CHERRY_PICKER_LISTEN_ADDRS", ""),
 		EventQueue: getenvInt("CHERRY_PICKER_EVENT_QUEUE", defaultEventQueue()),
 		BrokerURL:  getenvDefault("CHERRY_PICKER_BROKER_URL", ""),
 		AutoTune:   getenvBool("CHERRY_PICKER_AUTO_TUNE", false),
@@ -91,6 +94,7 @@ func Load() (Config, error) {
 			MaxNodes:       getenvInt("CHERRY_PICKER_DHT_MAX_NODES", defaultMaxNodes()),
 			RefreshNodes:   getenvInt("CHERRY_PICKER_DHT_REFRESH_NODES", defaultRefreshNodes()),
 			NodeIDFile:     getenvDefault("CHERRY_PICKER_NODE_ID_FILE", ""),
+			NodeIDDir:      getenvDefault("CHERRY_PICKER_NODE_ID_DIR", ""),
 		},
 		Metadata: MetadataConfig{
 			Enabled:          getenvBool("CHERRY_PICKER_METADATA_ENABLED", true),
@@ -129,7 +133,8 @@ func loadFromFile(path string) (Config, error) {
 	cfg := Config{
 		Role:       strings.ToLower(strings.TrimSpace(raw.Role)),
 		InstanceID: strings.TrimSpace(raw.InstanceID),
-		ListenAddr: strings.TrimSpace(raw.ListenAddr),
+		ListenAddr:  strings.TrimSpace(raw.ListenAddr),
+		ListenAddrs: strings.TrimSpace(raw.ListenAddrs),
 		EventQueue: raw.EventQueue,
 		Dedupe: DedupeConfig{
 			PeerTTL:     parseDuration(raw.Dedupe.PeerTTL),
@@ -143,6 +148,7 @@ func loadFromFile(path string) (Config, error) {
 			MaxNodes:       intOrDefault(raw.Discovery.MaxNodes, 50000),
 			RefreshNodes:   intOrDefault(raw.Discovery.RefreshNodes, 2048),
 			NodeIDFile:     strings.TrimSpace(raw.Discovery.NodeIDFile),
+			NodeIDDir:      strings.TrimSpace(raw.Discovery.NodeIDDir),
 		},
 		Metadata: MetadataConfig{
 			Enabled:          raw.Metadata.Enabled,
@@ -251,7 +257,8 @@ func normalize(cfg Config) Config {
 type fileConfig struct {
 	Role       string              `json:"role"`
 	InstanceID string              `json:"instance_id"`
-	ListenAddr string              `json:"listen_addr"`
+	ListenAddr  string              `json:"listen_addr"`
+	ListenAddrs string              `json:"listen_addrs"`
 	EventQueue int                 `json:"event_queue"`
 	Dedupe     fileDedupeConfig    `json:"dedupe"`
 	Discovery  fileDiscoveryConfig `json:"discovery"`
@@ -272,6 +279,7 @@ type fileDiscoveryConfig struct {
 	MaxNodes       int    `json:"max_nodes"`
 	RefreshNodes   int    `json:"refresh_nodes"`
 	NodeIDFile     string `json:"node_id_file"`
+	NodeIDDir      string `json:"node_id_dir"`
 }
 
 type fileMetadataConfig struct {
