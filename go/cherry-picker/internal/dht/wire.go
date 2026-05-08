@@ -49,7 +49,7 @@ var handshakePrefix = []byte{
 
 // read 从 conn 读取 size 字节写入 data。
 func read(conn *net.TCPConn, size int, data *bytes.Buffer) error {
-	conn.SetReadDeadline(time.Now().Add(time.Second * 4))
+	conn.SetReadDeadline(time.Now().Add(3 * time.Second))
 
 	n, err := io.CopyN(data, conn, int64(size))
 	if err != nil || n != int64(size) {
@@ -270,7 +270,7 @@ func (wire *Wire) fetchMetadata(r Request, key string) {
 	infoHash := r.InfoHash
 	address := genAddress(r.IP, r.Port)
 
-	dial, err := net.DialTimeout("tcp", address, time.Second*4)
+	dial, err := net.DialTimeout("tcp", address, 1500*time.Millisecond)
 	if err != nil {
 		wire.blackList.insert(r.IP, r.Port)
 		return

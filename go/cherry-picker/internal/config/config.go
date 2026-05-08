@@ -144,8 +144,8 @@ func loadFromFile(path string) (Config, error) {
 		Metadata: MetadataConfig{
 			Enabled:          raw.Metadata.Enabled,
 			BlackListSize:    raw.Metadata.BlackListSize,
-			RequestQueueSize: raw.Metadata.RequestQueueSize,
-			WorkerQueueSize:  raw.Metadata.WorkerQueueSize,
+			RequestQueueSize: intOrDefault(raw.Metadata.RequestQueueSize, defaultMetadataRequestQueue()),
+			WorkerQueueSize:  intOrDefault(raw.Metadata.WorkerQueueSize, defaultMetadataWorkers()),
 		},
 		Exporter: ExporterConfig{
 			Kind:          strings.ToLower(strings.TrimSpace(raw.Exporter.Kind)),
@@ -361,12 +361,12 @@ func defaultRefreshNodes() int {
 }
 
 func defaultMetadataWorkers() int {
-	value := cpuScale() * 32
-	if value < 256 {
-		return 256
+	value := cpuScale() * 128
+	if value < 512 {
+		return 512
 	}
-	if value > 768 {
-		return 768
+	if value > 4096 {
+		return 4096
 	}
 	return value
 }
