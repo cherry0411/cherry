@@ -36,6 +36,7 @@ type DiscoveryConfig struct {
 	PacketJobs     int
 	MaxNodes       int
 	RefreshNodes   int
+	NodeIDFile     string
 }
 
 type MetadataConfig struct {
@@ -89,6 +90,7 @@ func Load() (Config, error) {
 			PacketJobs:     getenvInt("CHERRY_PICKER_DHT_PACKET_JOBS", defaultPacketJobs()),
 			MaxNodes:       getenvInt("CHERRY_PICKER_DHT_MAX_NODES", defaultMaxNodes()),
 			RefreshNodes:   getenvInt("CHERRY_PICKER_DHT_REFRESH_NODES", defaultRefreshNodes()),
+			NodeIDFile:     getenvDefault("CHERRY_PICKER_NODE_ID_FILE", ""),
 		},
 		Metadata: MetadataConfig{
 			Enabled:          getenvBool("CHERRY_PICKER_METADATA_ENABLED", true),
@@ -140,6 +142,7 @@ func loadFromFile(path string) (Config, error) {
 			PacketJobs:     intOrDefault(raw.Discovery.PacketJobs, 65536),
 			MaxNodes:       intOrDefault(raw.Discovery.MaxNodes, 50000),
 			RefreshNodes:   intOrDefault(raw.Discovery.RefreshNodes, 2048),
+			NodeIDFile:     strings.TrimSpace(raw.Discovery.NodeIDFile),
 		},
 		Metadata: MetadataConfig{
 			Enabled:          raw.Metadata.Enabled,
@@ -268,6 +271,7 @@ type fileDiscoveryConfig struct {
 	PacketJobs     int    `json:"packet_jobs"`
 	MaxNodes       int    `json:"max_nodes"`
 	RefreshNodes   int    `json:"refresh_nodes"`
+	NodeIDFile     string `json:"node_id_file"`
 }
 
 type fileMetadataConfig struct {

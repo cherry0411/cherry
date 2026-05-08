@@ -2,6 +2,7 @@ x-crawler-base: &crawler-base
   build: ./go/cherry-picker
   restart: unless-stopped
   depends_on: [api]
+  network_mode: host
   ulimits:
     nofile:
       soft: 65535
@@ -23,7 +24,7 @@ x-crawler-env: &crawler-env
   CHERRY_PICKER_METADATA_REQUEST_QUEUE: "32768"
   CHERRY_PICKER_METADATA_WORKERS: "256"
   CHERRY_PICKER_EXPORTER: http
-  CHERRY_PICKER_EXPORTER_URL: http://api:5070/api/v1/torrents/batch
+  CHERRY_PICKER_EXPORTER_URL: http://127.0.0.1:5070/api/v1/torrents/batch
   CHERRY_PICKER_EXPORTER_BATCH: "128"
   CHERRY_PICKER_EXPORTER_FLUSH: "5s"
   CHERRY_PICKER_EXPORTER_TIMEOUT: "60s"
@@ -95,7 +96,9 @@ services:
       <<: *crawler-env
       CHERRY_PICKER_INSTANCE_ID: docker-crawler-1
       CHERRY_PICKER_LISTEN_ADDR: ":20003"
-    ports: ["20003:20003/udp"]
+      CHERRY_PICKER_NODE_ID_FILE: /data/node_id
+    volumes:
+      - crawler1-data:/data
 
   crawler-2:
     <<: *crawler-base
@@ -103,7 +106,9 @@ services:
       <<: *crawler-env
       CHERRY_PICKER_INSTANCE_ID: docker-crawler-2
       CHERRY_PICKER_LISTEN_ADDR: ":20004"
-    ports: ["20004:20004/udp"]
+      CHERRY_PICKER_NODE_ID_FILE: /data/node_id
+    volumes:
+      - crawler2-data:/data
 
   crawler-3:
     <<: *crawler-base
@@ -111,7 +116,9 @@ services:
       <<: *crawler-env
       CHERRY_PICKER_INSTANCE_ID: docker-crawler-3
       CHERRY_PICKER_LISTEN_ADDR: ":20005"
-    ports: ["20005:20005/udp"]
+      CHERRY_PICKER_NODE_ID_FILE: /data/node_id
+    volumes:
+      - crawler3-data:/data
 
   crawler-4:
     <<: *crawler-base
@@ -119,7 +126,9 @@ services:
       <<: *crawler-env
       CHERRY_PICKER_INSTANCE_ID: docker-crawler-4
       CHERRY_PICKER_LISTEN_ADDR: ":20006"
-    ports: ["20006:20006/udp"]
+      CHERRY_PICKER_NODE_ID_FILE: /data/node_id
+    volumes:
+      - crawler4-data:/data
 
   crawler-5:
     <<: *crawler-base
@@ -127,7 +136,9 @@ services:
       <<: *crawler-env
       CHERRY_PICKER_INSTANCE_ID: docker-crawler-5
       CHERRY_PICKER_LISTEN_ADDR: ":20007"
-    ports: ["20007:20007/udp"]
+      CHERRY_PICKER_NODE_ID_FILE: /data/node_id
+    volumes:
+      - crawler5-data:/data
 
   crawler-6:
     <<: *crawler-base
@@ -135,9 +146,17 @@ services:
       <<: *crawler-env
       CHERRY_PICKER_INSTANCE_ID: docker-crawler-6
       CHERRY_PICKER_LISTEN_ADDR: ":20008"
-    ports: ["20008:20008/udp"]
+      CHERRY_PICKER_NODE_ID_FILE: /data/node_id
+    volumes:
+      - crawler6-data:/data
 
 volumes:
   pgdata:
   apidata:
   meili_data:
+  crawler1-data:
+  crawler2-data:
+  crawler3-data:
+  crawler4-data:
+  crawler5-data:
+  crawler6-data:

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"math"
 	"net"
+	"os"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -73,6 +74,9 @@ type Config struct {
 	PacketWorkerLimit int
 	// the nodes num to be fresh in a kbucket
 	RefreshNodeNum int
+	// NodeIDFile is the path to persist the node ID across restarts.
+	// If empty or the file doesn't exist, a new random ID is generated and saved.
+	NodeIDFile string
 }
 
 // NewStandardConfig returns a Config pointer with default values.
@@ -168,7 +172,7 @@ func New(config *Config) *DHT {
 		config = NewStandardConfig()
 	}
 
-	node, err := newNode(randomString(20), config.Network, config.Address)
+	node, err := newNode(loadOrGenerateNodeID(config.NodeIDFile), config.Network, config.Address)
 	if err != nil {
 		panic(err)
 	}
@@ -324,8 +328,29 @@ func (dht *DHT) id(target string) string {
 	return target[:15] + dht.node.id.RawString()[15:]
 }
 
+// loadOrGenerateNodeID loads a node ID from file, or generates a new random one
+// and saves it. This preserves DHT network identity across restarts.
+func loadOrGenerateNodeID(path string) string {
+	if path != "" {
+		if data, err := os.ReadFile(path); err == nil {
+			id := string(data)
+			for len(id) > 0 && (id[len(id)-1] == '\n' || id[len(id)-1] == '\r') {
+				id = id[:len(id)-1]
+			}
+			if len(id) == 40 {
+				if b, err := hex.DecodeString(id); err == nil && len(b) == 20 {
+					return string(b)
+				}
+			}
+		}
+		id := randomString(20)
+		_ = os.WriteFile(path, []byte(hex.EncodeToString([]byte(id))+"\n"), 0600)
+		return id
+	}
+	return randomString(20)
+}
+
 // crawlGenTxID 生成 2 字节爬虫模式事务 ID（无锁，原子计数器）。
-// 相比 transactionManager.genTransID() 省去互斥锁开销，适合高频出站请求。
 // 返回的字符串可通过 crawlTxIdx() 还原为 crawlTxBuf 的索引。
 func (dht *DHT) crawlGenTxID() string {
 	ctr := dht.crawlTxCtr.Add(1)

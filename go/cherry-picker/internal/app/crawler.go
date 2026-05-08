@@ -191,6 +191,7 @@ func (a *Application) Run(ctx context.Context) error {
 	dhtConfig.PacketJobLimit = a.cfg.Discovery.PacketJobs
 	dhtConfig.MaxNodes = a.cfg.Discovery.MaxNodes
 	dhtConfig.RefreshNodeNum = a.cfg.Discovery.RefreshNodes
+	dhtConfig.NodeIDFile = a.cfg.Discovery.NodeIDFile
 
 	dhtConfig.OnGetPeers = func(infoHash, ip string, port int) {
 		ihHex := hex.EncodeToString([]byte(infoHash))
