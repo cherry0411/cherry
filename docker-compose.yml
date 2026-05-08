@@ -121,6 +121,22 @@ services:
       CHERRY_PICKER_LISTEN_ADDR: ":20006"
     ports: ["20006:20006/udp"]
 
+  crawler-5:
+    <<: *crawler-base
+    environment:
+      <<: *crawler-env
+      CHERRY_PICKER_INSTANCE_ID: docker-crawler-5
+      CHERRY_PICKER_LISTEN_ADDR: ":20007"
+    ports: ["20007:20007/udp"]
+
+  crawler-6:
+    <<: *crawler-base
+    environment:
+      <<: *crawler-env
+      CHERRY_PICKER_INSTANCE_ID: docker-crawler-6
+      CHERRY_PICKER_LISTEN_ADDR: ":20008"
+    ports: ["20008:20008/udp"]
+
 volumes:
   pgdata:
   apidata:
