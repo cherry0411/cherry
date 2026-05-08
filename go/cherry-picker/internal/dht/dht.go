@@ -7,6 +7,7 @@ import (
 	"errors"
 	"math"
 	"net"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -239,6 +240,13 @@ func (dht *DHT) init() {
 
 func (dht *DHT) startPacketWorkers() {
 	workers := dht.PacketWorkerLimit
+	if dht.IsCrawlMode() {
+		// 爬虫模式：worker 数 = CPU 核数×2，避免 512 goroutine 的锁竞争
+		workers = runtime.NumCPU() * 2
+		if workers < 8 {
+			workers = 8
+		}
+	}
 	if workers <= 0 {
 		workers = 1
 	}
@@ -365,6 +373,10 @@ func (dht *DHT) Run() {
 	for {
 		select {
 		case <-tick:
+			// 爬虫模式：每 tick 刷新邻居缓存，供热路径 O(1) 读取
+			if dht.IsCrawlMode() {
+				dht.routingTable.refreshCachedNeighbors()
+			}
 			if dht.routingTable.Len() == 0 {
 				dht.join()
 			} else if dht.transactionManager.len() == 0 {

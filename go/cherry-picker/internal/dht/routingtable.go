@@ -6,6 +6,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -337,6 +338,10 @@ type routingTable struct {
 	cachedKBuckets *keyedDeque
 	dht            *DHT
 	clearQueue     *syncedList
+
+	// 爬虫模式预缓存：K 个邻居节点的 compact node info 拼接字符串，每秒刷新一次。
+	// 热路径直接原子读取，替代每请求 O(n×logK) 路由表扫描。
+	cachedNeighborNodes atomic.Pointer[string]
 }
 
 // newRoutingTable returns a new routingTable pointer.
@@ -453,6 +458,41 @@ func (rt *routingTable) GetNeighborCompactInfos(id *bitmap, size int) []string {
 	}
 
 	return infos
+}
+
+// refreshCachedNeighbors 随机取 K 个节点预计算 compact nodes 字符串，每秒调用一次。
+// 爬虫模式下不需要精确的最近邻，随机节点已足够保持在对方路由表中。
+func (rt *routingTable) refreshCachedNeighbors() {
+	rt.cachedNodes.RLock()
+	nodes := make([]*node, 0, rt.dht.K)
+	for _, val := range rt.cachedNodes.data {
+		if len(nodes) >= rt.dht.K {
+			break
+		}
+		nodes = append(nodes, val.(*node))
+	}
+	rt.cachedNodes.RUnlock()
+
+	if len(nodes) == 0 {
+		return
+	}
+
+	var b strings.Builder
+	b.Grow(len(nodes) * 26)
+	for _, n := range nodes {
+		b.WriteString(n.compactInfo)
+	}
+	s := b.String()
+	rt.cachedNeighborNodes.Store(&s)
+}
+
+// GetCachedNeighborNodes 返回预计算的 compact nodes 字符串（O(1) 原子读，无锁）。
+func (rt *routingTable) GetCachedNeighborNodes() string {
+	p := rt.cachedNeighborNodes.Load()
+	if p == nil {
+		return ""
+	}
+	return *p
 }
 
 // GetNodeKBucktById returns node whose id is `id` and the bucket it
