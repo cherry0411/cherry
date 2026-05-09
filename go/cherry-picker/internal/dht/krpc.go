@@ -133,8 +133,6 @@ func makeError(t string, errCode int, errMsg string) map[string]interface{} {
 
 // send sends data to the udp.
 func send(dht *DHT, addr *net.UDPAddr, data map[string]interface{}) error {
-	dht.conn.SetWriteDeadline(time.Now().Add(time.Second * 15))
-
 	_, err := dht.conn.WriteToUDP([]byte(Encode(data)), addr)
 	if err != nil {
 		dht.blackList.insert(addr.IP.String(), -1)
@@ -524,16 +522,19 @@ func handleRequest(dht *DHT, addr *net.UDPAddr,
 		}
 
 		var nodes string
-		targetID := newBitmapFromString(target)
-
-		no, _ := dht.routingTable.GetNodeKBucktByID(targetID)
-		if no != nil {
-			nodes = no.CompactNodeInfo()
+		if dht.IsCrawlMode() {
+			nodes = dht.routingTable.GetCachedNeighborNodes()
 		} else {
-			nodes = strings.Join(
-				dht.routingTable.GetNeighborCompactInfos(targetID, dht.K),
-				"",
-			)
+			targetID := newBitmapFromString(target)
+			no, _ := dht.routingTable.GetNodeKBucktByID(targetID)
+			if no != nil {
+				nodes = no.CompactNodeInfo()
+			} else {
+				nodes = strings.Join(
+					dht.routingTable.GetNeighborCompactInfos(targetID, dht.K),
+					"",
+				)
+			}
 		}
 
 		send(dht, addr, makeResponse(t, map[string]interface{}{
@@ -554,15 +555,10 @@ func handleRequest(dht *DHT, addr *net.UDPAddr,
 		}
 
 		if dht.IsCrawlMode() {
-			// 爬虫模式：
-			//   1. 返回真实邻居节点（而非空串），让对方把我们视为有价值的节点
-			//   2. 使用固定 token（crawlToken）避免 tokenManager 映射表无限增长
-			nodes := strings.Join(dht.routingTable.GetNeighborCompactInfos(
-				newBitmapFromString(infoHash), dht.K), "")
 			send(dht, addr, makeResponse(t, map[string]interface{}{
 				"id":    dht.id(infoHash),
 				"token": crawlToken,
-				"nodes": nodes,
+				"nodes": dht.routingTable.GetCachedNeighborNodes(),
 			}))
 		} else if peers := dht.peersManager.GetPeers(
 			infoHash, dht.K); len(peers) > 0 {

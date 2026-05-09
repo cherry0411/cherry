@@ -52,7 +52,7 @@ type lruCapConfig struct {
 type Application struct {
 	cfg    config.Config
 	logger *log.Logger
-	dht    *dht.DHT
+	dhts   []*dht.DHT
 
 	// 有界 LRU，替代无限增长的 seenSet / remoteKnown
 	infohashSeen        *cache.LRU // infohash 去重（peer 发现）
@@ -181,29 +181,19 @@ func (a *Application) Run(ctx context.Context) error {
 	go downloader.Run()
 	a.logger.Printf("metadata workers: %d, queue: %d", a.cfg.Metadata.WorkerQueueSize, a.cfg.Metadata.RequestQueueSize)
 
-	// DHT 配置
-	dhtConfig := dht.NewCrawlConfig()
-	if a.cfg.Discovery.Mode == "standard" {
-		dhtConfig = dht.NewStandardConfig()
-	}
-	dhtConfig.Address = a.cfg.ListenAddr
-	dhtConfig.PacketWorkerLimit = a.cfg.Discovery.PacketWorkers
-	dhtConfig.PacketJobLimit = a.cfg.Discovery.PacketJobs
-	dhtConfig.MaxNodes = a.cfg.Discovery.MaxNodes
-	dhtConfig.RefreshNodeNum = a.cfg.Discovery.RefreshNodes
-
-	dhtConfig.OnGetPeers = func(infoHash, ip string, port int) {
+	// 共享回调（所有 DHT 实例共用同一套 handler，共享下载器和 LRU）
+	onGetPeers := func(infoHash, ip string, port int) {
 		ihHex := hex.EncodeToString([]byte(infoHash))
 		a.submitInfohashEvent(events, ihHex, ip, port, "get_peers", stats)
 	}
-	dhtConfig.OnGetPeersResponse = func(infoHash string, peer *dht.Peer) {
+	onGetPeersResponse := func(infoHash string, peer *dht.Peer) {
 		ihHex := hex.EncodeToString([]byte(infoHash))
 		if a.cfg.Role != "metadata" {
 			a.submitPeerEvent(events, ihHex, peer.IP.String(), peer.Port, "get_peers_response", stats)
 		}
 		a.queueMetadataRequest(downloader, ihHex, peer.IP.String(), peer.Port, stats, checkQueue)
 	}
-	dhtConfig.OnAnnouncePeer = func(infoHash, ip string, port int) {
+	onAnnouncePeer := func(infoHash, ip string, port int) {
 		ihHex := hex.EncodeToString([]byte(infoHash))
 		if a.cfg.Role != "metadata" {
 			a.submitPeerEvent(events, ihHex, ip, port, "announce_peer", stats)
@@ -211,10 +201,29 @@ func (a *Application) Run(ctx context.Context) error {
 		a.queueMetadataRequest(downloader, ihHex, ip, port, stats, checkQueue)
 	}
 
-	a.dht = dht.New(dhtConfig)
+	addrs := a.listenAddrs()
+	a.dhts = make([]*dht.DHT, 0, len(addrs))
+	for i, addr := range addrs {
+		dhtCfg := dht.NewCrawlConfig()
+		if a.cfg.Discovery.Mode == "standard" {
+			dhtCfg = dht.NewStandardConfig()
+		}
+		dhtCfg.Address = addr
+		dhtCfg.PacketWorkerLimit = a.cfg.Discovery.PacketWorkers
+		dhtCfg.PacketJobLimit = a.cfg.Discovery.PacketJobs
+		dhtCfg.MaxNodes = a.cfg.Discovery.MaxNodes
+		dhtCfg.RefreshNodeNum = a.cfg.Discovery.RefreshNodes
+		dhtCfg.NodeIDFile = a.nodeIDPath(i)
+		dhtCfg.OnGetPeers = onGetPeers
+		dhtCfg.OnGetPeersResponse = onGetPeersResponse
+		dhtCfg.OnAnnouncePeer = onAnnouncePeer
+		d := dht.New(dhtCfg)
+		a.dhts = append(a.dhts, d)
+		go d.Run()
+	}
 
 	// 后台 goroutines
-	go a.emitStats(ctx, events, stats, a.dht)
+	go a.emitStats(ctx, events, stats)
 	go a.flushPeerCountsLoop(ctx)
 	go a.pollPendingRequests(ctx)
 	if a.cfg.AutoTune {
@@ -222,10 +231,9 @@ func (a *Application) Run(ctx context.Context) error {
 	}
 	debug.SetGCPercent(200)
 
-	go a.dht.Run()
-	a.logger.Printf("started: instance=%s udp=%s workers=%d nodes=%d",
-		a.cfg.InstanceID, a.cfg.ListenAddr,
-		a.cfg.Metadata.WorkerQueueSize, a.cfg.Discovery.MaxNodes)
+	a.logger.Printf("started: instance=%s listen=%v meta_workers=%d nodes_per_dht=%d dht_count=%d",
+		a.cfg.InstanceID, addrs,
+		a.cfg.Metadata.WorkerQueueSize, a.cfg.Discovery.MaxNodes, len(a.dhts))
 
 	<-ctx.Done()
 	a.logger.Printf("shutdown")
@@ -361,7 +369,9 @@ func (a *Application) pollPendingRequests(ctx context.Context) {
 			}
 			resp.Body.Close()
 			for _, h := range pending {
-				a.dht.GetPeers(h)
+				for _, d := range a.dhts {
+					_ = d.GetPeers(h)
+				}
 			}
 		}
 	}
@@ -613,7 +623,7 @@ func (a *Application) incPeerCount(ihHex string) {
 
 func (a *Application) consumeMetadata(ctx context.Context, downloader *dht.Wire, events chan<- pipeline.Event, stats *runtimeStats) {
 	responses := downloader.Response()
-	var ok, fail uint64
+	var ok, fail, okCache uint64
 	logTicker := time.NewTicker(30 * time.Second)
 	defer logTicker.Stop()
 
@@ -622,8 +632,8 @@ func (a *Application) consumeMetadata(ctx context.Context, downloader *dht.Wire,
 		case <-ctx.Done():
 			return
 		case <-logTicker.C:
-			a.logger.Printf("metadata download: ok=%d fail=%d (30s)", ok, fail)
-			ok, fail = 0, 0
+			a.logger.Printf("metadata download: ok=%d (cache=%d) fail=%d (30s)", ok, okCache, fail)
+			ok, fail, okCache = 0, 0, 0
 		case response := <-responses:
 			ihHex := hex.EncodeToString(response.InfoHash)
 			responseKey := buildInfohashPeerKey(ihHex, response.IP, response.Port)
@@ -639,6 +649,9 @@ func (a *Application) consumeMetadata(ctx context.Context, downloader *dht.Wire,
 				continue
 			}
 			ok++
+			if response.FromCache {
+				okCache++
+			}
 			a.submitEvent(events, pipeline.Event{
 				Type:       pipeline.EventMetadataFetched,
 				Timestamp:  time.Now().UTC(),
@@ -653,7 +666,7 @@ func (a *Application) consumeMetadata(ctx context.Context, downloader *dht.Wire,
 	}
 }
 
-func (a *Application) emitStats(ctx context.Context, events chan<- pipeline.Event, stats *runtimeStats, node *dht.DHT) {
+func (a *Application) emitStats(ctx context.Context, events chan<- pipeline.Event, stats *runtimeStats) {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 	var previous statsSnapshot
@@ -662,7 +675,7 @@ func (a *Application) emitStats(ctx context.Context, events chan<- pipeline.Even
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			packetStats := node.PacketStats()
+			packetStats := a.aggregatePacketStats()
 			current := statsSnapshot{
 				infohashEventsSent:      stats.infohashEventsSent.Load(),
 				infohashEventsDropped:   stats.infohashEventsDropped.Load(),
@@ -776,6 +789,45 @@ func (a *Application) submitEvent(events chan<- pipeline.Event, event pipeline.E
 }
 
 // --- 辅助函数 ---
+
+func (a *Application) listenAddrs() []string {
+	if a.cfg.ListenAddrs != "" {
+		parts := strings.Split(a.cfg.ListenAddrs, ",")
+		addrs := make([]string, 0, len(parts))
+		for _, p := range parts {
+			if p = strings.TrimSpace(p); p != "" {
+				addrs = append(addrs, p)
+			}
+		}
+		if len(addrs) > 0 {
+			return addrs
+		}
+	}
+	return []string{a.cfg.ListenAddr}
+}
+
+func (a *Application) nodeIDPath(idx int) string {
+	if a.cfg.Discovery.NodeIDDir != "" {
+		return filepath.Join(a.cfg.Discovery.NodeIDDir, "node_"+strconv.Itoa(idx))
+	}
+	if idx == 0 {
+		return a.cfg.Discovery.NodeIDFile
+	}
+	return ""
+}
+
+func (a *Application) aggregatePacketStats() dht.PacketStats {
+	var agg dht.PacketStats
+	for _, d := range a.dhts {
+		ps := d.PacketStats()
+		agg.Received += ps.Received
+		agg.Enqueued += ps.Enqueued
+		agg.Dropped += ps.Dropped
+		agg.Handled += ps.Handled
+		agg.DecodeErrors += ps.DecodeErrors
+	}
+	return agg
+}
 
 func (a *Application) baseURL() string {
 	url := a.cfg.Exporter.HTTPEndpoint
