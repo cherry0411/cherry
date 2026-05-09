@@ -1,3 +1,4 @@
+using System;
 using System.IO.Compression;
 using System.Security.Cryptography;
 using System.Text;
@@ -23,26 +24,36 @@ public class CuckooFilter : IDedupFilter, IDisposable
         if (persistPath != null) Load();
     }
 
-    public void Save()
-    {
-        if (_persistPath == null) return;
-        try
+        public void Save()
         {
-            var dir = Path.GetDirectoryName(_persistPath);
-            if (dir != null) Directory.CreateDirectory(dir);
-            var tmp = _persistPath + ".tmp";
-            using var fs = new FileStream(tmp, FileMode.Create, FileAccess.Write);
-            using var gz = new GZipStream(fs, CompressionLevel.Fastest);
-            using var bw = new BinaryWriter(gz);
-            bw.Write(_bucketCount);
-            bw.Write(Volatile.Read(ref _count));
-            var buf = new byte[_bucketCount * sizeof(ulong)];
-            Buffer.BlockCopy(_buckets, 0, buf, 0, buf.Length);
-            bw.Write(buf);
-            File.Move(tmp, _persistPath, overwrite: true);
+            if (_persistPath == null) return;
+            try
+            {
+                var dir = Path.GetDirectoryName(_persistPath);
+                if (dir != null) Directory.CreateDirectory(dir);
+                var tmp = _persistPath + ".tmp";
+                using (var fs = new FileStream(tmp, FileMode.Create, FileAccess.Write, FileShare.None))
+                using (var gz = new GZipStream(fs, CompressionLevel.Fastest))
+                using (var bw = new BinaryWriter(gz))
+                {
+                    bw.Write(_bucketCount);
+                    bw.Write(Volatile.Read(ref _count));
+                    var buf = new byte[_bucketCount * sizeof(ulong)];
+                    Buffer.BlockCopy(_buckets, 0, buf, 0, buf.Length);
+                    bw.Write(buf);
+                    bw.Flush();
+                    gz.Flush();
+                    fs.Flush(true);
+                }
+
+                // At this point all streams are disposed and the temp file handle released.
+                File.Move(tmp, _persistPath, overwrite: true);
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"CuckooFilter.Save failed: {ex}");
+            }
         }
-        catch { }
-    }
 
     private void Load()
     {
