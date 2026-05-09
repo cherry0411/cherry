@@ -623,7 +623,7 @@ func (a *Application) incPeerCount(ihHex string) {
 
 func (a *Application) consumeMetadata(ctx context.Context, downloader *dht.Wire, events chan<- pipeline.Event, stats *runtimeStats) {
 	responses := downloader.Response()
-	var ok, fail uint64
+	var ok, fail, okCache uint64
 	logTicker := time.NewTicker(30 * time.Second)
 	defer logTicker.Stop()
 
@@ -632,8 +632,8 @@ func (a *Application) consumeMetadata(ctx context.Context, downloader *dht.Wire,
 		case <-ctx.Done():
 			return
 		case <-logTicker.C:
-			a.logger.Printf("metadata download: ok=%d fail=%d (30s)", ok, fail)
-			ok, fail = 0, 0
+			a.logger.Printf("metadata download: ok=%d (cache=%d) fail=%d (30s)", ok, okCache, fail)
+			ok, fail, okCache = 0, 0, 0
 		case response := <-responses:
 			ihHex := hex.EncodeToString(response.InfoHash)
 			responseKey := buildInfohashPeerKey(ihHex, response.IP, response.Port)
@@ -649,6 +649,9 @@ func (a *Application) consumeMetadata(ctx context.Context, downloader *dht.Wire,
 				continue
 			}
 			ok++
+			if response.FromCache {
+				okCache++
+			}
 			a.submitEvent(events, pipeline.Event{
 				Type:       pipeline.EventMetadataFetched,
 				Timestamp:  time.Now().UTC(),

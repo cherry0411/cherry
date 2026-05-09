@@ -13,9 +13,11 @@ import (
 	"bytes"
 	"crypto/sha1"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"io"
 	"net"
+	"net/http"
 	"strings"
 	"time"
 
@@ -34,13 +36,21 @@ const (
 const (
 	// BLOCK 是 2^14，BitTorrent 标准块大小
 	BLOCK = 16384
-	// MaxMetadataSize 限制单个 metadata 最大尺寸（16 MB）
-	MaxMetadataSize = BLOCK * 1000
+	// MaxMetadataSize 限制单个 metadata 最大尺寸（1 MB）
+	MaxMetadataSize = BLOCK * 64
 	// EXTENDED 表示扩展消息类型
 	EXTENDED = 20
 	// HANDSHAKE 表示握手位
 	HANDSHAKE = 0
 )
+
+const (
+	httpCacheURL     = "https://itorrents.org/torrent/"
+	httpCacheTimeout = 2 * time.Second
+	httpCacheMaxBody = 2 * 1024 * 1024 // 2MB 上限，防止异常大响应
+)
+
+var httpCacheClient = &http.Client{Timeout: httpCacheTimeout}
 
 var handshakePrefix = []byte{
 	19, 66, 105, 116, 84, 111, 114, 114, 101, 110, 116, 32, 112, 114,
@@ -162,6 +172,7 @@ type Request struct {
 type Response struct {
 	Request
 	MetadataInfo []byte
+	FromCache    bool // true 表示通过 HTTP 缓存获取，false 表示 BEP-9 wire 协议
 }
 
 // Wire 表示 peer wire 协议下载器。
@@ -247,11 +258,73 @@ func (wire *Wire) requestPieces(
 	buffer = nil
 }
 
+// extractInfoBytes 从原始 .torrent 文件字节中提取 info dict 的原始 bencode 字节。
+// .torrent 文件的外层结构是 bencoded dict，info 键对应的值即为我们需要的部分。
+// 提取后的字节 SHA1 应等于 infohash。
+func extractInfoBytes(torrentData []byte) ([]byte, error) {
+	const sep = "4:info"
+	idx := bytes.Index(torrentData, []byte(sep))
+	if idx < 0 {
+		return nil, errors.New("info key not found")
+	}
+	start := idx + len(sep)
+	if start >= len(torrentData) || torrentData[start] != 'd' {
+		return nil, errors.New("info value is not a dict")
+	}
+	_, endIdx, err := DecodeDict(torrentData[start:], 0)
+	if err != nil {
+		return nil, err
+	}
+	return torrentData[start : start+endIdx], nil
+}
+
+// tryHTTPCache 尝试从 itorrents.org 缓存服务获取 .torrent 文件。
+// 成功则将解析结果发送到 responses channel 并返回 true，否则返回 false。
+func (wire *Wire) tryHTTPCache(r Request) bool {
+	url := httpCacheURL + strings.ToUpper(hex.EncodeToString(r.InfoHash)) + ".torrent"
+
+	resp, err := httpCacheClient.Get(url)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return false
+	}
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, httpCacheMaxBody))
+	if err != nil || len(body) < 20 {
+		return false
+	}
+
+	infoBytes, err := extractInfoBytes(body)
+	if err != nil {
+		return false
+	}
+
+	hash := sha1.Sum(infoBytes)
+	if !bytes.Equal(hash[:], r.InfoHash) {
+		return false
+	}
+
+	wire.responses <- Response{
+		Request:      r,
+		MetadataInfo: infoBytes,
+		FromCache:    true,
+	}
+	return true
+}
+
 // fetchMetadata 连接 peer，通过 extension protocol 下载 info dict。
 // 完成后（成功或失败）都会从 queue 中删除 key，避免泄漏。
 func (wire *Wire) fetchMetadata(r Request, key string) {
 	// 请求完成后释放 inflight 去重键，允许同一 peer 在后续重新尝试。
 	defer wire.queue.Delete(key)
+
+	// 先尝试 HTTP 缓存（通常 <500ms），成功则跳过 BEP-9 wire 协议
+	if wire.tryHTTPCache(r) {
+		return
+	}
 
 	var (
 		length       int
