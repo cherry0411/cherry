@@ -42,19 +42,18 @@ public class TorrentRepository : ITorrentRepository
         // Step 1: COPY all candidates into temp table
         await CopyToTempAsync(unique, conn, tableName, ct);
 
-        // Step 2: INSERT ... ON CONFLICT DO NOTHING RETURNING id, info_hash
-        var hashToId = await InsertFromTempAsync(conn, tableName, ct);
+        // Step 2: INSERT ... ON CONFLICT DO NOTHING RETURNING info_hash
+        var insertedHashes = await InsertFromTempAsync(conn, tableName, ct);
 
         // Step 3: Build file list for successfully inserted torrents
         var files = new List<TorrentFile>();
         foreach (var t in unique)
         {
-            if (hashToId.TryGetValue(t.InfoHash, out var id))
+            if (insertedHashes.Contains(t.InfoHash))
             {
-                t.Id = id;
                 foreach (var f in t.Files)
                 {
-                    f.TorrentId = id;
+                    f.InfoHash = t.InfoHash;
                     files.Add(f);
                 }
             }
@@ -65,7 +64,7 @@ public class TorrentRepository : ITorrentRepository
 
         await DropTempTableAsync(conn, tableName, ct);
 
-        return hashToId.Count;
+        return insertedHashes.Count;
     }
 
     private static async Task DropTempTableAsync(NpgsqlConnection conn, string tableName, CancellationToken ct)
@@ -112,7 +111,7 @@ public class TorrentRepository : ITorrentRepository
         await writer.CompleteAsync(ct);
     }
 
-    private static async Task<Dictionary<string, long>> InsertFromTempAsync(NpgsqlConnection conn, string tableName, CancellationToken ct)
+    private static async Task<HashSet<string>> InsertFromTempAsync(NpgsqlConnection conn, string tableName, CancellationToken ct)
     {
         await using var cmd = new NpgsqlCommand(
             $"""
@@ -120,14 +119,14 @@ public class TorrentRepository : ITorrentRepository
             SELECT info_hash, name, piece_length, total_length, file_count, is_private, source
             FROM {tableName}
             ON CONFLICT (info_hash) DO NOTHING
-            RETURNING id, info_hash
+            RETURNING info_hash
             """, conn);
 
-        var result = new Dictionary<string, long>();
+        var result = new HashSet<string>();
         await using var reader = await cmd.ExecuteReaderAsync(ct);
         while (await reader.ReadAsync(ct))
         {
-            result[reader.GetString(1)] = reader.GetInt64(0);
+            result.Add(reader.GetString(0));
         }
         return result;
     }
@@ -135,13 +134,13 @@ public class TorrentRepository : ITorrentRepository
     private static async Task CopyFilesAsync(List<TorrentFile> files, NpgsqlConnection conn, CancellationToken ct)
     {
         await using var writer = await conn.BeginBinaryImportAsync(
-            "COPY torrent_files (torrent_id, path_text, length) FROM STDIN (FORMAT BINARY)",
+            "COPY torrent_files (info_hash, path_text, length) FROM STDIN (FORMAT BINARY)",
             ct);
 
         foreach (var f in files)
         {
             await writer.StartRowAsync(ct);
-            await writer.WriteAsync(f.TorrentId, ct);
+            await writer.WriteAsync(f.InfoHash, ct);
             await writer.WriteAsync(f.PathText, ct);
             await writer.WriteAsync(f.Length, ct);
         }
@@ -151,10 +150,17 @@ public class TorrentRepository : ITorrentRepository
 
     public async Task<Torrent?> GetByInfoHashAsync(string infoHash, CancellationToken ct = default)
     {
-        return await _db.Torrents
-            .Include(t => t.Files)
+        var torrent = await _db.Torrents
             .AsNoTracking()
             .FirstOrDefaultAsync(t => t.InfoHash == infoHash, ct);
+
+        if (torrent != null)
+            torrent.Files = await _db.TorrentFiles
+                .AsNoTracking()
+                .Where(f => f.InfoHash == infoHash)
+                .ToListAsync(ct);
+
+        return torrent;
     }
 
     public async Task<(List<Torrent> Items, long Total)> SearchAsync(
@@ -189,7 +195,8 @@ public class TorrentRepository : ITorrentRepository
         if (!string.IsNullOrWhiteSpace(fileType))
         {
             var pattern = $".{fileType}";
-            baseQuery = baseQuery.Where(t => t.Files.Any(f => f.PathText.EndsWith(pattern)));
+            baseQuery = baseQuery.Where(t => _db.TorrentFiles
+                .Any(f => f.InfoHash == t.InfoHash && f.PathText.EndsWith(pattern)));
         }
 
         var total = await baseQuery.LongCountAsync(ct);

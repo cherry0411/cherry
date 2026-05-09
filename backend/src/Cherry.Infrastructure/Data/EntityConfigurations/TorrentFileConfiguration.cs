@@ -10,12 +10,13 @@ public class TorrentFileConfiguration : IEntityTypeConfiguration<TorrentFile>
     {
         builder.ToTable("torrent_files");
 
-        builder.HasKey(x => new { x.Id, x.TorrentId });
+        builder.HasNoKey();
 
-        builder.Property(x => x.Id).HasColumnName("id").UseIdentityAlwaysColumn();
-        builder.Property(x => x.TorrentId).HasColumnName("torrent_id").IsRequired();
+        builder.Property(x => x.InfoHash).HasColumnName("info_hash").HasMaxLength(40).IsRequired();
         builder.Property(x => x.PathText).HasColumnName("path_text").HasColumnType("text").IsRequired();
         builder.Property(x => x.Length).HasColumnName("length").IsRequired();
+
+        builder.HasIndex(x => x.InfoHash).HasDatabaseName("idx_torrent_files_info_hash");
 
         builder.HasIndex(x => x.PathText)
             .HasDatabaseName("idx_torrent_files_path")

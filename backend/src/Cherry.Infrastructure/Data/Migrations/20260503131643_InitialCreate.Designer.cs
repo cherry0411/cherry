@@ -27,13 +27,6 @@ namespace Cherry.Infrastructure.Data.Migrations
 
             modelBuilder.Entity("Cherry.Domain.Entities.Torrent", b =>
                 {
-                    b.Property<long>("Id")
-                        .ValueGeneratedOnAdd()
-                        .HasColumnType("bigint")
-                        .HasColumnName("id");
-
-                    NpgsqlPropertyBuilderExtensions.UseIdentityAlwaysColumn(b.Property<long>("Id"));
-
                     b.Property<DateTime>("CreatedAt")
                         .ValueGeneratedOnAdd()
                         .HasColumnType("timestamp with time zone")
@@ -59,6 +52,16 @@ namespace Cherry.Infrastructure.Data.Migrations
                         .HasColumnType("text")
                         .HasColumnName("name");
 
+                    b.Property<int>("PeerCount")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("integer")
+                        .HasColumnName("peer_count")
+                        .HasDefaultValue(0);
+
+                    b.Property<DateTime>("PeerUpdatedAt")
+                        .HasColumnType("timestamp with time zone")
+                        .HasColumnName("peer_updated_at");
+
                     b.Property<int>("PieceLength")
                         .HasColumnType("integer")
                         .HasColumnName("piece_length");
@@ -78,14 +81,10 @@ namespace Cherry.Infrastructure.Data.Migrations
                         .HasColumnName("updated_at")
                         .HasDefaultValueSql("NOW()");
 
-                    b.HasKey("Id");
+                    b.HasKey("InfoHash");
 
                     b.HasIndex("CreatedAt")
                         .HasDatabaseName("idx_torrents_created");
-
-                    b.HasIndex("InfoHash")
-                        .IsUnique()
-                        .HasDatabaseName("uq_torrents_info_hash");
 
                     b.HasIndex("Name")
                         .HasDatabaseName("idx_torrents_name_trgm");
@@ -93,21 +92,18 @@ namespace Cherry.Infrastructure.Data.Migrations
                     NpgsqlIndexBuilderExtensions.HasMethod(b.HasIndex("Name"), "GIN");
                     NpgsqlIndexBuilderExtensions.HasOperators(b.HasIndex("Name"), new[] { "gin_trgm_ops" });
 
+                    b.HasIndex("PeerCount")
+                        .HasDatabaseName("idx_torrents_peer_count");
+
                     b.ToTable("torrents", (string)null);
                 });
 
             modelBuilder.Entity("Cherry.Domain.Entities.TorrentFile", b =>
                 {
-                    b.Property<long>("Id")
-                        .ValueGeneratedOnAdd()
-                        .HasColumnType("bigint")
-                        .HasColumnName("id");
-
-                    NpgsqlPropertyBuilderExtensions.UseIdentityAlwaysColumn(b.Property<long>("Id"));
-
-                    b.Property<long>("TorrentId")
-                        .HasColumnType("bigint")
-                        .HasColumnName("torrent_id");
+                    b.Property<string>("InfoHash")
+                        .HasMaxLength(40)
+                        .HasColumnType("character varying(40)")
+                        .HasColumnName("info_hash");
 
                     b.Property<long>("Length")
                         .HasColumnType("bigint")
@@ -118,7 +114,10 @@ namespace Cherry.Infrastructure.Data.Migrations
                         .HasColumnType("text")
                         .HasColumnName("path_text");
 
-                    b.HasKey("Id", "TorrentId");
+                    b.HasNoKey();
+
+                    b.HasIndex("InfoHash")
+                        .HasDatabaseName("idx_torrent_files_info_hash");
 
                     b.HasIndex("PathText")
                         .HasDatabaseName("idx_torrent_files_path");
@@ -126,20 +125,45 @@ namespace Cherry.Infrastructure.Data.Migrations
                     NpgsqlIndexBuilderExtensions.HasMethod(b.HasIndex("PathText"), "GIN");
                     NpgsqlIndexBuilderExtensions.HasOperators(b.HasIndex("PathText"), new[] { "gin_trgm_ops" });
 
-                    b.HasIndex("TorrentId");
-
                     b.ToTable("torrent_files", (string)null);
                 });
 
-            modelBuilder.Entity("Cherry.Domain.Entities.TorrentFile", b =>
+            modelBuilder.Entity("Cherry.Domain.Entities.TorrentRequest", b =>
                 {
-                    b.HasOne("Cherry.Domain.Entities.Torrent", "Torrent")
-                        .WithMany("Files")
-                        .HasForeignKey("TorrentId")
-                        .OnDelete(DeleteBehavior.Cascade)
-                        .IsRequired();
+                    b.Property<long>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("bigint")
+                        .HasColumnName("id");
 
-                    b.Navigation("Torrent");
+                    NpgsqlPropertyBuilderExtensions.UseIdentityAlwaysColumn(b.Property<long>("Id"));
+
+                    b.Property<DateTime>("CreatedAt")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("timestamp with time zone")
+                        .HasColumnName("created_at")
+                        .HasDefaultValueSql("NOW()");
+
+                    b.Property<string>("InfoHash")
+                        .IsRequired()
+                        .HasMaxLength(40)
+                        .HasColumnType("character varying(40)")
+                        .HasColumnName("info_hash");
+
+                    b.Property<string>("Status")
+                        .IsRequired()
+                        .HasMaxLength(16)
+                        .HasColumnType("character varying(16)")
+                        .HasColumnName("status");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("InfoHash")
+                        .HasDatabaseName("idx_torrent_requests_hash");
+
+                    b.HasIndex("Status")
+                        .HasDatabaseName("idx_torrent_requests_status");
+
+                    b.ToTable("torrent_requests", (string)null);
                 });
 
             modelBuilder.Entity("Cherry.Domain.Entities.Torrent", b =>

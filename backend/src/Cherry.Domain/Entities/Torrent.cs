@@ -2,7 +2,6 @@ namespace Cherry.Domain.Entities;
 
 public class Torrent
 {
-    public long Id { get; set; }
     public string InfoHash { get; set; } = string.Empty;
     public string Name { get; set; } = string.Empty;
     public int PieceLength { get; set; }

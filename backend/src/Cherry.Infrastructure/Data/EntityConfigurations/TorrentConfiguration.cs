@@ -10,9 +10,8 @@ public class TorrentConfiguration : IEntityTypeConfiguration<Torrent>
     {
         builder.ToTable("torrents");
 
-        builder.HasKey(x => x.Id);
+        builder.HasKey(x => x.InfoHash);
 
-        builder.Property(x => x.Id).HasColumnName("id").UseIdentityAlwaysColumn();
         builder.Property(x => x.InfoHash).HasColumnName("info_hash").HasMaxLength(40).IsRequired();
         builder.Property(x => x.Name).HasColumnName("name").HasColumnType("text").IsRequired();
         builder.Property(x => x.PieceLength).HasColumnName("piece_length").IsRequired();
@@ -25,7 +24,6 @@ public class TorrentConfiguration : IEntityTypeConfiguration<Torrent>
         builder.Property(x => x.CreatedAt).HasColumnName("created_at").HasDefaultValueSql("NOW()");
         builder.Property(x => x.UpdatedAt).HasColumnName("updated_at").HasDefaultValueSql("NOW()");
 
-        builder.HasIndex(x => x.InfoHash).IsUnique().HasDatabaseName("uq_torrents_info_hash");
         builder.HasIndex(x => x.CreatedAt).HasDatabaseName("idx_torrents_created");
         builder.HasIndex(x => x.PeerCount).HasDatabaseName("idx_torrents_peer_count");
         builder.HasIndex(x => x.Name)
@@ -33,9 +31,6 @@ public class TorrentConfiguration : IEntityTypeConfiguration<Torrent>
             .HasMethod("GIN")
             .HasOperators("gin_trgm_ops");
 
-        builder.HasMany(x => x.Files)
-            .WithOne(f => f.Torrent)
-            .HasForeignKey(f => f.TorrentId)
-            .OnDelete(DeleteBehavior.Cascade);
+        builder.Ignore(x => x.Files);
     }
 }
