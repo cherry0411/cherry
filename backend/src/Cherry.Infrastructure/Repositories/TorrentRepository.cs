@@ -65,6 +65,13 @@ public class TorrentRepository : ITorrentRepository
 
         await DropTempTableAsync(conn, tableName, ct);
 
+        if (_meili != null && hashToId.Count > 0)
+        {
+            var indexDocs = unique.Where(t => hashToId.ContainsKey(t.InfoHash)).ToList();
+            // Fire-and-forget: don't block the DB batch loop on meili latency
+            _ = _meili.IndexDocumentsAsync(indexDocs, CancellationToken.None);
+        }
+
         return hashToId.Count;
     }
 
@@ -268,5 +275,21 @@ public class TorrentRepository : ITorrentRepository
     {
         var today = DateTime.UtcNow.Date;
         return await _db.Torrents.LongCountAsync(t => t.CreatedAt >= today, ct);
+    }
+
+    public async Task MarkRequestsDoneAsync(IEnumerable<string> infoHashes, CancellationToken ct = default)
+    {
+        var arr = infoHashes.ToArray();
+        if (arr.Length == 0) return;
+
+        var conn = (NpgsqlConnection)_db.Database.GetDbConnection();
+        if (conn.State != System.Data.ConnectionState.Open)
+            await conn.OpenAsync(ct);
+
+        await using var cmd = new NpgsqlCommand(
+            "UPDATE torrent_requests SET status = 'done' WHERE status = 'pending' AND info_hash = ANY(@hashes)",
+            conn);
+        cmd.Parameters.AddWithValue("hashes", arr);
+        await cmd.ExecuteNonQueryAsync(ct);
     }
 }

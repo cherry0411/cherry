@@ -33,7 +33,8 @@
       "Bash(GOPROXY=\"https://goproxy.cn,direct\" \"/c/Program Files/Go/bin/go\" build ./...)",
       "Bash(GOPROXY=\"https://goproxy.cn,direct\" /c/Program Files/Go/bin/go vet *)",
       "Bash(echo exit:$? *)",
-      "Bash(python *)"
+      "Bash(python *)",
+      "Bash(DOTNET_NUGET_SIGNATURE_VERIFICATION=false dotnet build -v quiet --source https://api.nuget.org/v3/index.json)"
     ]
   }
 }

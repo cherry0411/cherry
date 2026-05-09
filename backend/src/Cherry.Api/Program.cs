@@ -38,6 +38,7 @@ if (!string.IsNullOrWhiteSpace(meiliUrl))
 var dedupPath = Path.Combine(builder.Environment.ContentRootPath, "data", "cuckoo.dat");
 var dedup = new CuckooFilter(capacity: 100_000_000, persistPath: dedupPath);
 builder.Services.AddSingleton<IDedupFilter>(dedup);
+builder.Services.AddSingleton<Cherry.Application.Services.PendingRequestTracker>();
 builder.Services.AddScoped<ITorrentRepository, TorrentRepository>();
 builder.Services.AddScoped<SearchService>();
 builder.Services.AddScoped<StatsService>();
@@ -96,6 +97,19 @@ if (!string.IsNullOrWhiteSpace(meiliUrl))
         if (meiliInit != null) await meiliInit.EnsureIndexAsync(CancellationToken.None);
     }
     catch { }
+}
+
+// Seed PendingRequestTracker with existing pending requests from DB
+{
+    await using var trackerScope = app.Services.CreateAsyncScope();
+    var db = trackerScope.ServiceProvider.GetRequiredService<AppDbContext>();
+    var tracker = app.Services.GetRequiredService<Cherry.Application.Services.PendingRequestTracker>();
+    var pendingHashes = await db.TorrentRequests
+        .Where(r => r.Status == "pending")
+        .Select(r => r.InfoHash)
+        .ToListAsync();
+    if (pendingHashes.Count > 0)
+        tracker.TrackMany(pendingHashes);
 }
 
 // CORS — allow independent frontend deployment

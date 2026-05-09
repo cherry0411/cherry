@@ -14,4 +14,5 @@ public interface ITorrentRepository
     Task DecayPeerCountsAsync(CancellationToken ct = default);
     Task<long> GetTotalCountAsync(CancellationToken ct = default);
     Task<long> GetTodayCountAsync(CancellationToken ct = default);
+    Task MarkRequestsDoneAsync(IEnumerable<string> infoHashes, CancellationToken ct = default);
 }

@@ -284,13 +284,14 @@ public static class TorrentEndpoints
     private static async Task<IResult> RequestTorrentAsync(
         TorrentRequestDto dto,
         AppDbContext db,
+        PendingRequestTracker tracker,
         CancellationToken ct)
     {
         var hash = dto.InfoHash.ToLowerInvariant().Trim();
         if (hash.Length != 40 || !hash.All(c => c is >= 'a' and <= 'f' or >= '0' and <= '9'))
             return Results.BadRequest("Invalid info_hash");
 
-        if (await db.TorrentRequests.AnyAsync(r => r.InfoHash == hash, cancellationToken: ct))
+        if (await db.TorrentRequests.AnyAsync(r => r.InfoHash == hash && r.Status == "pending", ct))
             return Results.Ok(new { status = "already_pending" });
 
         if (await db.Torrents.AnyAsync(t => t.InfoHash == hash, ct))
@@ -298,6 +299,7 @@ public static class TorrentEndpoints
 
         db.TorrentRequests.Add(new TorrentRequest { InfoHash = hash });
         await db.SaveChangesAsync(ct);
+        tracker.Track(hash);
         return Results.Ok(new { status = "queued" });
     }
 
