@@ -64,14 +64,14 @@ public class TorrentRepository : ITorrentRepository
 
         await DropTempTableAsync(conn, tableName, ct);
 
-        if (_meili != null && hashToId.Count > 0)
+        if (_meili != null && insertedHashes.Count > 0)
         {
-            var indexDocs = unique.Where(t => hashToId.ContainsKey(t.InfoHash)).ToList();
+            var indexDocs = unique.Where(t => insertedHashes.Contains(t.InfoHash)).ToList();
             // Fire-and-forget: don't block the DB batch loop on meili latency
             _ = _meili.IndexDocumentsAsync(indexDocs, CancellationToken.None);
         }
 
-        return hashToId.Count;
+        return insertedHashes.Count;
     }
 
     private static async Task DropTempTableAsync(NpgsqlConnection conn, string tableName, CancellationToken ct)
