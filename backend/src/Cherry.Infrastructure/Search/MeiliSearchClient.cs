@@ -24,7 +24,7 @@ public class MeiliSearchClient
             searchableAttributes = new[] { "name" },
             sortableAttributes = new[] { "createdAt", "fileCount", "peerCount", "totalLength" },
             filterableAttributes = new[] { "fileCount", "totalLength", "isPrivate", "peerCount" },
-            rankingRules = new[] { "words", "typo", "proximity", "attribute", "sort", "exactness" },
+            rankingRules = new[] { "sort", "createdAt:desc", "words", "exactness" },
             typoTolerance = new
             {
                 minWordSizeForTypos = new { oneTypo = 5, twoTypos = 8 },
