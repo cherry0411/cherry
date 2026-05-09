@@ -71,14 +71,17 @@ public class IngestService : IHostedService
 
     public Task StartAsync(CancellationToken cancellationToken)
     {
+        // Run two concurrent batch-processing workers to keep up under burst load.
+        _ = ProcessLoop(_cts.Token);
         _ = ProcessLoop(_cts.Token);
         return Task.CompletedTask;
     }
 
     public Task StopAsync(CancellationToken cancellationToken)
     {
-        _cts.Cancel();
+        // Signal the ProcessLoop to drain remaining items, then stop.
         _channel.Writer.Complete();
+        _cts.CancelAfter(TimeSpan.FromSeconds(15)); // hard-stop after 15 s if drain stalls
         return Task.CompletedTask;
     }
 

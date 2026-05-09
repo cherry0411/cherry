@@ -4,18 +4,21 @@ using Cherry.Infrastructure.Data;
 using Cherry.Infrastructure.Search;
 using Microsoft.EntityFrameworkCore;
 using Npgsql;
+using NpgsqlTypes;
 
 namespace Cherry.Infrastructure.Repositories;
 
 public class TorrentRepository : ITorrentRepository
 {
     private readonly AppDbContext _db;
-    private readonly MeiliSearchClient? _meili;
+    private readonly MeiliIndexQueue? _meiliQueue;
+    private readonly MeiliSearchClient? _meiliClient;
 
-    public TorrentRepository(AppDbContext db, MeiliSearchClient? meili = null)
+    public TorrentRepository(AppDbContext db, MeiliIndexQueue? meiliQueue = null, MeiliSearchClient? meiliClient = null)
     {
         _db = db;
-        _meili = meili;
+        _meiliQueue = meiliQueue;
+        _meiliClient = meiliClient;
     }
 
     public async Task<long> BulkInsertTorrentsAsync(List<Torrent> torrents, CancellationToken ct = default)
@@ -36,113 +39,91 @@ public class TorrentRepository : ITorrentRepository
         if (conn.State != System.Data.ConnectionState.Open)
             await conn.OpenAsync(ct);
 
-        var tableName = "_ingest_" + Guid.NewGuid().ToString("N");
-        await EnsureTempTableAsync(conn, tableName, ct);
-
-        // Step 1: COPY all candidates into temp table
-        await CopyToTempAsync(unique, conn, tableName, ct);
-
-        // Step 2: INSERT ... ON CONFLICT DO NOTHING RETURNING info_hash
-        var insertedHashes = await InsertFromTempAsync(conn, tableName, ct);
-
-        // Step 3: Build file list for successfully inserted torrents
-        var files = new List<TorrentFile>();
-        foreach (var t in unique)
+        // Use a transaction so torrents and their files are inserted atomically.
+        await using var tx = await conn.BeginTransactionAsync(ct);
+        HashSet<string> insertedHashes;
+        try
         {
-            if (insertedHashes.Contains(t.InfoHash))
+            // Step 1: INSERT torrents via unnest arrays ¡ª no temp table needed.
+            insertedHashes = await InsertTorrentsAsync(unique, conn, tx, ct);
+
+            // Step 2: INSERT files for successfully inserted torrents.
+            var files = new List<TorrentFile>();
+            foreach (var t in unique)
             {
+                if (!insertedHashes.Contains(t.InfoHash)) continue;
                 foreach (var f in t.Files)
                 {
                     f.InfoHash = t.InfoHash;
                     files.Add(f);
                 }
             }
+
+            if (files.Count > 0)
+                await CopyFilesAsync(files, conn, tx, ct);
+
+            await tx.CommitAsync(ct);
+        }
+        catch
+        {
+            await tx.RollbackAsync(ct);
+            throw;
         }
 
-        if (files.Count > 0)
-            await CopyFilesAsync(files, conn, ct);
-
-        await DropTempTableAsync(conn, tableName, ct);
-
-        if (_meili != null && insertedHashes.Count > 0)
+        if (_meiliQueue != null && insertedHashes.Count > 0)
         {
             var indexDocs = unique.Where(t => insertedHashes.Contains(t.InfoHash)).ToList();
-            // Fire-and-forget: don't block the DB batch loop on meili latency
-            _ = _meili.IndexDocumentsAsync(indexDocs, CancellationToken.None);
+            _meiliQueue.Enqueue(indexDocs);
         }
 
         return insertedHashes.Count;
     }
 
-    private static async Task DropTempTableAsync(NpgsqlConnection conn, string tableName, CancellationToken ct)
-    {
-        await using var cmd = new NpgsqlCommand($"DROP TABLE IF EXISTS {tableName}", conn);
-        await cmd.ExecuteNonQueryAsync(ct);
-    }
-
-    private static async Task EnsureTempTableAsync(NpgsqlConnection conn, string tableName, CancellationToken ct)
+    private static async Task<HashSet<string>> InsertTorrentsAsync(
+        List<Torrent> torrents, NpgsqlConnection conn, NpgsqlTransaction tx, CancellationToken ct)
     {
         await using var cmd = new NpgsqlCommand(
-            $"""
-            CREATE TEMP TABLE {tableName} (
-                info_hash VARCHAR(40) NOT NULL,
-                name TEXT NOT NULL,
-                piece_length INTEGER NOT NULL,
-                total_length BIGINT NOT NULL,
-                file_count INTEGER NOT NULL,
-                is_private BOOLEAN NOT NULL,
-                source VARCHAR(32)
-            )
-            """, conn);
-        await cmd.ExecuteNonQueryAsync(ct);
-    }
-
-    private static async Task CopyToTempAsync(List<Torrent> torrents, NpgsqlConnection conn, string tableName, CancellationToken ct)
-    {
-        await using var writer = await conn.BeginBinaryImportAsync(
-            $"COPY {tableName} (info_hash, name, piece_length, total_length, file_count, is_private, source) FROM STDIN (FORMAT BINARY)",
-            ct);
-
-        foreach (var t in torrents)
-        {
-            await writer.StartRowAsync(ct);
-            await writer.WriteAsync(t.InfoHash, ct);
-            await writer.WriteAsync(t.Name, ct);
-            await writer.WriteAsync(t.PieceLength, ct);
-            await writer.WriteAsync(t.TotalLength, ct);
-            await writer.WriteAsync(t.FileCount, ct);
-            await writer.WriteAsync(t.IsPrivate, ct);
-            await writer.WriteAsync(t.Source ?? (object)DBNull.Value, ct);
-        }
-
-        await writer.CompleteAsync(ct);
-    }
-
-    private static async Task<HashSet<string>> InsertFromTempAsync(NpgsqlConnection conn, string tableName, CancellationToken ct)
-    {
-        await using var cmd = new NpgsqlCommand(
-            $"""
+            """
             INSERT INTO torrents (info_hash, name, piece_length, total_length, file_count, is_private, source)
-            SELECT info_hash, name, piece_length, total_length, file_count, is_private, source
-            FROM {tableName}
+            SELECT * FROM unnest(
+                @hashes::varchar[],
+                @names::text[],
+                @pieceLengths::int[],
+                @totalLengths::bigint[],
+                @fileCounts::int[],
+                @isPrivates::bool[],
+                @sources::varchar[]
+            ) AS t(info_hash, name, piece_length, total_length, file_count, is_private, source)
             ON CONFLICT (info_hash) DO NOTHING
             RETURNING info_hash
-            """, conn);
+            """, conn, tx);
+
+        cmd.Parameters.AddWithValue("hashes",      torrents.Select(t => t.InfoHash).ToArray());
+        cmd.Parameters.AddWithValue("names",        torrents.Select(t => t.Name).ToArray());
+        cmd.Parameters.AddWithValue("pieceLengths", torrents.Select(t => t.PieceLength).ToArray());
+        cmd.Parameters.AddWithValue("totalLengths", torrents.Select(t => t.TotalLength).ToArray());
+        cmd.Parameters.AddWithValue("fileCounts",   torrents.Select(t => t.FileCount).ToArray());
+        cmd.Parameters.AddWithValue("isPrivates",   torrents.Select(t => t.IsPrivate).ToArray());
+        // Use explicit NpgsqlDbType so Npgsql correctly maps nullable varchar[] without type ambiguity.
+        cmd.Parameters.Add(new NpgsqlParameter<string?[]>("sources", NpgsqlDbType.Array | NpgsqlDbType.Varchar)
+        {
+            Value = torrents.Select(t => t.Source).ToArray()
+        });
 
         var result = new HashSet<string>();
         await using var reader = await cmd.ExecuteReaderAsync(ct);
         while (await reader.ReadAsync(ct))
-        {
             result.Add(reader.GetString(0));
-        }
         return result;
     }
 
-    private static async Task CopyFilesAsync(List<TorrentFile> files, NpgsqlConnection conn, CancellationToken ct)
+    private static async Task CopyFilesAsync(
+        List<TorrentFile> files, NpgsqlConnection conn, NpgsqlTransaction tx, CancellationToken ct)
     {
         await using var writer = await conn.BeginBinaryImportAsync(
             "COPY torrent_files (info_hash, path_text, length) FROM STDIN (FORMAT BINARY)",
             ct);
+        // Npgsql binary COPY is implicitly part of the current transaction on this connection.
 
         foreach (var f in files)
         {
@@ -171,50 +152,30 @@ public class TorrentRepository : ITorrentRepository
     }
 
     public async Task<(List<Torrent> Items, long Total)> SearchAsync(
-        string query, int page, int pageSize, string? fileType = null, CancellationToken ct = default)
+        string query, int page, int pageSize, CancellationToken ct = default)
     {
-        // Try Meilisearch first
-        if (_meili != null)
-        {
-            var result = await _meili.SearchAsync(query, page, pageSize, fileType, ct);
-            if (result is { Hits.Count: > 0 })
-            {
-                var hashes = result.Hits.Select(h => h.InfoHash).ToList();
-                var dbItems = await _db.Torrents
-                    .AsNoTracking()
-                    .Where(t => hashes.Contains(t.InfoHash))
-                    .ToListAsync(ct);
-                // Preserve Meilisearch order
-                var ordered = hashes
-                    .Select(h => dbItems.FirstOrDefault(t => t.InfoHash == h))
-                    .Where(t => t != null)
-                    .Cast<Torrent>()
-                    .ToList();
-                return (ordered, result.EstimatedTotalHits);
-            }
-        }
+        if (_meiliClient == null)
+            return ([], 0);
 
-        // Fallback: PG trigram
-        var baseQuery = _db.Torrents
+        var result = await _meiliClient.SearchAsync(query, page, pageSize, ct);
+        if (result is not { Hits.Count: > 0 })
+            return ([], result?.EstimatedTotalHits ?? 0);
+
+        var hashes = result.Hits.Select(h => h.InfoHash).ToList();
+        var dbItems = await _db.Torrents
             .AsNoTracking()
-            .Where(t => EF.Functions.TrigramsSimilarityDistance(t.Name, query) < 0.95);
-
-        if (!string.IsNullOrWhiteSpace(fileType))
-        {
-            var pattern = $".{fileType}";
-            baseQuery = baseQuery.Where(t => _db.TorrentFiles
-                .Any(f => f.InfoHash == t.InfoHash && f.PathText.EndsWith(pattern)));
-        }
-
-        var total = await baseQuery.LongCountAsync(ct);
-        var items = await baseQuery
-            .OrderByDescending(t => t.PeerCount)
-            .ThenByDescending(t => t.CreatedAt)
-            .Skip((page - 1) * pageSize)
-            .Take(pageSize)
+            .Where(t => hashes.Contains(t.InfoHash))
             .ToListAsync(ct);
 
-        return (items, total);
+        // O(n) dict-based reorder to preserve Meilisearch ranking.
+        var byHash = dbItems.ToDictionary(t => t.InfoHash);
+        var ordered = hashes
+            .Select(h => byHash.GetValueOrDefault(h))
+            .Where(t => t != null)
+            .Cast<Torrent>()
+            .ToList();
+
+        return (ordered, result.EstimatedTotalHits);
     }
 
     public async Task DecayPeerCountsAsync(CancellationToken ct = default)
@@ -231,32 +192,24 @@ public class TorrentRepository : ITorrentRepository
         if (conn.State != System.Data.ConnectionState.Open)
             await conn.OpenAsync(ct);
 
-        var tableName = "_peer_temp_" + Guid.NewGuid().ToString("N");
-        await using (var cmd = new NpgsqlCommand($"CREATE TEMP TABLE {tableName} (info_hash VARCHAR(40), cnt INT)", conn))
-            await cmd.ExecuteNonQueryAsync(ct);
+        // unnest-based UPDATE: no temp table, no extra round-trips, single statement.
+        await using var cmd = new NpgsqlCommand(
+            """
+            UPDATE torrents
+               SET peer_count      = torrents.peer_count + t.cnt,
+                   peer_updated_at = NOW()
+              FROM unnest(@hashes::varchar[], @counts::int[]) AS t(hash, cnt)
+             WHERE torrents.info_hash = t.hash
+            """, conn);
 
-        await using (var writer = await conn.BeginBinaryImportAsync($"COPY {tableName} FROM STDIN (FORMAT BINARY)", ct))
-        {
-            foreach (var (hash, count) in counts)
-            {
-                await writer.StartRowAsync(ct);
-                await writer.WriteAsync(hash, ct);
-                await writer.WriteAsync(count, ct);
-            }
-            await writer.CompleteAsync(ct);
-        }
-
-        await using (var cmd = new NpgsqlCommand(
-            $"UPDATE torrents SET peer_count = torrents.peer_count + t.cnt, peer_updated_at = NOW() FROM {tableName} t WHERE torrents.info_hash = t.info_hash", conn))
-            await cmd.ExecuteNonQueryAsync(ct);
-
-        await using (var cmd = new NpgsqlCommand($"DROP TABLE IF EXISTS {tableName}", conn))
-            await cmd.ExecuteNonQueryAsync(ct);
+        cmd.Parameters.AddWithValue("hashes", counts.Keys.ToArray());
+        cmd.Parameters.AddWithValue("counts", counts.Values.ToArray());
+        await cmd.ExecuteNonQueryAsync(ct);
     }
 
     public async Task<List<string>> CheckExistsAsync(List<string> hashes, CancellationToken ct = default)
     {
-        if (hashes.Count == 0) return new List<string>();
+        if (hashes.Count == 0) return [];
         return await _db.Torrents
             .AsNoTracking()
             .Where(t => hashes.Contains(t.InfoHash))
@@ -275,7 +228,19 @@ public class TorrentRepository : ITorrentRepository
 
     public async Task<long> GetTotalCountAsync(CancellationToken ct = default)
     {
-        return await _db.Torrents.LongCountAsync(ct);
+        // Use pg_class.reltuples for a fast O(1) estimate instead of a full COUNT(*) seq-scan.
+        // Falls back to exact count if the table is brand-new (reltuples = -1 before first ANALYZE).
+        var conn = (NpgsqlConnection)_db.Database.GetDbConnection();
+        if (conn.State != System.Data.ConnectionState.Open)
+            await conn.OpenAsync(ct);
+
+        await using var cmd = new NpgsqlCommand(
+            "SELECT GREATEST(0, reltuples::bigint) FROM pg_class WHERE relname = 'torrents'", conn);
+        var raw = await cmd.ExecuteScalarAsync(ct);
+        var estimate = raw is long l ? l : Convert.ToInt64(raw ?? 0L);
+
+        // If pg_class hasn't been analyzed yet, fall back to exact count.
+        return estimate > 0 ? estimate : await _db.Torrents.LongCountAsync(ct);
     }
 
     public async Task<long> GetTodayCountAsync(CancellationToken ct = default)
@@ -300,3 +265,5 @@ public class TorrentRepository : ITorrentRepository
         await cmd.ExecuteNonQueryAsync(ct);
     }
 }
+
+

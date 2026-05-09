@@ -1,4 +1,4 @@
-// Package app 实现 Cherry DHT 爬虫的核心应用逻辑（高性能重写版）。
+﻿// Package app 实现 Cherry DHT 爬虫的核心应用逻辑（高性能重写版）。
 //
 // 主要修复（相比 app.go）：
 //  1. seenSet（无限增长 map）→ 有界 LRU cache，内存严格上限
@@ -21,7 +21,8 @@ import (
 	"path/filepath"
 	"runtime"
 	"runtime/debug"
-	"sort"
+runtimemetrics "runtime/metrics"
+"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -183,26 +184,28 @@ func (a *Application) Run(ctx context.Context) error {
 
 	// 共享回调（所有 DHT 实例共用同一套 handler，共享下载器和 LRU）
 	onGetPeers := func(infoHash, ip string, port int) {
+		now := time.Now().UTC()
 		ihHex := hex.EncodeToString([]byte(infoHash))
-		a.submitInfohashEvent(events, ihHex, ip, port, "get_peers", stats)
+		a.submitInfohashEvent(events, ihHex, ip, port, "get_peers", stats, now)
 	}
 	onGetPeersResponse := func(infoHash string, peer *dht.Peer) {
+		now := time.Now().UTC()
 		ihHex := hex.EncodeToString([]byte(infoHash))
 		if a.cfg.Role != "metadata" {
-			a.submitPeerEvent(events, ihHex, peer.IP.String(), peer.Port, "get_peers_response", stats)
+			a.submitPeerEvent(events, ihHex, peer.IP.String(), peer.Port, "get_peers_response", stats, now)
 		}
 		a.queueMetadataRequest(downloader, ihHex, peer.IP.String(), peer.Port, stats, checkQueue)
 	}
 	onAnnouncePeer := func(infoHash, ip string, port int) {
+		now := time.Now().UTC()
 		ihHex := hex.EncodeToString([]byte(infoHash))
 		if a.cfg.Role != "metadata" {
-			a.submitPeerEvent(events, ihHex, ip, port, "announce_peer", stats)
+			a.submitPeerEvent(events, ihHex, ip, port, "announce_peer", stats, now)
 		}
 		a.queueMetadataRequest(downloader, ihHex, ip, port, stats, checkQueue)
 	}
 
 	addrs := a.listenAddrs()
-	a.dhts = make([]*dht.DHT, 0, len(addrs))
 	for i, addr := range addrs {
 		dhtCfg := dht.NewCrawlConfig()
 		if a.cfg.Discovery.Mode == "standard" {
@@ -305,9 +308,9 @@ func (a *Application) runCheckLoop(ctx context.Context, checkQueue <-chan string
 	}
 }
 
-// flushPeerCountsLoop 每60秒将累积的 peer counts 批量上报到 API。
+// flushPeerCountsLoop flushes peer counts every 20s or when count exceeds threshold.
 func (a *Application) flushPeerCountsLoop(ctx context.Context) {
-	ticker := time.NewTicker(60 * time.Second)
+ticker := time.NewTicker(20 * time.Second)
 	defer ticker.Stop()
 	for {
 		select {
@@ -394,12 +397,16 @@ func (a *Application) autoTuneLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			var ms runtime.MemStats
-			runtime.ReadMemStats(&ms)
-
-			heapAlloc := ms.HeapAlloc
-			heapInUse := ms.HeapInuse
+			// G11: runtime/metrics avoids STW unlike ReadMemStats.
+			samples := []runtimemetrics.Sample{
+				{Name: "/memory/classes/heap/objects:bytes"},
+				{Name: "/memory/classes/heap/inuse:bytes"},
+			}
+			runtimemetrics.Read(samples)
+			heapAlloc := samples[0].Value.Uint64()
+			heapInUse := samples[1].Value.Uint64()
 			paused := a.metaPaused.Load()
+
 			action := controller.nextAction(time.Now(), paused, heapAlloc, pauseThreshold, resumeThreshold)
 
 			switch action {
@@ -536,7 +543,7 @@ func clampUint64(value, minValue, maxValue uint64) uint64 {
 
 // --- 事件提交 ---
 
-func (a *Application) submitInfohashEvent(events chan<- pipeline.Event, ihHex, ip string, port int, source string, stats *runtimeStats) {
+func (a *Application) submitInfohashEvent(events chan<- pipeline.Event, ihHex, ip string, port int, source string, stats *runtimeStats, now time.Time) {
 	if !a.shouldEmitPeerEvents() {
 		return
 	}
@@ -549,7 +556,7 @@ func (a *Application) submitInfohashEvent(events chan<- pipeline.Event, ihHex, i
 	}
 	a.submitEvent(events, pipeline.Event{
 		Type:       pipeline.EventPeerDiscovered,
-		Timestamp:  time.Now().UTC(),
+Timestamp:  now,
 		InstanceID: a.cfg.InstanceID,
 		Source:     source,
 		InfoHash:   ihHex,
@@ -558,7 +565,7 @@ func (a *Application) submitInfohashEvent(events chan<- pipeline.Event, ihHex, i
 	}, stats.infohashEventsDropped.Add, stats.infohashEventsSent.Add)
 }
 
-func (a *Application) submitPeerEvent(events chan<- pipeline.Event, ihHex, ip string, port int, source string, stats *runtimeStats) {
+func (a *Application) submitPeerEvent(events chan<- pipeline.Event, ihHex, ip string, port int, source string, stats *runtimeStats, now time.Time) {
 	if !a.shouldEmitPeerEvents() {
 		return
 	}
@@ -570,7 +577,7 @@ func (a *Application) submitPeerEvent(events chan<- pipeline.Event, ihHex, ip st
 	}
 	a.submitEvent(events, pipeline.Event{
 		Type:       pipeline.EventPeerDiscovered,
-		Timestamp:  time.Now().UTC(),
+Timestamp:  now,
 		InstanceID: a.cfg.InstanceID,
 		Source:     source,
 		InfoHash:   ihHex,
@@ -636,8 +643,8 @@ func (a *Application) consumeMetadata(ctx context.Context, downloader *dht.Wire,
 			ok, fail, okCache = 0, 0, 0
 		case response := <-responses:
 			ihHex := hex.EncodeToString(response.InfoHash)
-			responseKey := buildInfohashPeerKey(ihHex, response.IP, response.Port)
-			if !a.metadataResultSeen.Set(responseKey) {
+// G7: dedupe by infohash only; one result per hash is sufficient.
+if !a.metadataResultSeen.Set(ihHex) {
 				stats.metadataEventsDeduped.Add(1)
 				fail++
 				continue
@@ -879,21 +886,32 @@ func (a *Application) checkWorkerCount() int {
 }
 
 func (a *Application) checkBatchExists(hashes []string) {
-	if len(hashes) == 0 {
-		return
-	}
-	url := a.baseURL() + "/api/v1/torrents/check?hashes=" + strings.Join(hashes, ",")
-	resp, err := a.apiClient.Get(url)
-	if err != nil {
-		return
-	}
-	defer resp.Body.Close()
-	var found []string
-	if json.NewDecoder(resp.Body).Decode(&found) == nil {
-		for _, h := range found {
-			a.remoteKnown.Set(h) // 添加到有界 LRU，超容量时自动淘汰最旧的
-		}
-	}
+if len(hashes) == 0 {
+return
+}
+// POST to avoid URL-length limits and URL-encoding overhead.
+body, _ := json.Marshal(hashes)
+req, err := http.NewRequest(http.MethodPost,
+a.baseURL()+"/api/v1/torrents/check",
+bytes.NewReader(body))
+if err != nil {
+return
+}
+req.Header.Set("Content-Type", "application/json")
+if a.cfg.Exporter.APIKey != "" {
+req.Header.Set("X-API-Key", a.cfg.Exporter.APIKey)
+}
+resp, err := a.apiClient.Do(req)
+if err != nil {
+return
+}
+defer resp.Body.Close()
+var found []string
+if json.NewDecoder(resp.Body).Decode(&found) == nil {
+for _, h := range found {
+a.remoteKnown.Set(h)
+}
+}
 }
 
 // --- metadata 解析（与原 app.go 完全一致）---
@@ -968,11 +986,11 @@ func normalizeMetadata(data []byte) (*pipeline.Metadata, error) {
 	}
 	metadata.FileCount = len(metadata.Files)
 	if metadata.FileCount > 1 {
-		sort.Slice(metadata.Files, func(i, j int) bool {
-			return metadata.Files[i].PathText < metadata.Files[j].PathText
+		slices.SortFunc(metadata.Files, func(a, b pipeline.MetadataFile) int {
+			return strings.Compare(a.PathText, b.PathText)
 		})
 	}
-	if metadata.Name == "" && metadata.FileCount > 0 {
+	if metadata.FileCount > 0 && metadata.Name == "" {
 		metadata.Name = metadata.Files[0].Path[0]
 	}
 	if metadata.Name == "" || metadata.Length <= 0 {

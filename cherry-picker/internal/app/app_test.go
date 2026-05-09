@@ -1,4 +1,4 @@
-package app
+﻿package app
 
 import (
 	"io"
@@ -33,8 +33,8 @@ func TestSubmitInfohashEventKeepsDistinctSources(t *testing.T) {
 	stats := &runtimeStats{}
 
 	// 不同 source → 应该各发送一次
-	app.submitInfohashEvent(events, "abc123", "1.1.1.1", 6881, "get_peers", stats)
-	app.submitInfohashEvent(events, "abc123", "1.1.1.1", 6881, "get_peers_response", stats)
+	app.submitInfohashEvent(events, "abc123", "1.1.1.1", 6881, "get_peers", stats, time.Now())
+	app.submitInfohashEvent(events, "abc123", "1.1.1.1", 6881, "get_peers_response", stats, time.Now())
 
 	if got := len(events); got != 2 {
 		t.Fatalf("len(events) = %d, want 2", got)
@@ -50,8 +50,8 @@ func TestSubmitInfohashEventDeduplicates(t *testing.T) {
 	stats := &runtimeStats{}
 
 	// 完全相同的事件 → 第二次应该被去重
-	app.submitInfohashEvent(events, "abc123", "1.1.1.1", 6881, "get_peers", stats)
-	app.submitInfohashEvent(events, "abc123", "1.1.1.1", 6881, "get_peers", stats)
+	app.submitInfohashEvent(events, "abc123", "1.1.1.1", 6881, "get_peers", stats, time.Now())
+	app.submitInfohashEvent(events, "abc123", "1.1.1.1", 6881, "get_peers", stats, time.Now())
 
 	if got := len(events); got != 1 {
 		t.Fatalf("len(events) = %d, want 1", got)

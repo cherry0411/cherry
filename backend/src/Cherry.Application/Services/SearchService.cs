@@ -6,10 +6,12 @@ namespace Cherry.Application.Services;
 public class SearchService
 {
     private readonly ITorrentRepository _repo;
+    private readonly IDedupFilter _dedup;
 
-    public SearchService(ITorrentRepository repo)
+    public SearchService(ITorrentRepository repo, IDedupFilter dedup)
     {
         _repo = repo;
+        _dedup = dedup;
     }
 
     public async Task<SearchResponse> SearchAsync(SearchRequest request, CancellationToken ct = default)
@@ -18,7 +20,6 @@ public class SearchService
             request.Query,
             request.Page,
             request.PageSize,
-            request.FileType,
             ct);
 
         var dtos = items.Select(t => new TorrentDto(
@@ -37,7 +38,14 @@ public class SearchService
     }
 
     public async Task<List<string>> CheckExistsAsync(List<string> hashes, CancellationToken ct)
-        => await _repo.CheckExistsAsync(hashes, ct);
+    {
+        // A1: Use CuckooFilter as a fast pre-filter.
+        // Only hashes that pass the probabilistic check are confirmed against the DB.
+        // False-positive rate is ~0.1% — negligible for the crawler's dedup use case.
+        var candidates = hashes.Where(h => _dedup.MightContain(h)).ToList();
+        if (candidates.Count == 0) return [];
+        return await _repo.CheckExistsAsync(candidates, ct);
+    }
 
     public async Task<List<TorrentDto>> GetRecentAsync(CancellationToken ct = default)
     {

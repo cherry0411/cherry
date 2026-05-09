@@ -23,7 +23,7 @@ builder.Services.AddDbContextPool<AppDbContext>(options =>
     });
 }, poolSize: 64);
 
-// MeiliSearch (optional — falls back to PG trigram if not configured)
+// MeiliSearch (optional)
 var meiliUrl = builder.Configuration["MeiliSearch:Url"];
 if (!string.IsNullOrWhiteSpace(meiliUrl))
 {
@@ -32,6 +32,9 @@ if (!string.IsNullOrWhiteSpace(meiliUrl))
         c.BaseAddress = new Uri(meiliUrl);
         c.Timeout = TimeSpan.FromSeconds(5);
     });
+    builder.Services.AddSingleton<Cherry.Infrastructure.Search.MeiliIndexQueue>();
+    builder.Services.AddHostedService(sp =>
+        sp.GetRequiredService<Cherry.Infrastructure.Search.MeiliIndexQueue>());
 }
 
 // Core services
@@ -80,9 +83,12 @@ await using (var scope = app.Services.CreateAsyncScope())
         try { await db.Database.MigrateAsync(); }
         catch (PostgresException ex) when (ex.SqlState == "42P07")
         {
-            // Tables already exist from manual creation — record the migration
-            await db.Database.ExecuteSqlRawAsync(
-                $"INSERT INTO \"__EFMigrationsHistory\" VALUES ('{pending.Last()}', '10.0.0')");
+            // Tables already exist from manual creation — record all pending migrations
+            foreach (var migration in pending)
+            {
+                await db.Database.ExecuteSqlRawAsync(
+                    $"INSERT INTO \"__EFMigrationsHistory\" VALUES ('{migration}', '10.0.0') ON CONFLICT DO NOTHING");
+            }
         }
     }
 }
@@ -99,17 +105,37 @@ if (!string.IsNullOrWhiteSpace(meiliUrl))
     catch { }
 }
 
-// Seed PendingRequestTracker with existing pending requests from DB
+// Seed PendingRequestTracker: load pending hashes from DB, then mark any that
+// already have a matching torrent row as done (handles the crash-recovery edge case).
 {
     await using var trackerScope = app.Services.CreateAsyncScope();
     var db = trackerScope.ServiceProvider.GetRequiredService<AppDbContext>();
     var tracker = app.Services.GetRequiredService<Cherry.Application.Services.PendingRequestTracker>();
+
     var pendingHashes = await db.TorrentRequests
         .Where(r => r.Status == "pending")
         .Select(r => r.InfoHash)
         .ToListAsync();
+
     if (pendingHashes.Count > 0)
-        tracker.TrackMany(pendingHashes);
+    {
+        // Find pending hashes that already have a torrent row (crash-recovery)
+        var alreadyIngested = await db.Torrents
+            .Where(t => pendingHashes.Contains(t.InfoHash))
+            .Select(t => t.InfoHash)
+            .ToListAsync();
+
+        if (alreadyIngested.Count > 0)
+        {
+            await db.TorrentRequests
+                .Where(r => r.Status == "pending" && alreadyIngested.Contains(r.InfoHash))
+                .ExecuteUpdateAsync(s => s.SetProperty(r => r.Status, "done"));
+            pendingHashes = pendingHashes.Except(alreadyIngested).ToList();
+        }
+
+        if (pendingHashes.Count > 0)
+            tracker.TrackMany(pendingHashes);
+    }
 }
 
 // CORS — allow independent frontend deployment
@@ -117,6 +143,8 @@ app.UseCors(policy => policy
     .AllowAnyOrigin()
     .AllowAnyMethod()
     .AllowAnyHeader());
+
+app.UseOutputCache();
 
 // Swagger UI
 app.UseSwagger();

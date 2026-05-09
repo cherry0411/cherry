@@ -53,12 +53,18 @@ public static class TorrentEndpoints
             .WithDescription("POST {hashes: {info_hash: count, ...}} — batch update peer counts for ranking.")
             .Produces(200);
 
-        group.MapGet("/check", CheckExistsAsync)
-            .WithName("CheckExists")
-            .WithSummary("批量检查info_hash是否存在")
+        group.MapGet("/check", CheckExistsGetAsync)
+            .WithName("CheckExistsGet")
+            .WithSummary("批量检查info_hash是否存在（GET）")
             .WithDescription("Given ?hashes=a1,b2,c3, returns which hashes already exist in the database.")
+            .Produces<List<string>>(200);
+
+        group.MapPost("/check", CheckExistsPostAsync)
+            .WithName("CheckExistsPost")
+            .WithSummary("批量检查info_hash是否存在（POST）")
+            .WithDescription("POST [\"a1\",\"b2\",...], returns which hashes already exist. Preferred over GET for large batches.")
             .Produces<List<string>>(200)
-            .CacheOutput(p => p.Expire(TimeSpan.FromSeconds(5)));
+            .Produces(400);
 
         group.MapGet("/recent", GetRecentAsync)
             .WithName("GetRecentTorrents")
@@ -333,19 +339,47 @@ public static class TorrentEndpoints
         return Results.Ok();
     }
 
-    private static IResult CheckExistsAsync(
+    private static async Task<IResult> CheckExistsGetAsync(
         HttpContext http,
-        IDedupFilter dedup)
+        SearchService searchService,
+        CancellationToken ct)
     {
         var hashesParam = http.Request.Query["hashes"].ToString();
         if (string.IsNullOrWhiteSpace(hashesParam))
             return Results.BadRequest("?hashes=a1,b2,c3 required");
 
-        var existing = hashesParam.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+        var candidates = hashesParam
+            .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
             .Select(h => h.ToLowerInvariant())
-            .Where(h => h.Length == 40 && dedup.MightContain(h))
+            .Where(h => h.Length == 40 && h.All(c => c is >= 'a' and <= 'f' or >= '0' and <= '9'))
+            .Distinct()
             .ToList();
 
+        if (candidates.Count == 0)
+            return Results.Ok(Array.Empty<string>());
+
+        var existing = await searchService.CheckExistsAsync(candidates, ct);
+        return Results.Ok(existing);
+    }
+
+    private static async Task<IResult> CheckExistsPostAsync(
+        [FromBody] List<string>? hashes,
+        SearchService searchService,
+        CancellationToken ct)
+    {
+        if (hashes is null || hashes.Count == 0)
+            return Results.Ok(Array.Empty<string>());
+
+        var candidates = hashes
+            .Select(h => h.ToLowerInvariant())
+            .Where(h => h.Length == 40 && h.All(c => c is >= 'a' and <= 'f' or >= '0' and <= '9'))
+            .Distinct()
+            .ToList();
+
+        if (candidates.Count == 0)
+            return Results.Ok(Array.Empty<string>());
+
+        var existing = await searchService.CheckExistsAsync(candidates, ct);
         return Results.Ok(existing);
     }
 
@@ -375,7 +409,6 @@ public static class TorrentEndpoints
         [FromQuery] string q,
         [FromQuery] int page,
         [FromQuery] int size,
-        [FromQuery] string? fileType,
         SearchService searchService,
         CancellationToken ct)
     {
@@ -386,7 +419,7 @@ public static class TorrentEndpoints
         size = Math.Clamp(size == 0 ? 20 : size, 1, 100);
 
         var result = await searchService.SearchAsync(
-            new SearchRequest(q, page, size, fileType), ct);
+            new SearchRequest(q, page, size), ct);
         return Results.Ok(result);
     }
 
