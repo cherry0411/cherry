@@ -1,0 +1,18 @@
+[Unit]
+Description=cherry-picker metadata worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=cherry-picker
+Group=cherry-picker
+WorkingDirectory=/opt/cherry-picker
+Environment=CHERRY_PICKER_CONFIG=/etc/cherry-picker/metadata.json
+ExecStart=/opt/cherry-picker/cherry-picker
+Restart=always
+RestartSec=5
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target

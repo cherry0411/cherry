@@ -18,7 +18,7 @@ async function main() {
     const { rows: [{ count }] } = await pg.query('SELECT COUNT(*) FROM torrents');
     console.log(`Total: ${count} torrents`);
 
-    // 2. Create Meilisearch index with searchable fields
+    // 2. Create Meilisearch index with searchable fields (delete if exists then recreate)
     await fetch(`${MEILI}/indexes/torrents`, { method: 'DELETE' }).catch(() => {});
     await fetch(`${MEILI}/indexes`, {
         method: 'POST',
@@ -47,12 +47,21 @@ async function main() {
         })
     });
 
-    // 4. Batch import
-    for (let offset = 0; offset < count; offset += BATCH) {
+    // 4. Batch import using cursor pagination on info_hash (avoids relying on numeric id column)
+    let last = '';
+    let processed = 0;
+    while (true) {
         const { rows } = await pg.query(
             `SELECT info_hash, name, total_length, file_count, is_private, peer_count, created_at
-             FROM torrents ORDER BY id LIMIT ${BATCH} OFFSET ${offset}`
+             FROM torrents
+             WHERE info_hash > $1
+             ORDER BY info_hash
+             LIMIT $2`,
+            [last, BATCH]
         );
+
+        if (rows.length === 0) break;
+
         const docs = rows.map(r => ({
             infoHash: r.info_hash,
             name: r.name,
@@ -62,12 +71,16 @@ async function main() {
             peerCount: r.peer_count || 0,
             createdAt: r.created_at ? new Date(r.created_at).getTime() : 0
         }));
+
         await fetch(`${MEILI}/indexes/torrents/documents`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(docs)
         });
-        console.log(`${offset + rows.length} / ${count}`);
+
+        processed += rows.length;
+        last = rows[rows.length - 1].info_hash;
+        console.log(`${processed} / ${count}`);
     }
 
     console.log('Done. Try: curl http://localhost:7700/indexes/torrents/search?q=test');

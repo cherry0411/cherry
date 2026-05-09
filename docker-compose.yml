@@ -1,5 +1,5 @@
 x-crawler-base: &crawler-base
-  build: ./go/cherry-picker
+  build: ./cherry-picker
   restart: unless-stopped
   depends_on: [api]
   network_mode: host
