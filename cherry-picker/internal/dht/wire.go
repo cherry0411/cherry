@@ -17,6 +17,7 @@ import (
 	"io"
 	"net"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"cherry-picker/internal/cache"
@@ -94,7 +95,7 @@ func sendHandshake(conn *net.TCPConn, infoHash, peerID []byte) error {
 	copy(data[28:48], infoHash)
 	copy(data[48:], peerID)
 
-	conn.SetWriteDeadline(time.Now().Add(time.Second * 3))
+	conn.SetWriteDeadline(time.Now().Add(time.Second * 2))
 	_, err := conn.Write(data)
 	return err
 }
@@ -164,6 +165,15 @@ type Response struct {
 	MetadataInfo []byte
 }
 
+// WireStats 提供 wire 层的诊断计数器，所有字段均为原子操作安全。
+type WireStats struct {
+	DialAttempts atomic.Int64 // TCP dial 尝试次数
+	DialOK       atomic.Int64 // TCP dial 成功
+	HandshakeOK  atomic.Int64 // BT + extension 握手成功
+	DownloadOK   atomic.Int64 // metadata 下载并校验成功
+	Blacklisted  atomic.Int64 // 被黑名单跳过的请求数
+}
+
 // Wire 表示 peer wire 协议下载器。
 //
 // 改动：
@@ -175,6 +185,7 @@ type Wire struct {
 	requests     chan Request
 	responses    chan Response
 	workerTokens chan struct{} // semaphore：控制并发 goroutine 数量
+	Stats        WireStats
 }
 
 // NewWire 创建一个 Wire 实例。
@@ -290,11 +301,13 @@ func (wire *Wire) fetchMetadata(r Request, key string) {
 	infoHash := r.InfoHash
 	address := genAddress(r.IP, r.Port)
 
-	dial, err := net.DialTimeout("tcp", address, time.Second)
+	wire.Stats.DialAttempts.Add(1)
+	dial, err := net.DialTimeout("tcp", address, 500*time.Millisecond)
 	if err != nil {
 		wire.blackList.insert(r.IP, r.Port)
 		return
 	}
+	wire.Stats.DialOK.Add(1)
 	conn := dial.(*net.TCPConn)
 	conn.SetLinger(0)
 	defer conn.Close()
@@ -309,6 +322,7 @@ func (wire *Wire) fetchMetadata(r Request, key string) {
 		sendExtHandshake(conn) != nil {
 		return
 	}
+	wire.Stats.HandshakeOK.Add(1)
 
 	for {
 		length, err = readMessage(conn, data)
@@ -399,6 +413,7 @@ func (wire *Wire) fetchMetadata(r Request, key string) {
 					return
 				}
 
+				wire.Stats.DownloadOK.Add(1)
 				wire.responses <- Response{
 					Request:      r,
 					MetadataInfo: metadataInfo,
@@ -429,6 +444,9 @@ func (wire *Wire) Run() {
 
 		// 基本校验：infohash 必须是 20 字节，且不在黑名单
 		if len(r.InfoHash) != 20 || wire.blackList.in(r.IP, r.Port) {
+			if len(r.InfoHash) == 20 {
+				wire.Stats.Blacklisted.Add(1)
+			}
 			continue
 		}
 

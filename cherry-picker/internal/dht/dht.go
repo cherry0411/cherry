@@ -116,10 +116,10 @@ func NewCrawlConfig() *Config {
 	config.CheckKBucketPeriod = 2 * time.Second // 每 2 秒刷新一次路由表
 	config.KBucketSize = math.MaxInt32
 	config.Mode = CrawlMode
-	config.RefreshNodeNum = 256    // 每次刷新联系的节点数
-	config.MaxNodes = 5_000        // 路由表上限（节省内存）
-	config.PacketJobLimit = 4_096  // 数据包 channel 容量
-	config.PacketWorkerLimit = 0   // 0 = 自动检测（NumCPU × 4）
+	config.RefreshNodeNum = 256   // 每次刷新联系的节点数
+	config.MaxNodes = 5_000       // 路由表上限（节省内存）
+	config.PacketJobLimit = 4_096 // 数据包 channel 容量
+	config.PacketWorkerLimit = 0  // 0 = 自动检测（NumCPU × 4）
 	// 更多 bootstrap 节点，加快初始入网
 	config.PrimeNodes = append(config.PrimeNodes,
 		"router.bitcomet.com:6881",

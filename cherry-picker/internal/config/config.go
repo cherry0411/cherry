@@ -425,12 +425,12 @@ func defaultRefreshNodes() int {
 }
 
 func defaultMetadataWorkers() int {
-	value := cpuScale() * 128
-	if value < 256 {
-		return 256
+	value := cpuScale() * 256
+	if value < 512 {
+		return 512
 	}
-	if value > 1024 {
-		return 1024
+	if value > 2048 {
+		return 2048
 	}
 	return value
 }

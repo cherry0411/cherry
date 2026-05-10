@@ -120,6 +120,11 @@ type statsSnapshot struct {
 	dhtPacketsDropped       uint64
 	dhtPacketsHandled       uint64
 	dhtPacketDecodeErrors   uint64
+	wireDialAttempts        int64
+	wireDialOK              int64
+	wireHandshakeOK         int64
+	wireDownloadOK          int64
+	wireBlacklisted         int64
 }
 
 const (
@@ -236,7 +241,7 @@ func (a *Application) Run(ctx context.Context) error {
 	}
 
 	// 后台 goroutines
-	go a.emitStats(ctx, events, stats)
+	go a.emitStats(ctx, events, stats, downloader)
 	go a.flushPeerCountsLoop(ctx)
 	go a.flushRejectLoop(ctx)
 	go a.pollPendingRequests(ctx)
@@ -695,7 +700,7 @@ func (a *Application) consumeMetadata(ctx context.Context, downloader *dht.Wire,
 	}
 }
 
-func (a *Application) emitStats(ctx context.Context, events chan<- pipeline.Event, stats *runtimeStats) {
+func (a *Application) emitStats(ctx context.Context, events chan<- pipeline.Event, stats *runtimeStats, downloader *dht.Wire) {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 	var previous statsSnapshot
@@ -726,6 +731,11 @@ func (a *Application) emitStats(ctx context.Context, events chan<- pipeline.Even
 				dhtPacketsDropped:       packetStats.Dropped,
 				dhtPacketsHandled:       packetStats.Handled,
 				dhtPacketDecodeErrors:   packetStats.DecodeErrors,
+				wireDialAttempts:        downloader.Stats.DialAttempts.Load(),
+				wireDialOK:              downloader.Stats.DialOK.Load(),
+				wireHandshakeOK:         downloader.Stats.HandshakeOK.Load(),
+				wireDownloadOK:          downloader.Stats.DownloadOK.Load(),
+				wireBlacklisted:         downloader.Stats.Blacklisted.Load(),
 			}
 			a.logRuntimeDelta(current, previous)
 			previous = current
@@ -766,7 +776,7 @@ func (a *Application) emitStats(ctx context.Context, events chan<- pipeline.Even
 
 func (a *Application) logRuntimeDelta(current, previous statsSnapshot) {
 	a.logger.Printf(
-		"runtime 30s: dht_recv=%d handled=%d dropped=%d decode_err=%d peer_sent=%d peer_drop=%d peer_dedup=%d meta_req=%d meta_req_dedup=%d meta_sent=%d meta_drop=%d meta_dedup=%d meta_filtered=%d check_drop=%d paused=%v",
+		"runtime 30s: dht_recv=%d handled=%d dropped=%d decode_err=%d peer_sent=%d peer_drop=%d peer_dedup=%d meta_req=%d meta_req_dedup=%d meta_sent=%d meta_drop=%d meta_dedup=%d meta_filtered=%d check_drop=%d paused=%v wire_dial=%d wire_conn=%d wire_hs=%d wire_ok=%d wire_bl=%d",
 		current.dhtPacketsReceived-previous.dhtPacketsReceived,
 		current.dhtPacketsHandled-previous.dhtPacketsHandled,
 		current.dhtPacketsDropped-previous.dhtPacketsDropped,
@@ -782,6 +792,11 @@ func (a *Application) logRuntimeDelta(current, previous statsSnapshot) {
 		current.metadataEventsFiltered-previous.metadataEventsFiltered,
 		current.checkBatchesDropped-previous.checkBatchesDropped,
 		a.metaPaused.Load(),
+		current.wireDialAttempts-previous.wireDialAttempts,
+		current.wireDialOK-previous.wireDialOK,
+		current.wireHandshakeOK-previous.wireHandshakeOK,
+		current.wireDownloadOK-previous.wireDownloadOK,
+		current.wireBlacklisted-previous.wireBlacklisted,
 	)
 }
 
