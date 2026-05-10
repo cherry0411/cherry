@@ -97,19 +97,19 @@ namespace Cherry.Infrastructure.Data.Migrations
             modelBuilder.Entity("Cherry.Domain.Entities.TorrentFile", b =>
                 {
                     b.Property<string>("InfoHash")
+                        .IsRequired()
                         .HasMaxLength(40)
                         .HasColumnType("character varying(40)")
                         .HasColumnName("info_hash");
-
-                    b.Property<string>("PathText")
-                        .HasColumnType("text")
-                        .HasColumnName("path_text");
 
                     b.Property<long>("Length")
                         .HasColumnType("bigint")
                         .HasColumnName("length");
 
-                    b.HasNoKey();
+                    b.Property<string>("PathText")
+                        .IsRequired()
+                        .HasColumnType("text")
+                        .HasColumnName("path_text");
 
                     b.HasIndex("InfoHash")
                         .HasDatabaseName("idx_torrent_files_info_hash");
@@ -159,11 +159,6 @@ namespace Cherry.Infrastructure.Data.Migrations
                         .HasDatabaseName("idx_torrent_requests_status");
 
                     b.ToTable("torrent_requests", (string)null);
-                });
-
-            modelBuilder.Entity("Cherry.Domain.Entities.Torrent", b =>
-                {
-                    b.Navigation("Files");
                 });
 #pragma warning restore 612, 618
         }

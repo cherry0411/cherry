@@ -13,6 +13,33 @@ namespace Cherry.Infrastructure.Data.Migrations
         protected override void Up(MigrationBuilder migrationBuilder)
         {
             migrationBuilder.CreateTable(
+                name: "torrent_files",
+                columns: table => new
+                {
+                    info_hash = table.Column<string>(type: "character varying(40)", maxLength: 40, nullable: false),
+                    path_text = table.Column<string>(type: "text", nullable: false),
+                    length = table.Column<long>(type: "bigint", nullable: false)
+                },
+                constraints: table =>
+                {
+                });
+
+            migrationBuilder.CreateTable(
+                name: "torrent_requests",
+                columns: table => new
+                {
+                    id = table.Column<long>(type: "bigint", nullable: false)
+                        .Annotation("Npgsql:ValueGenerationStrategy", NpgsqlValueGenerationStrategy.IdentityAlwaysColumn),
+                    info_hash = table.Column<string>(type: "character varying(40)", maxLength: 40, nullable: false),
+                    status = table.Column<string>(type: "character varying(16)", maxLength: 16, nullable: false),
+                    created_at = table.Column<DateTime>(type: "timestamp with time zone", nullable: false, defaultValueSql: "NOW()")
+                },
+                constraints: table =>
+                {
+                    table.PrimaryKey("PK_torrent_requests", x => x.id);
+                });
+
+            migrationBuilder.CreateTable(
                 name: "torrents",
                 columns: table => new
                 {
@@ -33,30 +60,6 @@ namespace Cherry.Infrastructure.Data.Migrations
                     table.PrimaryKey("PK_torrents", x => x.info_hash);
                 });
 
-            migrationBuilder.CreateTable(
-                name: "torrent_files",
-                columns: table => new
-                {
-                    info_hash = table.Column<string>(type: "character varying(40)", maxLength: 40, nullable: false),
-                    path_text = table.Column<string>(type: "text", nullable: false),
-                    length = table.Column<long>(type: "bigint", nullable: false)
-                });
-
-            migrationBuilder.CreateTable(
-                name: "torrent_requests",
-                columns: table => new
-                {
-                    id = table.Column<long>(type: "bigint", nullable: false)
-                        .Annotation("Npgsql:ValueGenerationStrategy", NpgsqlValueGenerationStrategy.IdentityAlwaysColumn),
-                    info_hash = table.Column<string>(type: "character varying(40)", maxLength: 40, nullable: false),
-                    status = table.Column<string>(type: "character varying(16)", maxLength: 16, nullable: false),
-                    created_at = table.Column<DateTime>(type: "timestamp with time zone", nullable: false, defaultValueSql: "NOW()")
-                },
-                constraints: table =>
-                {
-                    table.PrimaryKey("PK_torrent_requests", x => x.id);
-                });
-
             migrationBuilder.CreateIndex(
                 name: "idx_torrent_files_info_hash",
                 table: "torrent_files",
@@ -68,6 +71,16 @@ namespace Cherry.Infrastructure.Data.Migrations
                 column: "path_text")
                 .Annotation("Npgsql:IndexMethod", "GIN")
                 .Annotation("Npgsql:IndexOperators", new[] { "gin_trgm_ops" });
+
+            migrationBuilder.CreateIndex(
+                name: "idx_torrent_requests_hash",
+                table: "torrent_requests",
+                column: "info_hash");
+
+            migrationBuilder.CreateIndex(
+                name: "idx_torrent_requests_status",
+                table: "torrent_requests",
+                column: "status");
 
             migrationBuilder.CreateIndex(
                 name: "idx_torrents_created",
@@ -85,26 +98,16 @@ namespace Cherry.Infrastructure.Data.Migrations
                 name: "idx_torrents_peer_count",
                 table: "torrents",
                 column: "peer_count");
-
-            migrationBuilder.CreateIndex(
-                name: "idx_torrent_requests_hash",
-                table: "torrent_requests",
-                column: "info_hash");
-
-            migrationBuilder.CreateIndex(
-                name: "idx_torrent_requests_status",
-                table: "torrent_requests",
-                column: "status");
         }
 
         /// <inheritdoc />
         protected override void Down(MigrationBuilder migrationBuilder)
         {
             migrationBuilder.DropTable(
-                name: "torrent_requests");
+                name: "torrent_files");
 
             migrationBuilder.DropTable(
-                name: "torrent_files");
+                name: "torrent_requests");
 
             migrationBuilder.DropTable(
                 name: "torrents");

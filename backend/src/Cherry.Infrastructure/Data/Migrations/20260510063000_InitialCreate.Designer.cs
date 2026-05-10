@@ -12,7 +12,7 @@ using Npgsql.EntityFrameworkCore.PostgreSQL.Metadata;
 namespace Cherry.Infrastructure.Data.Migrations
 {
     [DbContext(typeof(AppDbContext))]
-    [Migration("20260503131643_InitialCreate")]
+    [Migration("20260510063000_InitialCreate")]
     partial class InitialCreate
     {
         /// <inheritdoc />
@@ -27,6 +27,11 @@ namespace Cherry.Infrastructure.Data.Migrations
 
             modelBuilder.Entity("Cherry.Domain.Entities.Torrent", b =>
                 {
+                    b.Property<string>("InfoHash")
+                        .HasMaxLength(40)
+                        .HasColumnType("character varying(40)")
+                        .HasColumnName("info_hash");
+
                     b.Property<DateTime>("CreatedAt")
                         .ValueGeneratedOnAdd()
                         .HasColumnType("timestamp with time zone")
@@ -36,12 +41,6 @@ namespace Cherry.Infrastructure.Data.Migrations
                     b.Property<int>("FileCount")
                         .HasColumnType("integer")
                         .HasColumnName("file_count");
-
-                    b.Property<string>("InfoHash")
-                        .IsRequired()
-                        .HasMaxLength(40)
-                        .HasColumnType("character varying(40)")
-                        .HasColumnName("info_hash");
 
                     b.Property<bool>("IsPrivate")
                         .HasColumnType("boolean")
@@ -55,8 +54,8 @@ namespace Cherry.Infrastructure.Data.Migrations
                     b.Property<int>("PeerCount")
                         .ValueGeneratedOnAdd()
                         .HasColumnType("integer")
-                        .HasColumnName("peer_count")
-                        .HasDefaultValue(0);
+                        .HasDefaultValue(0)
+                        .HasColumnName("peer_count");
 
                     b.Property<DateTime>("PeerUpdatedAt")
                         .HasColumnType("timestamp with time zone")
@@ -101,6 +100,7 @@ namespace Cherry.Infrastructure.Data.Migrations
             modelBuilder.Entity("Cherry.Domain.Entities.TorrentFile", b =>
                 {
                     b.Property<string>("InfoHash")
+                        .IsRequired()
                         .HasMaxLength(40)
                         .HasColumnType("character varying(40)")
                         .HasColumnName("info_hash");
@@ -113,8 +113,6 @@ namespace Cherry.Infrastructure.Data.Migrations
                         .IsRequired()
                         .HasColumnType("text")
                         .HasColumnName("path_text");
-
-                    b.HasNoKey();
 
                     b.HasIndex("InfoHash")
                         .HasDatabaseName("idx_torrent_files_info_hash");
@@ -164,11 +162,6 @@ namespace Cherry.Infrastructure.Data.Migrations
                         .HasDatabaseName("idx_torrent_requests_status");
 
                     b.ToTable("torrent_requests", (string)null);
-                });
-
-            modelBuilder.Entity("Cherry.Domain.Entities.Torrent", b =>
-                {
-                    b.Navigation("Files");
                 });
 #pragma warning restore 612, 618
         }
