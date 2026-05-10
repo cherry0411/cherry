@@ -10,7 +10,7 @@ public class Torrent
     public bool IsPrivate { get; set; }
     public string? Source { get; set; }
     public int PeerCount { get; set; }
-    public DateTime PeerUpdatedAt { get; set; }
+    public DateTime? PeerUpdatedAt { get; set; }
     public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
     public DateTime UpdatedAt { get; set; } = DateTime.UtcNow;
 

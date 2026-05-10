@@ -54,7 +54,7 @@ namespace Cherry.Infrastructure.Data.Migrations
                         .HasDefaultValue(0)
                         .HasColumnName("peer_count");
 
-                    b.Property<DateTime>("PeerUpdatedAt")
+                    b.Property<DateTime?>("PeerUpdatedAt")
                         .HasColumnType("timestamp with time zone")
                         .HasColumnName("peer_updated_at");
 

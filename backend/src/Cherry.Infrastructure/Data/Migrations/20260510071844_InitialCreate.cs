@@ -51,7 +51,7 @@ namespace Cherry.Infrastructure.Data.Migrations
                     is_private = table.Column<bool>(type: "boolean", nullable: false),
                     source = table.Column<string>(type: "character varying(32)", maxLength: 32, nullable: true),
                     peer_count = table.Column<int>(type: "integer", nullable: false, defaultValue: 0),
-                    peer_updated_at = table.Column<DateTime>(type: "timestamp with time zone", nullable: false),
+                    peer_updated_at = table.Column<DateTime>(type: "timestamp with time zone", nullable: true),
                     created_at = table.Column<DateTime>(type: "timestamp with time zone", nullable: false, defaultValueSql: "NOW()"),
                     updated_at = table.Column<DateTime>(type: "timestamp with time zone", nullable: false, defaultValueSql: "NOW()")
                 },

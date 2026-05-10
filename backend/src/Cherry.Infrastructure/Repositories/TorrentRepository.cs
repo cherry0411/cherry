@@ -44,7 +44,7 @@ public class TorrentRepository : ITorrentRepository
         HashSet<string> insertedHashes;
         try
         {
-            // Step 1: INSERT torrents via unnest arrays ¡ª no temp table needed.
+            // Step 1: INSERT torrents via unnest arrays ï¿½ï¿½ no temp table needed.
             insertedHashes = await InsertTorrentsAsync(unique, conn, tx, ct);
 
             // Step 2: INSERT files for successfully inserted torrents.
@@ -181,7 +181,7 @@ public class TorrentRepository : ITorrentRepository
     public async Task DecayPeerCountsAsync(CancellationToken ct = default)
     {
         await _db.Torrents
-            .Where(t => t.PeerCount > 0 && t.PeerUpdatedAt < DateTime.UtcNow.AddDays(-7))
+            .Where(t => t.PeerCount > 0 && t.PeerUpdatedAt != null && t.PeerUpdatedAt < DateTime.UtcNow.AddDays(-7))
             .ExecuteUpdateAsync(s => s.SetProperty(t => t.PeerCount, t => t.PeerCount / 2), ct);
     }
 

@@ -12,7 +12,7 @@ using Npgsql.EntityFrameworkCore.PostgreSQL.Metadata;
 namespace Cherry.Infrastructure.Data.Migrations
 {
     [DbContext(typeof(AppDbContext))]
-    [Migration("20260510063000_InitialCreate")]
+    [Migration("20260510071844_InitialCreate")]
     partial class InitialCreate
     {
         /// <inheritdoc />
@@ -57,7 +57,7 @@ namespace Cherry.Infrastructure.Data.Migrations
                         .HasDefaultValue(0)
                         .HasColumnName("peer_count");
 
-                    b.Property<DateTime>("PeerUpdatedAt")
+                    b.Property<DateTime?>("PeerUpdatedAt")
                         .HasColumnType("timestamp with time zone")
                         .HasColumnName("peer_updated_at");
 

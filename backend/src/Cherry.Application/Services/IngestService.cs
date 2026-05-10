@@ -128,7 +128,6 @@ public class IngestService : IHostedService
                 FileCount = meta.FileCount,
                 IsPrivate = meta.Private,
                 Source = evt.InstanceId.Length > 32 ? evt.InstanceId[..32] : evt.InstanceId,
-                PeerUpdatedAt = DateTime.UtcNow,
                 Files = meta.Files.Select(f => new TorrentFile
                 {
                     PathText = f.PathText,
