@@ -1,7 +1,6 @@
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
-using System.Threading.Channels;
 using Cherry.Domain.Entities;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
@@ -81,15 +80,15 @@ public class MeiliSearchClient
 }
 
 /// <summary>
-/// Decouples DB ingest from Meilisearch writes. The repository enqueues document lists;
-/// this service drains the channel with retry (up to 3 attempts, exponential back-off).
-/// Bounded channel (capacity 256 lists) provides back-pressure without blocking ingest.
+/// Decouples DB ingest from Meilisearch writes. Buffers documents and flushes
+/// every 30 seconds (or when 500 docs accumulated) to reduce index pressure.
 /// </summary>
 public sealed class MeiliIndexQueue : IHostedService, IDisposable
 {
     private readonly MeiliSearchClient _client;
     private readonly ILogger<MeiliIndexQueue> _logger;
-    private readonly Channel<List<Torrent>> _channel;
+    private readonly List<Torrent> _buffer;
+    private readonly Lock _lock = new();
     private readonly CancellationTokenSource _cts = new();
     private Task? _loop;
 
@@ -97,18 +96,14 @@ public sealed class MeiliIndexQueue : IHostedService, IDisposable
     {
         _client = client;
         _logger = logger;
-        _channel = Channel.CreateBounded<List<Torrent>>(new BoundedChannelOptions(256)
-        {
-            FullMode = BoundedChannelFullMode.DropOldest,
-            SingleReader = true
-        });
+        _buffer = [];
     }
 
-    /// <summary>Enqueue a batch for async indexing. Non-blocking; oldest batches dropped if full.</summary>
+    /// <summary>Enqueue documents for async indexing. Non-blocking.</summary>
     public void Enqueue(List<Torrent> batch)
     {
         if (batch.Count == 0) return;
-        _channel.Writer.TryWrite(batch);
+        lock (_lock) _buffer.AddRange(batch);
     }
 
     public Task StartAsync(CancellationToken cancellationToken)
@@ -120,44 +115,54 @@ public sealed class MeiliIndexQueue : IHostedService, IDisposable
     public async Task StopAsync(CancellationToken cancellationToken)
     {
         _cts.Cancel();
-        _channel.Writer.Complete();
-        if (_loop != null)
-            await _loop.ConfigureAwait(false);
+        if (_loop != null) await _loop;
     }
 
     private async Task RunLoopAsync(CancellationToken ct)
     {
-        await foreach (var batch in _channel.Reader.ReadAllAsync(ct).ConfigureAwait(false))
+        while (!ct.IsCancellationRequested)
         {
-            await IndexWithRetryAsync(batch, ct).ConfigureAwait(false);
+            try { await Task.Delay(TimeSpan.FromSeconds(30), ct); }
+            catch (OperationCanceledException) { break; }
+            List<Torrent> batch;
+            lock (_lock)
+            {
+                if (_buffer.Count == 0) continue;
+                batch = new List<Torrent>(_buffer);
+                _buffer.Clear();
+            }
+            await IndexWithRetryAsync(batch, ct);
         }
+        // Final flush on shutdown
+        List<Torrent> final;
+        lock (_lock) { final = new List<Torrent>(_buffer); _buffer.Clear(); }
+        if (final.Count > 0) await IndexWithRetryAsync(final, CancellationToken.None);
     }
 
     private async Task IndexWithRetryAsync(List<Torrent> batch, CancellationToken ct)
     {
         const int maxAttempts = 3;
+        var total = batch.Count;
         var delay = TimeSpan.FromSeconds(1);
         for (var attempt = 1; attempt <= maxAttempts; attempt++)
         {
             try
             {
-                var ok = await _client.IndexDocumentsAsync(batch, ct).ConfigureAwait(false);
-                if (ok) return;
-                _logger.LogWarning("Meilisearch indexing returned non-success (attempt {Attempt}/{Max}, batch size {Count})",
-                    attempt, maxAttempts, batch.Count);
+                var ok = await _client.IndexDocumentsAsync(batch, ct);
+                if (ok)
+                {
+                    _logger.LogInformation("Meilisearch: {Count} docs indexed", total);
+                    return;
+                }
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
-                _logger.LogWarning(ex, "Meilisearch indexing failed (attempt {Attempt}/{Max}, batch size {Count})",
-                    attempt, maxAttempts, batch.Count);
+                _logger.LogWarning(ex, "Meilisearch indexing failed (attempt {Attempt}/{Max})", attempt, maxAttempts);
             }
-
-            if (attempt < maxAttempts)
-                await Task.Delay(delay, ct).ConfigureAwait(false);
+            if (attempt < maxAttempts) await Task.Delay(delay, ct);
             delay *= 2;
         }
-        _logger.LogError("Meilisearch indexing permanently failed after {Max} attempts for batch of {Count} documents",
-            maxAttempts, batch.Count);
+        _logger.LogError("Meilisearch indexing failed after {Max} attempts for {Count} docs", maxAttempts, total);
     }
 
     public void Dispose() => _cts.Dispose();
