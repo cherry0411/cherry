@@ -249,6 +249,7 @@ func (a *Application) Run(ctx context.Context) error {
 		go a.autoTuneLoop(ctx)
 	}
 	debug.SetGCPercent(100)
+	debug.SetMemoryLimit(1_200_000_000) // 1.2GB — 防止 heap 无限增长导致系统 swap
 
 	a.logger.Printf("started: instance=%s listen=%v meta_workers=%d nodes_per_dht=%d dht_count=%d",
 		a.cfg.InstanceID, addrs,

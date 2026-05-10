@@ -49,9 +49,8 @@ var handshakePrefix = []byte{
 }
 
 // read 从 conn 读取 size 字节写入 data。
+// 不再设置 per-read deadline，依赖调用方设置的 overall deadline。
 func read(conn *net.TCPConn, size int, data *bytes.Buffer) error {
-	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
-
 	n, err := io.CopyN(data, conn, int64(size))
 	if err != nil || n != int64(size) {
 		return errors.New("read error")
@@ -77,13 +76,13 @@ func readMessage(conn *net.TCPConn, data *bytes.Buffer) (length int, err error) 
 }
 
 // sendMessage 向连接发送带长度前缀的消息。
+// 不再设置 per-write deadline，依赖调用方设置的 overall deadline。
 func sendMessage(conn *net.TCPConn, data []byte) error {
 	length := int32(len(data))
 
 	buffer := bytes.NewBuffer(nil)
 	binary.Write(buffer, binary.BigEndian, length)
 
-	conn.SetWriteDeadline(time.Now().Add(time.Second * 2))
 	_, err := conn.Write(append(buffer.Bytes(), data...))
 	return err
 }
@@ -95,7 +94,6 @@ func sendHandshake(conn *net.TCPConn, infoHash, peerID []byte) error {
 	copy(data[28:48], infoHash)
 	copy(data[48:], peerID)
 
-	conn.SetWriteDeadline(time.Now().Add(time.Second * 2))
 	_, err := conn.Write(data)
 	return err
 }
@@ -180,7 +178,7 @@ type WireStats struct {
 //   - queue 改为有界 LRU（防止无限增长）
 //   - Run() 改为 semaphore 等待模式（不再丢弃请求）
 type Wire struct {
-	blackList    *blackList
+	failedPeers  *cache.LRU // 替代 blackList：有界 LRU，自动淘汰，无需 TTL 清理
 	queue        *cache.LRU // 有界 LRU，替代原来的 syncedMap
 	requests     chan Request
 	responses    chan Response
@@ -205,7 +203,7 @@ func NewWire(blackListSize, requestQueueSize, workerQueueSize int) *Wire {
 		queueCap = 4096
 	}
 	return &Wire{
-		blackList:    newBlackList(blackListSize),
+		failedPeers:  cache.NewLRU(blackListSize),
 		queue:        cache.NewLRU(queueCap),
 		requests:     make(chan Request, requestQueueSize),
 		responses:    make(chan Response, workerQueueSize*2),
@@ -304,13 +302,18 @@ func (wire *Wire) fetchMetadata(r Request, key string) {
 	wire.Stats.DialAttempts.Add(1)
 	dial, err := net.DialTimeout("tcp", address, 500*time.Millisecond)
 	if err != nil {
-		wire.blackList.insert(r.IP, r.Port)
+		wire.failedPeers.Set(genAddress(r.IP, r.Port))
 		return
 	}
 	wire.Stats.DialOK.Add(1)
 	conn := dial.(*net.TCPConn)
 	conn.SetLinger(0)
 	defer conn.Close()
+
+	// 整体 deadline：防止慢速 peer 长时间占用 worker。
+	// 没有此限制时，peer 只需每 2s 发一个 keepalive 就能无限占用 worker，
+	// 导致 wire_dial 持续下降。实测平均连接耗时 14.7s，远超合理值。
+	conn.SetDeadline(time.Now().Add(10 * time.Second))
 
 	// 使用固定大小的 buffer，避免无限增长
 	data := bytes.NewBuffer(nil)
@@ -434,19 +437,19 @@ func (wire *Wire) fetchMetadata(r Request, key string) {
 // 新版改为阻塞等待 token（wire.workerTokens <- struct{}{}），
 // 背压自然传导到 wire.requests channel，不会丢失已入队的请求。
 func (wire *Wire) Run() {
-	go wire.blackList.clear()
-
 	for r := range wire.requests {
 		// 生成去重 key：infohash:ip:port
 		key := strings.Join([]string{
 			string(r.InfoHash), genAddress(r.IP, r.Port),
 		}, ":")
 
-		// 基本校验：infohash 必须是 20 字节，且不在黑名单
-		if len(r.InfoHash) != 20 || wire.blackList.in(r.IP, r.Port) {
-			if len(r.InfoHash) == 20 {
-				wire.Stats.Blacklisted.Add(1)
-			}
+		// 基本校验：infohash 必须是 20 字节，且该 peer 最近未失败过
+		if len(r.InfoHash) != 20 {
+			continue
+		}
+		peerAddr := genAddress(r.IP, r.Port)
+		if wire.failedPeers.Contains(peerAddr) {
+			wire.Stats.Blacklisted.Add(1)
 			continue
 		}
 
