@@ -41,6 +41,11 @@ if (!string.IsNullOrWhiteSpace(meiliUrl))
 var dedupPath = Path.Combine(builder.Environment.ContentRootPath, "data", "cuckoo.dat");
 var dedup = new CuckooFilter(capacity: 100_000_000, persistPath: dedupPath);
 builder.Services.AddSingleton<IDedupFilter>(dedup);
+
+var rejectedPath = Path.Combine(builder.Environment.ContentRootPath, "data", "rejected.dat");
+var rejectedStore = new RejectedHashStore(persistPath: rejectedPath);
+builder.Services.AddSingleton<IRejectedHashStore>(rejectedStore);
+builder.Services.AddSingleton(rejectedStore); // for direct Save() on shutdown
 builder.Services.AddSingleton<Cherry.Application.Services.PendingRequestTracker>();
 builder.Services.AddScoped<ITorrentRepository, TorrentRepository>();
 builder.Services.AddScoped<SearchService>();
@@ -68,8 +73,9 @@ builder.Services.AddSwaggerGen(options =>
 
 var app = builder.Build();
 
-// Persist CuckooFilter on graceful shutdown
+// Persist CuckooFilter and RejectedHashStore on graceful shutdown
 app.Lifetime.ApplicationStopping.Register(() => dedup.Save());
+app.Lifetime.ApplicationStopping.Register(() => rejectedStore.Save());
 
 // Auto-apply EF Core migrations and ensure pg_trgm extension
 await using (var scope = app.Services.CreateAsyncScope())

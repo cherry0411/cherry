@@ -11,18 +11,19 @@ import (
 )
 
 type Config struct {
-	Role       string
-	InstanceID string
+	Role        string
+	InstanceID  string
 	ListenAddr  string
 	ListenAddrs string
 	EventQueue  int
-	BrokerURL  string
-	Dedupe     DedupeConfig
-	Discovery  DiscoveryConfig
-	Metadata   MetadataConfig
-	Exporter   ExporterConfig
-	AutoTune   bool
-	TargetCPU  float64
+	BrokerURL   string
+	Dedupe      DedupeConfig
+	Discovery   DiscoveryConfig
+	Metadata    MetadataConfig
+	Filter      FilterConfig
+	Exporter    ExporterConfig
+	AutoTune    bool
+	TargetCPU   float64
 }
 
 type DedupeConfig struct {
@@ -46,6 +47,24 @@ type MetadataConfig struct {
 	BlackListSize    int
 	RequestQueueSize int
 	WorkerQueueSize  int
+}
+
+// FilterConfig controls which metadata is silently rejected before export.
+// A threshold of -1 disables the corresponding rule; 0 uses the built-in default.
+type FilterConfig struct {
+	// MaxFileCount rejects any torrent whose file count exceeds this value.
+	// Default: 10 000.
+	MaxFileCount int
+
+	// MaxFileCountNonCN rejects torrents with more files than this threshold
+	// when no Chinese characters appear anywhere in the file paths or name.
+	// Default: 1 000.
+	MaxFileCountNonCN int
+
+	// MaxFileCountNumeric rejects torrents with more files than this threshold
+	// when every filename (extension stripped) is purely numeric.
+	// Default: 100.
+	MaxFileCountNumeric int
 }
 
 type ExporterConfig struct {
@@ -74,14 +93,14 @@ func Load() (Config, error) {
 	instanceID := getenvDefault("CHERRY_PICKER_INSTANCE_ID", defaultInstanceID())
 
 	cfg := Config{
-		Role:       strings.ToLower(getenvDefault("CHERRY_PICKER_ROLE", "combined")),
-		InstanceID: instanceID,
+		Role:        strings.ToLower(getenvDefault("CHERRY_PICKER_ROLE", "combined")),
+		InstanceID:  instanceID,
 		ListenAddr:  getenvDefault("CHERRY_PICKER_LISTEN_ADDR", ":6881"),
 		ListenAddrs: getenvDefault("CHERRY_PICKER_LISTEN_ADDRS", ""),
-		EventQueue: getenvInt("CHERRY_PICKER_EVENT_QUEUE", defaultEventQueue()),
-		BrokerURL:  getenvDefault("CHERRY_PICKER_BROKER_URL", ""),
-		AutoTune:   getenvBool("CHERRY_PICKER_AUTO_TUNE", false),
-		TargetCPU:  float64(getenvInt("CHERRY_PICKER_TARGET_CPU", 80)) / 100.0,
+		EventQueue:  getenvInt("CHERRY_PICKER_EVENT_QUEUE", defaultEventQueue()),
+		BrokerURL:   getenvDefault("CHERRY_PICKER_BROKER_URL", ""),
+		AutoTune:    getenvBool("CHERRY_PICKER_AUTO_TUNE", false),
+		TargetCPU:   float64(getenvInt("CHERRY_PICKER_TARGET_CPU", 80)) / 100.0,
 		Dedupe: DedupeConfig{
 			PeerTTL:     getenvDuration("CHERRY_PICKER_DEDUPE_PEER_TTL", 10*time.Minute),
 			MetadataTTL: getenvDuration("CHERRY_PICKER_DEDUPE_METADATA_TTL", 30*time.Minute),
@@ -101,6 +120,11 @@ func Load() (Config, error) {
 			BlackListSize:    getenvInt("CHERRY_PICKER_METADATA_BLACKLIST", 131072),
 			RequestQueueSize: getenvInt("CHERRY_PICKER_METADATA_REQUEST_QUEUE", defaultMetadataRequestQueue()),
 			WorkerQueueSize:  getenvInt("CHERRY_PICKER_METADATA_WORKERS", defaultMetadataWorkers()),
+		},
+		Filter: FilterConfig{
+			MaxFileCount:        getenvInt("CHERRY_PICKER_FILTER_MAX_FILES", 0),
+			MaxFileCountNonCN:   getenvInt("CHERRY_PICKER_FILTER_MAX_FILES_NON_CN", 0),
+			MaxFileCountNumeric: getenvInt("CHERRY_PICKER_FILTER_MAX_FILES_NUMERIC", 0),
 		},
 		Exporter: ExporterConfig{
 			Kind:          strings.ToLower(getenvDefault("CHERRY_PICKER_EXPORTER", "stdout")),
@@ -131,11 +155,11 @@ func loadFromFile(path string) (Config, error) {
 	}
 
 	cfg := Config{
-		Role:       strings.ToLower(strings.TrimSpace(raw.Role)),
-		InstanceID: strings.TrimSpace(raw.InstanceID),
+		Role:        strings.ToLower(strings.TrimSpace(raw.Role)),
+		InstanceID:  strings.TrimSpace(raw.InstanceID),
 		ListenAddr:  strings.TrimSpace(raw.ListenAddr),
 		ListenAddrs: strings.TrimSpace(raw.ListenAddrs),
-		EventQueue: raw.EventQueue,
+		EventQueue:  raw.EventQueue,
 		Dedupe: DedupeConfig{
 			PeerTTL:     parseDuration(raw.Dedupe.PeerTTL),
 			MetadataTTL: parseDuration(raw.Dedupe.MetadataTTL),
@@ -155,6 +179,11 @@ func loadFromFile(path string) (Config, error) {
 			BlackListSize:    raw.Metadata.BlackListSize,
 			RequestQueueSize: intOrDefault(raw.Metadata.RequestQueueSize, defaultMetadataRequestQueue()),
 			WorkerQueueSize:  intOrDefault(raw.Metadata.WorkerQueueSize, defaultMetadataWorkers()),
+		},
+		Filter: FilterConfig{
+			MaxFileCount:        raw.Filter.MaxFileCount,
+			MaxFileCountNonCN:   raw.Filter.MaxFileCountNonCN,
+			MaxFileCountNumeric: raw.Filter.MaxFileCountNumeric,
 		},
 		Exporter: ExporterConfig{
 			Kind:          strings.ToLower(strings.TrimSpace(raw.Exporter.Kind)),
@@ -216,6 +245,8 @@ func normalize(cfg Config) Config {
 	if cfg.Metadata.WorkerQueueSize <= 0 {
 		cfg.Metadata.WorkerQueueSize = defaultMetadataWorkers()
 	}
+	normalizeFilterConfig(&cfg.Filter)
+
 	if cfg.Exporter.Kind == "" {
 		cfg.Exporter.Kind = "stdout"
 	}
@@ -255,15 +286,22 @@ func normalize(cfg Config) Config {
 }
 
 type fileConfig struct {
-	Role       string              `json:"role"`
-	InstanceID string              `json:"instance_id"`
+	Role        string              `json:"role"`
+	InstanceID  string              `json:"instance_id"`
 	ListenAddr  string              `json:"listen_addr"`
 	ListenAddrs string              `json:"listen_addrs"`
-	EventQueue int                 `json:"event_queue"`
-	Dedupe     fileDedupeConfig    `json:"dedupe"`
-	Discovery  fileDiscoveryConfig `json:"discovery"`
-	Metadata   fileMetadataConfig  `json:"metadata"`
-	Exporter   fileExporterConfig  `json:"exporter"`
+	EventQueue  int                 `json:"event_queue"`
+	Dedupe      fileDedupeConfig    `json:"dedupe"`
+	Discovery   fileDiscoveryConfig `json:"discovery"`
+	Metadata    fileMetadataConfig  `json:"metadata"`
+	Filter      fileFilterConfig    `json:"filter"`
+	Exporter    fileExporterConfig  `json:"exporter"`
+}
+
+type fileFilterConfig struct {
+	MaxFileCount        int `json:"max_file_count"`
+	MaxFileCountNonCN   int `json:"max_file_count_non_cn"`
+	MaxFileCountNumeric int `json:"max_file_count_numeric"`
 }
 
 type fileDedupeConfig struct {
@@ -300,6 +338,20 @@ type fileExporterConfig struct {
 	RetryBackoff  string `json:"retry_backoff"`
 	WalDir        string `json:"wal_dir"`
 	APIKey        string `json:"api_key"`
+}
+
+// normalizeFilterConfig applies built-in defaults for any filter threshold that
+// is zero (unset). A negative value disables the corresponding rule.
+func normalizeFilterConfig(f *FilterConfig) {
+	if f.MaxFileCount == 0 {
+		f.MaxFileCount = 10_000
+	}
+	if f.MaxFileCountNonCN == 0 {
+		f.MaxFileCountNonCN = 1_000
+	}
+	if f.MaxFileCountNumeric == 0 {
+		f.MaxFileCountNumeric = 100
+	}
 }
 
 func intOrDefault(value, fallback int) int {

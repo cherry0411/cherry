@@ -66,6 +66,15 @@ public static class TorrentEndpoints
             .Produces<List<string>>(200)
             .Produces(400);
 
+        group.MapPost("/reject", RejectHashesAsync)
+            .WithName("RejectHashes")
+            .WithSummary("标记infohash为已过滤")
+            .WithDescription("POST [\"a1\",\"b2\",...] — marks hashes as rejected by crawler filter rules. " +
+                             "Recorded in a dedicated filter so future /check calls return them as already processed, " +
+                             "preventing unnecessary re-crawling.")
+            .Produces(200)
+            .Produces(400);
+
         group.MapGet("/recent", GetRecentAsync)
             .WithName("GetRecentTorrents")
             .WithSummary("获取最新种子")
@@ -381,6 +390,23 @@ public static class TorrentEndpoints
 
         var existing = await searchService.CheckExistsAsync(candidates, ct);
         return Results.Ok(existing);
+    }
+
+    private static IResult RejectHashesAsync(
+        [FromBody] List<string>? hashes,
+        IRejectedHashStore rejectedStore)
+    {
+        if (hashes is null || hashes.Count == 0)
+            return Results.Ok();
+
+        foreach (var h in hashes)
+        {
+            if (h is null) continue;
+            var clean = h.ToLowerInvariant();
+            if (clean.Length == 40 && clean.All(c => c is >= 'a' and <= 'f' or >= '0' and <= '9'))
+                rejectedStore.Add(clean);
+        }
+        return Results.Ok();
     }
 
     private static async Task<IResult> GetRecentAsync(

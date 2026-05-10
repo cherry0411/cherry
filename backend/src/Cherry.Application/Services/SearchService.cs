@@ -7,11 +7,13 @@ public class SearchService
 {
     private readonly ITorrentRepository _repo;
     private readonly IDedupFilter _dedup;
+    private readonly IRejectedHashStore _rejected;
 
-    public SearchService(ITorrentRepository repo, IDedupFilter dedup)
+    public SearchService(ITorrentRepository repo, IDedupFilter dedup, IRejectedHashStore rejected)
     {
         _repo = repo;
         _dedup = dedup;
+        _rejected = rejected;
     }
 
     public async Task<SearchResponse> SearchAsync(SearchRequest request, CancellationToken ct = default)
@@ -39,12 +41,32 @@ public class SearchService
 
     public async Task<List<string>> CheckExistsAsync(List<string> hashes, CancellationToken ct)
     {
-        // A1: Use CuckooFilter as a fast pre-filter.
-        // Only hashes that pass the probabilistic check are confirmed against the DB.
-        // False-positive rate is ~0.1% — negligible for the crawler's dedup use case.
-        var candidates = hashes.Where(h => _dedup.MightContain(h)).ToList();
-        if (candidates.Count == 0) return [];
-        return await _repo.CheckExistsAsync(candidates, ct);
+        var result = new HashSet<string>(hashes.Count, StringComparer.Ordinal);
+
+        // Fast-path: hashes in the rejected store are "already processed" —
+        // return them immediately without a DB round-trip.
+        var remaining = new List<string>(hashes.Count);
+        foreach (var h in hashes)
+        {
+            if (_rejected.Contains(h))
+                result.Add(h);
+            else
+                remaining.Add(h);
+        }
+
+        // DB check for the rest (cuckoo pre-filter eliminates most misses).
+        if (remaining.Count > 0)
+        {
+            var candidates = remaining.Where(h => _dedup.MightContain(h)).ToList();
+            if (candidates.Count > 0)
+            {
+                var dbFound = await _repo.CheckExistsAsync(candidates, ct);
+                foreach (var h in dbFound)
+                    result.Add(h);
+            }
+        }
+
+        return [.. result];
     }
 
     public async Task<List<TorrentDto>> GetRecentAsync(CancellationToken ct = default)

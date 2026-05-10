@@ -21,8 +21,8 @@ import (
 	"path/filepath"
 	"runtime"
 	"runtime/debug"
-runtimemetrics "runtime/metrics"
-"slices"
+	runtimemetrics "runtime/metrics"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -34,6 +34,7 @@ runtimemetrics "runtime/metrics"
 	"cherry-picker/internal/config"
 	dht "cherry-picker/internal/dht"
 	"cherry-picker/internal/export"
+	"cherry-picker/internal/filter"
 	"cherry-picker/internal/pipeline"
 
 	"golang.org/x/text/encoding/simplifiedchinese"
@@ -70,6 +71,11 @@ type Application struct {
 	// 自适应调优：内存压力高时暂停 metadata 请求入队
 	metaPaused atomic.Bool
 
+	// filterChain 在 metadata 上报前执行规则过滤。
+	filterChain *filter.Chain
+	// rejectQueue 将被过滤的 hash 异步批量上报给后端 cuckoo filter。
+	rejectQueue chan string
+
 	// API 客户端（不再是全局变量）
 	apiClient *http.Client
 }
@@ -85,6 +91,7 @@ type runtimeStats struct {
 	metadataEventsSent      atomic.Uint64
 	peerEventsDeduped       atomic.Uint64
 	metadataEventsDeduped   atomic.Uint64
+	metadataEventsFiltered  atomic.Uint64
 	metadataRequestsQueued  atomic.Uint64
 	metadataRequestsDeduped atomic.Uint64
 	checkBatchesQueued      atomic.Uint64
@@ -107,6 +114,7 @@ type statsSnapshot struct {
 	metadataEventsSent      uint64
 	metadataEventsDropped   uint64
 	metadataEventsDeduped   uint64
+	metadataEventsFiltered  uint64
 	dhtPacketsReceived      uint64
 	dhtPacketsEnqueued      uint64
 	dhtPacketsDropped       uint64
@@ -154,8 +162,10 @@ func New(cfg config.Config, logger *log.Logger) *Application {
 		metadataResultSeen:  cache.NewLRU(lruCaps.metadataResultSeen),
 		remoteKnown:         cache.NewLRU(lruCaps.remoteKnown),
 
-		peerCounts: make(map[string]int, 4096),
-		apiClient:  &http.Client{Timeout: 10 * time.Second},
+		peerCounts:  make(map[string]int, 4096),
+		filterChain: buildFilterChain(cfg.Filter),
+		rejectQueue: make(chan string, 10_000),
+		apiClient:   &http.Client{Timeout: 10 * time.Second},
 	}
 }
 
@@ -228,6 +238,7 @@ func (a *Application) Run(ctx context.Context) error {
 	// 后台 goroutines
 	go a.emitStats(ctx, events, stats)
 	go a.flushPeerCountsLoop(ctx)
+	go a.flushRejectLoop(ctx)
 	go a.pollPendingRequests(ctx)
 	if a.cfg.AutoTune {
 		go a.autoTuneLoop(ctx)
@@ -310,7 +321,7 @@ func (a *Application) runCheckLoop(ctx context.Context, checkQueue <-chan string
 
 // flushPeerCountsLoop flushes peer counts every 20s or when count exceeds threshold.
 func (a *Application) flushPeerCountsLoop(ctx context.Context) {
-ticker := time.NewTicker(20 * time.Second)
+	ticker := time.NewTicker(20 * time.Second)
 	defer ticker.Stop()
 	for {
 		select {
@@ -556,7 +567,7 @@ func (a *Application) submitInfohashEvent(events chan<- pipeline.Event, ihHex, i
 	}
 	a.submitEvent(events, pipeline.Event{
 		Type:       pipeline.EventPeerDiscovered,
-Timestamp:  now,
+		Timestamp:  now,
 		InstanceID: a.cfg.InstanceID,
 		Source:     source,
 		InfoHash:   ihHex,
@@ -577,7 +588,7 @@ func (a *Application) submitPeerEvent(events chan<- pipeline.Event, ihHex, ip st
 	}
 	a.submitEvent(events, pipeline.Event{
 		Type:       pipeline.EventPeerDiscovered,
-Timestamp:  now,
+		Timestamp:  now,
 		InstanceID: a.cfg.InstanceID,
 		Source:     source,
 		InfoHash:   ihHex,
@@ -643,8 +654,8 @@ func (a *Application) consumeMetadata(ctx context.Context, downloader *dht.Wire,
 			ok, fail, okCache = 0, 0, 0
 		case response := <-responses:
 			ihHex := hex.EncodeToString(response.InfoHash)
-// G7: dedupe by infohash only; one result per hash is sufficient.
-if !a.metadataResultSeen.Set(ihHex) {
+			// G7: dedupe by infohash only; one result per hash is sufficient.
+			if !a.metadataResultSeen.Set(ihHex) {
 				stats.metadataEventsDeduped.Add(1)
 				fail++
 				continue
@@ -653,6 +664,20 @@ if !a.metadataResultSeen.Set(ihHex) {
 			if err != nil {
 				stats.metadataEventsDeduped.Add(1)
 				fail++
+				continue
+			}
+			// Apply content filter rules before reporting to the backend.
+			if reason := a.filterChain.Apply(metadata); reason != filter.ReasonPass {
+				stats.metadataEventsFiltered.Add(1)
+				// Prevent re-requesting this hash within the current session.
+				a.remoteKnown.Set(ihHex)
+				// Asynchronously notify the backend so it can persist the
+				// rejection in the cuckoo filter, preventing re-requests across
+				// process restarts. Drop silently when the channel is full.
+				select {
+				case a.rejectQueue <- ihHex:
+				default:
+				}
 				continue
 			}
 			ok++
@@ -698,6 +723,7 @@ func (a *Application) emitStats(ctx context.Context, events chan<- pipeline.Even
 				metadataEventsSent:      stats.metadataEventsSent.Load(),
 				metadataEventsDropped:   stats.metadataEventsDropped.Load(),
 				metadataEventsDeduped:   stats.metadataEventsDeduped.Load(),
+				metadataEventsFiltered:  stats.metadataEventsFiltered.Load(),
 				dhtPacketsReceived:      packetStats.Received,
 				dhtPacketsEnqueued:      packetStats.Enqueued,
 				dhtPacketsDropped:       packetStats.Dropped,
@@ -729,6 +755,7 @@ func (a *Application) emitStats(ctx context.Context, events chan<- pipeline.Even
 					"metadata_events_sent":      current.metadataEventsSent,
 					"metadata_events_dropped":   current.metadataEventsDropped,
 					"metadata_events_deduped":   current.metadataEventsDeduped,
+					"metadata_events_filtered":  current.metadataEventsFiltered,
 					"dht_packets_received":      current.dhtPacketsReceived,
 					"dht_packets_enqueued":      current.dhtPacketsEnqueued,
 					"dht_packets_dropped":       current.dhtPacketsDropped,
@@ -742,7 +769,7 @@ func (a *Application) emitStats(ctx context.Context, events chan<- pipeline.Even
 
 func (a *Application) logRuntimeDelta(current, previous statsSnapshot) {
 	a.logger.Printf(
-		"runtime 30s: dht_recv=%d handled=%d dropped=%d decode_err=%d peer_sent=%d peer_drop=%d peer_dedup=%d meta_req=%d meta_req_dedup=%d meta_sent=%d meta_drop=%d meta_dedup=%d check_drop=%d paused=%v",
+		"runtime 30s: dht_recv=%d handled=%d dropped=%d decode_err=%d peer_sent=%d peer_drop=%d peer_dedup=%d meta_req=%d meta_req_dedup=%d meta_sent=%d meta_drop=%d meta_dedup=%d meta_filtered=%d check_drop=%d paused=%v",
 		current.dhtPacketsReceived-previous.dhtPacketsReceived,
 		current.dhtPacketsHandled-previous.dhtPacketsHandled,
 		current.dhtPacketsDropped-previous.dhtPacketsDropped,
@@ -755,6 +782,7 @@ func (a *Application) logRuntimeDelta(current, previous statsSnapshot) {
 		current.metadataEventsSent-previous.metadataEventsSent,
 		current.metadataEventsDropped-previous.metadataEventsDropped,
 		current.metadataEventsDeduped-previous.metadataEventsDeduped,
+		current.metadataEventsFiltered-previous.metadataEventsFiltered,
 		current.checkBatchesDropped-previous.checkBatchesDropped,
 		a.metaPaused.Load(),
 	)
@@ -793,6 +821,81 @@ func (a *Application) submitEvent(events chan<- pipeline.Event, event pipeline.E
 	default:
 		onDrop(1)
 	}
+}
+
+// --- 过滤与拒绝上报 ---
+
+// flushRejectLoop 批量将被过滤的 hash 上报给后端 /api/v1/torrents/reject，
+// 让后端 cuckoo filter 记住这些 hash，避免跨进程重启后重复下载。
+func (a *Application) flushRejectLoop(ctx context.Context) {
+	const batchSize = 512
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	buf := make([]string, 0, batchSize)
+
+	flush := func() {
+		if len(buf) == 0 {
+			return
+		}
+		a.reportRejected(buf)
+		buf = buf[:0]
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			flush()
+			return
+		case h := <-a.rejectQueue:
+			buf = append(buf, h)
+			if len(buf) >= batchSize {
+				flush()
+			}
+		case <-ticker.C:
+			flush()
+		}
+	}
+}
+
+// reportRejected POSTs a batch of filtered infohashes to the backend so they
+// are added to the persistent cuckoo filter.  Only runs when the exporter is
+// HTTP (i.e. there is an actual backend to talk to).
+func (a *Application) reportRejected(hashes []string) {
+	if len(hashes) == 0 || a.cfg.Exporter.Kind != "http" {
+		return
+	}
+	body, _ := json.Marshal(hashes)
+	req, err := http.NewRequest(http.MethodPost,
+		a.baseURL()+"/api/v1/torrents/reject",
+		bytes.NewReader(body))
+	if err != nil {
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if a.cfg.Exporter.APIKey != "" {
+		req.Header.Set("X-API-Key", a.cfg.Exporter.APIKey)
+	}
+	resp, err := a.apiClient.Do(req)
+	if err != nil {
+		return
+	}
+	resp.Body.Close()
+}
+
+// buildFilterChain constructs the ordered filter chain from configuration.
+// A threshold ≤ 0 disables the corresponding rule.
+func buildFilterChain(cfg config.FilterConfig) *filter.Chain {
+	c := filter.NewChain()
+	if cfg.MaxFileCount > 0 {
+		c.Add("too_many_files", filter.TooManyFiles(cfg.MaxFileCount))
+	}
+	if cfg.MaxFileCountNonCN > 0 {
+		c.Add("non_chinese_files", filter.NonChineseHighFileCount(cfg.MaxFileCountNonCN))
+	}
+	if cfg.MaxFileCountNumeric > 0 {
+		c.Add("numeric_file_names", filter.NumericOnlyFileNames(cfg.MaxFileCountNumeric))
+	}
+	return c
 }
 
 // --- 辅助函数 ---
@@ -886,32 +989,32 @@ func (a *Application) checkWorkerCount() int {
 }
 
 func (a *Application) checkBatchExists(hashes []string) {
-if len(hashes) == 0 {
-return
-}
-// POST to avoid URL-length limits and URL-encoding overhead.
-body, _ := json.Marshal(hashes)
-req, err := http.NewRequest(http.MethodPost,
-a.baseURL()+"/api/v1/torrents/check",
-bytes.NewReader(body))
-if err != nil {
-return
-}
-req.Header.Set("Content-Type", "application/json")
-if a.cfg.Exporter.APIKey != "" {
-req.Header.Set("X-API-Key", a.cfg.Exporter.APIKey)
-}
-resp, err := a.apiClient.Do(req)
-if err != nil {
-return
-}
-defer resp.Body.Close()
-var found []string
-if json.NewDecoder(resp.Body).Decode(&found) == nil {
-for _, h := range found {
-a.remoteKnown.Set(h)
-}
-}
+	if len(hashes) == 0 {
+		return
+	}
+	// POST to avoid URL-length limits and URL-encoding overhead.
+	body, _ := json.Marshal(hashes)
+	req, err := http.NewRequest(http.MethodPost,
+		a.baseURL()+"/api/v1/torrents/check",
+		bytes.NewReader(body))
+	if err != nil {
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if a.cfg.Exporter.APIKey != "" {
+		req.Header.Set("X-API-Key", a.cfg.Exporter.APIKey)
+	}
+	resp, err := a.apiClient.Do(req)
+	if err != nil {
+		return
+	}
+	defer resp.Body.Close()
+	var found []string
+	if json.NewDecoder(resp.Body).Decode(&found) == nil {
+		for _, h := range found {
+			a.remoteKnown.Set(h)
+		}
+	}
 }
 
 // --- metadata 解析（与原 app.go 完全一致）---
