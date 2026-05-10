@@ -33,27 +33,12 @@ func handleResponseCrawl(dht *DHT, addr *net.UDPAddr, response map[string]interf
 	}
 	r := response["r"].(map[string]interface{})
 
-	id, ok := r["id"].(string)
-	if !ok || len(id) != 20 {
-		return false
-	}
-
+	// 快速路径：路由表已满时，只处理包含 values 的 get_peers 响应。
+	// find_node 响应（只有 nodes、没有 values）占全部响应的 ~80-90%，
+	// 当表满时它们只会白白消耗 CPU（解析节点 → Insert 立即失败）。
+	// 跳过它们可节省：bencode node 解析 × 8 + newNode 分配 × 9 + Insert 写锁竞争。
 	tableFull := atomic.LoadInt64(&dht.routingTable.nodeCount) >= int64(dht.MaxNodes)
 
-	// 解析 compact node 信息，路由表未满时将新发现的节点插入。
-	// 路由表已满时完全跳过解析和插入：避免 newNode 分配 + 写锁竞争。
-	if !tableFull {
-		if nodesStr, ok := r["nodes"].(string); ok && len(nodesStr) > 0 && len(nodesStr)%26 == 0 {
-			for i := 0; i < len(nodesStr)/26; i++ {
-				no, err := newNodeFromCompactInfo(nodesStr[i*26:(i+1)*26], dht.Network)
-				if err == nil {
-					dht.routingTable.Insert(no)
-				}
-			}
-		}
-	}
-
-	// 处理 get_peers 响应中的 values（peer 列表）。
 	if dht.OnGetPeersResponse != nil {
 		if values, ok := r["values"].([]interface{}); ok {
 			t := response["t"].(string)
@@ -69,14 +54,32 @@ func handleResponseCrawl(dht *DHT, addr *net.UDPAddr, response map[string]interf
 					}
 				}
 			}
+			return true
 		}
 	}
 
-	// 路由表未满时将响应方插入路由表
-	if !tableFull {
-		if no, err := newNodeFromAddr(id, addr); err == nil {
-			dht.routingTable.Insert(no)
+	// 路由表已满且没有 values → 这个响应没有价值，直接跳过全部处理。
+	if tableFull {
+		return true
+	}
+
+	// 路由表未满：解析 compact nodes 并插入路由表以填充表。
+	id, ok := r["id"].(string)
+	if !ok || len(id) != 20 {
+		return false
+	}
+
+	if nodesStr, ok := r["nodes"].(string); ok && len(nodesStr) > 0 && len(nodesStr)%26 == 0 {
+		for i := 0; i < len(nodesStr)/26; i++ {
+			no, err := newNodeFromCompactInfo(nodesStr[i*26:(i+1)*26], dht.Network)
+			if err == nil {
+				dht.routingTable.Insert(no)
+			}
 		}
+	}
+
+	if no, err := newNodeFromAddr(id, addr); err == nil {
+		dht.routingTable.Insert(no)
 	}
 	return true
 }

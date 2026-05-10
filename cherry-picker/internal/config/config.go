@@ -370,18 +370,51 @@ func cpuScale() int {
 }
 
 func defaultEventQueue() int {
-	value := cpuScale() * 4096
-	if value < 16384 {
-		return 16384
+	value := cpuScale() * 2048
+	if value < 4096 {
+		return 4096
 	}
-	if value > 65536 {
-		return 65536
+	if value > 16384 {
+		return 16384
 	}
 	return value
 }
 
 func defaultPacketWorkers() int {
-	value := cpuScale() * 64
+	value := cpuScale() * 4
+	if value < 4 {
+		return 4
+	}
+	if value > 32 {
+		return 32
+	}
+	return value
+}
+
+func defaultPacketJobs() int {
+	value := defaultPacketWorkers() * 512
+	if value < 4096 {
+		return 4096
+	}
+	if value > 16384 {
+		return 16384
+	}
+	return value
+}
+
+func defaultMaxNodes() int {
+	value := cpuScale() * 2500
+	if value < 5000 {
+		return 5000
+	}
+	if value > 20000 {
+		return 20000
+	}
+	return value
+}
+
+func defaultRefreshNodes() int {
+	value := cpuScale() * 128
 	if value < 256 {
 		return 256
 	}
@@ -391,57 +424,24 @@ func defaultPacketWorkers() int {
 	return value
 }
 
-func defaultPacketJobs() int {
-	value := defaultPacketWorkers() * 128
-	if value < 32768 {
-		return 32768
-	}
-	if value > 131072 {
-		return 131072
-	}
-	return value
-}
-
-func defaultMaxNodes() int {
-	value := cpuScale() * 12000
-	if value < 50000 {
-		return 50000
-	}
-	if value > 150000 {
-		return 150000
-	}
-	return value
-}
-
-func defaultRefreshNodes() int {
-	value := cpuScale() * 256
-	if value < 1024 {
-		return 1024
-	}
-	if value > 8192 {
-		return 8192
-	}
-	return value
-}
-
 func defaultMetadataWorkers() int {
 	value := cpuScale() * 128
-	if value < 512 {
-		return 512
+	if value < 256 {
+		return 256
 	}
-	if value > 4096 {
-		return 4096
+	if value > 1024 {
+		return 1024
 	}
 	return value
 }
 
 func defaultMetadataRequestQueue() int {
-	value := defaultMetadataWorkers() * 64
-	if value < 16384 {
-		return 16384
+	value := defaultMetadataWorkers() * 32
+	if value < 8192 {
+		return 8192
 	}
-	if value > 65536 {
-		return 65536
+	if value > 32768 {
+		return 32768
 	}
 	return value
 }

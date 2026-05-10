@@ -113,13 +113,13 @@ func NewCrawlConfig() *Config {
 	config := NewStandardConfig()
 	config.NodeExpriedAfter = 0
 	config.KBucketExpiredAfter = 0
-	config.CheckKBucketPeriod = time.Second // 每秒刷新（原 5s）
+	config.CheckKBucketPeriod = 2 * time.Second // 每 2 秒刷新一次路由表
 	config.KBucketSize = math.MaxInt32
 	config.Mode = CrawlMode
-	config.RefreshNodeNum = 2048   // 每次刷新联系的节点数（原 256）
-	config.MaxNodes = 50_000       // 路由表上限（原 5000）
-	config.PacketJobLimit = 65_536 // 数据包 channel 容量（原 1024）
-	config.PacketWorkerLimit = 512 // 包处理 goroutine 数（原 256）
+	config.RefreshNodeNum = 256    // 每次刷新联系的节点数
+	config.MaxNodes = 5_000        // 路由表上限（节省内存）
+	config.PacketJobLimit = 4_096  // 数据包 channel 容量
+	config.PacketWorkerLimit = 0   // 0 = 自动检测（NumCPU × 4）
 	// 更多 bootstrap 节点，加快初始入网
 	config.PrimeNodes = append(config.PrimeNodes,
 		"router.bitcomet.com:6881",
@@ -252,10 +252,11 @@ func (dht *DHT) init() {
 func (dht *DHT) startPacketWorkers() {
 	workers := dht.PacketWorkerLimit
 	if dht.IsCrawlMode() && workers <= 0 {
-		// 爬虫模式默认值：CPU×2，未显式配置时才生效
-		workers = runtime.NumCPU() * 2
-		if workers < 8 {
-			workers = 8
+		// 爬虫模式：每核 4 个 worker 即可饱和处理。
+		// 超过此数只增加调度开销和内存，不增加吞吐。
+		workers = runtime.NumCPU() * 4
+		if workers < 4 {
+			workers = 4
 		}
 	}
 	if workers <= 0 {

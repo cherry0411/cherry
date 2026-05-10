@@ -13,11 +13,9 @@ import (
 	"bytes"
 	"crypto/sha1"
 	"encoding/binary"
-	"encoding/hex"
 	"errors"
 	"io"
 	"net"
-	"net/http"
 	"strings"
 	"time"
 
@@ -44,14 +42,6 @@ const (
 	HANDSHAKE = 0
 )
 
-const (
-	httpCacheURL     = "https://itorrents.org/torrent/"
-	httpCacheTimeout = 2 * time.Second
-	httpCacheMaxBody = 2 * 1024 * 1024 // 2MB 上限，防止异常大响应
-)
-
-var httpCacheClient = &http.Client{Timeout: httpCacheTimeout}
-
 var handshakePrefix = []byte{
 	19, 66, 105, 116, 84, 111, 114, 114, 101, 110, 116, 32, 112, 114,
 	111, 116, 111, 99, 111, 108, 0, 0, 0, 0, 0, 16, 0, 1,
@@ -59,7 +49,7 @@ var handshakePrefix = []byte{
 
 // read 从 conn 读取 size 字节写入 data。
 func read(conn *net.TCPConn, size int, data *bytes.Buffer) error {
-	conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
 
 	n, err := io.CopyN(data, conn, int64(size))
 	if err != nil || n != int64(size) {
@@ -92,7 +82,7 @@ func sendMessage(conn *net.TCPConn, data []byte) error {
 	buffer := bytes.NewBuffer(nil)
 	binary.Write(buffer, binary.BigEndian, length)
 
-	conn.SetWriteDeadline(time.Now().Add(time.Second * 3))
+	conn.SetWriteDeadline(time.Now().Add(time.Second * 2))
 	_, err := conn.Write(append(buffer.Bytes(), data...))
 	return err
 }
@@ -172,7 +162,6 @@ type Request struct {
 type Response struct {
 	Request
 	MetadataInfo []byte
-	FromCache    bool // true 表示通过 HTTP 缓存获取，false 表示 BEP-9 wire 协议
 }
 
 // Wire 表示 peer wire 协议下载器。
@@ -278,53 +267,11 @@ func extractInfoBytes(torrentData []byte) ([]byte, error) {
 	return torrentData[start : start+endIdx], nil
 }
 
-// tryHTTPCache 尝试从 itorrents.org 缓存服务获取 .torrent 文件。
-// 成功则将解析结果发送到 responses channel 并返回 true，否则返回 false。
-func (wire *Wire) tryHTTPCache(r Request) bool {
-	url := httpCacheURL + strings.ToUpper(hex.EncodeToString(r.InfoHash)) + ".torrent"
-
-	resp, err := httpCacheClient.Get(url)
-	if err != nil {
-		return false
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return false
-	}
-
-	body, err := io.ReadAll(io.LimitReader(resp.Body, httpCacheMaxBody))
-	if err != nil || len(body) < 20 {
-		return false
-	}
-
-	infoBytes, err := extractInfoBytes(body)
-	if err != nil {
-		return false
-	}
-
-	hash := sha1.Sum(infoBytes)
-	if !bytes.Equal(hash[:], r.InfoHash) {
-		return false
-	}
-
-	wire.responses <- Response{
-		Request:      r,
-		MetadataInfo: infoBytes,
-		FromCache:    true,
-	}
-	return true
-}
-
 // fetchMetadata 连接 peer，通过 extension protocol 下载 info dict。
 // 完成后（成功或失败）都会从 queue 中删除 key，避免泄漏。
 func (wire *Wire) fetchMetadata(r Request, key string) {
 	// 请求完成后释放 inflight 去重键，允许同一 peer 在后续重新尝试。
 	defer wire.queue.Delete(key)
-
-	// 先尝试 HTTP 缓存（通常 <500ms），成功则跳过 BEP-9 wire 协议
-	if wire.tryHTTPCache(r) {
-		return
-	}
 
 	var (
 		length       int
@@ -343,7 +290,7 @@ func (wire *Wire) fetchMetadata(r Request, key string) {
 	infoHash := r.InfoHash
 	address := genAddress(r.IP, r.Port)
 
-	dial, err := net.DialTimeout("tcp", address, 1500*time.Millisecond)
+	dial, err := net.DialTimeout("tcp", address, time.Second)
 	if err != nil {
 		wire.blackList.insert(r.IP, r.Port)
 		return

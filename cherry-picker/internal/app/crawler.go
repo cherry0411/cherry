@@ -182,8 +182,8 @@ func (a *Application) Run(ctx context.Context) error {
 
 	stats := &runtimeStats{}
 
-	// checkQueue：批量向 API 检查 hash 是否已存在，容量从 4096 增大到 100000
-	checkQueue := make(chan string, 100_000)
+	// checkQueue：批量向 API 检查 hash 是否已存在
+	checkQueue := make(chan string, 16_384)
 	go a.runCheckLoop(ctx, checkQueue, stats)
 
 	// peer wire metadata 下载器
@@ -243,7 +243,7 @@ func (a *Application) Run(ctx context.Context) error {
 	if a.cfg.AutoTune {
 		go a.autoTuneLoop(ctx)
 	}
-	debug.SetGCPercent(200)
+	debug.SetGCPercent(100)
 
 	a.logger.Printf("started: instance=%s listen=%v meta_workers=%d nodes_per_dht=%d dht_count=%d",
 		a.cfg.InstanceID, addrs,
@@ -480,16 +480,16 @@ func newLRUCaps(cfg config.Config) lruCapConfig {
 		cpuScale = 1
 	}
 
-	peerCap := clampInt(cpuScale*20_000, 80_000, 200_000)
-	infohashCap := clampInt(cpuScale*24_000, 100_000, 240_000)
-	metadataRequestCap := clampInt(cpuScale*36_000, 150_000, 320_000)
-	metadataResultCap := clampInt(cpuScale*28_000, 120_000, 240_000)
-	remoteKnownCap := clampInt(cpuScale*36_000, 150_000, 320_000)
+	peerCap := clampInt(cpuScale*10_000, 20_000, 80_000)
+	infohashCap := clampInt(cpuScale*12_000, 24_000, 80_000)
+	metadataRequestCap := clampInt(cpuScale*16_000, 32_000, 120_000)
+	metadataResultCap := clampInt(cpuScale*12_000, 24_000, 80_000)
+	remoteKnownCap := clampInt(cpuScale*16_000, 32_000, 120_000)
 
 	switch cfg.Role {
 	case "discovery":
-		metadataRequestCap = 64_000
-		metadataResultCap = 64_000
+		metadataRequestCap = 32_000
+		metadataResultCap = 32_000
 	case "metadata":
 		peerCap /= 2
 		infohashCap /= 2
@@ -511,14 +511,14 @@ func (a *Application) autoTuneThresholds() (pauseThreshold uint64, resumeThresho
 		return pauseThreshold, resumeThreshold
 	}
 
-	pauseThreshold = 768 * 1024 * 1024
+	pauseThreshold = 512 * 1024 * 1024
 	if a.cfg.Role != "discovery" {
-		pauseThreshold = 1024 * 1024 * 1024
+		pauseThreshold = 768 * 1024 * 1024
 	}
-	pauseThreshold += uint64(maxInt(a.cfg.EventQueue-16_384, 0)) * 1024
-	pauseThreshold += uint64(maxInt(a.cfg.Metadata.RequestQueueSize-16_384, 0)) * 256
+	pauseThreshold += uint64(maxInt(a.cfg.EventQueue-4_096, 0)) * 1024
+	pauseThreshold += uint64(maxInt(a.cfg.Metadata.RequestQueueSize-8_192, 0)) * 256
 	pauseThreshold += uint64(maxInt(a.cfg.Metadata.WorkerQueueSize-256, 0)) * 512 * 1024
-	pauseThreshold = clampUint64(pauseThreshold, 768*1024*1024, 3*1024*1024*1024)
+	pauseThreshold = clampUint64(pauseThreshold, 512*1024*1024, 2*1024*1024*1024)
 
 	resumeThreshold = pauseThreshold * 70 / 100
 	resumeThreshold = clampUint64(resumeThreshold, 512*1024*1024, pauseThreshold-128*1024*1024)
@@ -641,7 +641,7 @@ func (a *Application) incPeerCount(ihHex string) {
 
 func (a *Application) consumeMetadata(ctx context.Context, downloader *dht.Wire, events chan<- pipeline.Event, stats *runtimeStats) {
 	responses := downloader.Response()
-	var ok, fail, okCache uint64
+	var ok, fail uint64
 	logTicker := time.NewTicker(30 * time.Second)
 	defer logTicker.Stop()
 
@@ -650,8 +650,8 @@ func (a *Application) consumeMetadata(ctx context.Context, downloader *dht.Wire,
 		case <-ctx.Done():
 			return
 		case <-logTicker.C:
-			a.logger.Printf("metadata download: ok=%d (cache=%d) fail=%d (30s)", ok, okCache, fail)
-			ok, fail, okCache = 0, 0, 0
+			a.logger.Printf("metadata download: ok=%d fail=%d (30s)", ok, fail)
+			ok, fail = 0, 0
 		case response := <-responses:
 			ihHex := hex.EncodeToString(response.InfoHash)
 			// G7: dedupe by infohash only; one result per hash is sufficient.
@@ -681,9 +681,6 @@ func (a *Application) consumeMetadata(ctx context.Context, downloader *dht.Wire,
 				continue
 			}
 			ok++
-			if response.FromCache {
-				okCache++
-			}
 			a.submitEvent(events, pipeline.Event{
 				Type:       pipeline.EventMetadataFetched,
 				Timestamp:  time.Now().UTC(),
