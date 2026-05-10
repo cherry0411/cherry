@@ -339,6 +339,10 @@ type routingTable struct {
 	dht            *DHT
 	clearQueue     *syncedList
 
+	// nodeCount 无锁近似节点计数，供爬虫模式快速路径判断路由表是否已满。
+	// 使用 atomic.Int64 避免获取写锁。
+	nodeCount int64
+
 	// 爬虫模式预缓存：K 个邻居节点的 compact node info 拼接字符串，每秒刷新一次。
 	// 热路径直接原子读取，替代每请求 O(n×logK) 路由表扫描。
 	cachedNeighborNodes atomic.Pointer[string]
@@ -365,6 +369,11 @@ func newRoutingTable(k int, dht *DHT) *routingTable {
 // Insert adds a node to routing table. It returns whether the node is new
 // in the routingtable.
 func (rt *routingTable) Insert(nd *node) bool {
+	// 快速路径：原子检查节点计数，表满时直接返回不获取写锁。
+	if atomic.LoadInt64(&rt.nodeCount) >= int64(rt.dht.MaxNodes) {
+		return false
+	}
+
 	rt.Lock()
 	defer rt.Unlock()
 
@@ -393,6 +402,9 @@ func (rt *routingTable) Insert(nd *node) bool {
 
 			rt.cachedNodes.Set(nd.addr.String(), nd)
 			rt.cachedKBuckets.Push(bucket.prefix.String(), bucket)
+			if isNew {
+				atomic.AddInt64(&rt.nodeCount, 1)
+			}
 
 			return isNew
 		} else if root.KBucket().prefix.Compare(nd.id, prefixLen-1) == 0 {
@@ -539,6 +551,7 @@ func (rt *routingTable) Remove(id *bitmap) {
 		bucket.Replace(nd)
 		rt.cachedNodes.Delete(nd.addr.String())
 		rt.cachedKBuckets.Push(bucket.prefix.String(), bucket)
+		atomic.AddInt64(&rt.nodeCount, -1)
 	}
 }
 

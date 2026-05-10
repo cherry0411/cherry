@@ -196,54 +196,53 @@ func Decode(data []byte) (result interface{}, err error) {
 
 // EncodeString encodes a string value.
 func EncodeString(data string) string {
-	return strings.Join([]string{strconv.Itoa(len(data)), data}, ":")
+	return strconv.Itoa(len(data)) + ":" + data
 }
 
 // EncodeInt encodes a int value.
 func EncodeInt(data int) string {
-	return strings.Join([]string{"i", strconv.Itoa(data), "e"}, "")
+	return "i" + strconv.Itoa(data) + "e"
 }
 
 // EncodeItem encodes an item of dict or list.
-func encodeItem(data interface{}) (item string) {
+func encodeItem(data interface{}) string {
 	switch v := data.(type) {
 	case string:
-		item = EncodeString(v)
+		return EncodeString(v)
 	case int:
-		item = EncodeInt(v)
+		return EncodeInt(v)
 	case []interface{}:
-		item = EncodeList(v)
+		return EncodeList(v)
 	case map[string]interface{}:
-		item = EncodeDict(v)
+		return EncodeDict(v)
 	default:
 		panic("invalid type when encode item")
 	}
-	return
 }
 
 // EncodeList encodes a list value.
 func EncodeList(data []interface{}) string {
-	result := make([]string, len(data))
-
-	for i, item := range data {
-		result[i] = encodeItem(item)
+	var b strings.Builder
+	b.Grow(64)
+	b.WriteByte('l')
+	for _, item := range data {
+		b.WriteString(encodeItem(item))
 	}
-
-	return strings.Join([]string{"l", strings.Join(result, ""), "e"}, "")
+	b.WriteByte('e')
+	return b.String()
 }
 
 // EncodeDict encodes a dict value.
 func EncodeDict(data map[string]interface{}) string {
-	result, i := make([]string, len(data)), 0
-
+	var b strings.Builder
+	b.Grow(128)
+	b.WriteByte('d')
 	for key, val := range data {
-		result[i] = strings.Join(
-			[]string{EncodeString(key), encodeItem(val)},
-			"")
-		i++
+		b.WriteString(EncodeString(key))
+		b.WriteString(encodeItem(val))
 	}
-
-	return strings.Join([]string{"d", strings.Join(result, ""), "e"}, "")
+	b.WriteByte('e')
+	return b.String()
 }
 
 // Encode encodes a string, int, dict or list value to a bencoded string.
@@ -260,4 +259,42 @@ func Encode(data interface{}) string {
 	default:
 		panic("invalid type when encode")
 	}
+}
+
+// EncodeBytes encodes data directly to []byte, avoiding the string→[]byte copy
+// that occurs when using Encode() + []byte() conversion.
+func EncodeBytes(data interface{}) []byte {
+	var buf []byte
+	return appendEncoded(buf, data)
+}
+
+func appendEncoded(buf []byte, data interface{}) []byte {
+	switch v := data.(type) {
+	case string:
+		buf = strconv.AppendInt(buf, int64(len(v)), 10)
+		buf = append(buf, ':')
+		buf = append(buf, v...)
+	case int:
+		buf = append(buf, 'i')
+		buf = strconv.AppendInt(buf, int64(v), 10)
+		buf = append(buf, 'e')
+	case []interface{}:
+		buf = append(buf, 'l')
+		for _, item := range v {
+			buf = appendEncoded(buf, item)
+		}
+		buf = append(buf, 'e')
+	case map[string]interface{}:
+		buf = append(buf, 'd')
+		for key, val := range v {
+			buf = strconv.AppendInt(buf, int64(len(key)), 10)
+			buf = append(buf, ':')
+			buf = append(buf, key...)
+			buf = appendEncoded(buf, val)
+		}
+		buf = append(buf, 'e')
+	default:
+		panic("invalid type when encode")
+	}
+	return buf
 }

@@ -24,9 +24,9 @@ const (
 
 // packet represents the information receive from udp.
 type packet struct {
-	data  []byte
+	data   []byte
 	buffer []byte
-	raddr *net.UDPAddr
+	raddr  *net.UDPAddr
 }
 
 func (pkt packet) release(dht *DHT) {
@@ -133,8 +133,10 @@ func makeError(t string, errCode int, errMsg string) map[string]interface{} {
 
 // send sends data to the udp.
 func send(dht *DHT, addr *net.UDPAddr, data map[string]interface{}) error {
-	_, err := dht.conn.WriteToUDP([]byte(Encode(data)), addr)
-	if err != nil {
+	// 使用 EncodeBytes 直接编码到 []byte，避免 Encode() → string → []byte 的双重拷贝。
+	buf := EncodeBytes(data)
+	_, err := dht.conn.WriteToUDP(buf, addr)
+	if err != nil && !dht.IsCrawlMode() {
 		dht.blackList.insert(addr.IP.String(), -1)
 	}
 	return err
@@ -378,6 +380,14 @@ func (tm *transactionManager) ping(no *node) {
 
 // findNode sends find_node query to the chan.
 func (tm *transactionManager) findNode(no *node, target string) {
+	// 爬虫模式：直接构造字节发送，跳过 queryChan → run() → query() → send() → Encode() 全链路。
+	if tm.dht.IsCrawlMode() {
+		if no.id != nil && no.id.RawString() == tm.dht.node.id.RawString() {
+			return
+		}
+		sendCrawlFindNodeQuery(tm.dht, no.addr, target)
+		return
+	}
 	tm.sendQuery(no, findNodeType, map[string]interface{}{
 		"id":     tm.dht.id(target),
 		"target": target,
@@ -386,6 +396,14 @@ func (tm *transactionManager) findNode(no *node, target string) {
 
 // getPeers sends get_peers query to the chan.
 func (tm *transactionManager) getPeers(no *node, infoHash string) {
+	// 爬虫模式：直接构造字节发送。
+	if tm.dht.IsCrawlMode() {
+		if no.id != nil && no.id.RawString() == tm.dht.node.id.RawString() {
+			return
+		}
+		sendCrawlGetPeersQuery(tm.dht, no, infoHash)
+		return
+	}
 	tm.sendQuery(no, getPeersType, map[string]interface{}{
 		"id":        tm.dht.id(infoHash),
 		"info_hash": infoHash,
@@ -802,10 +820,6 @@ var handlers = map[string]func(*DHT, *net.UDPAddr, map[string]interface{}) bool{
 func handle(dht *DHT, pkt packet) {
 	defer pkt.release(dht)
 
-	if dht.blackList.in(pkt.raddr.IP.String(), pkt.raddr.Port) {
-		return
-	}
-
 	data, err := Decode(pkt.data)
 	if err != nil {
 		dht.stats.decodeErrors.Add(1)
@@ -818,7 +832,30 @@ func handle(dht *DHT, pkt packet) {
 		return
 	}
 
-	if f, ok := handlers[response["y"].(string)]; ok {
+	y := response["y"].(string)
+
+	// 爬虫模式快速路径：跳过黑名单检查，使用零分配请求处理器
+	if dht.IsCrawlMode() {
+		switch y {
+		case "q":
+			if handleRequestCrawl(dht, pkt.raddr, response) {
+				dht.stats.handled.Add(1)
+			}
+		case "r":
+			if handleResponseCrawl(dht, pkt.raddr, response) {
+				dht.stats.handled.Add(1)
+			}
+		case "e":
+			// 爬虫模式忽略错误报文
+		}
+		return
+	}
+
+	if dht.blackList.in(pkt.raddr.IP.String(), pkt.raddr.Port) {
+		return
+	}
+
+	if f, ok := handlers[y]; ok {
 		f(dht, pkt.raddr, response)
 		dht.stats.handled.Add(1)
 	}

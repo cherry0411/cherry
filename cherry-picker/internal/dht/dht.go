@@ -232,13 +232,19 @@ func (dht *DHT) init() {
 	dht.conn.SetWriteBuffer(4 * 1024 * 1024) // 4MB 发送缓冲
 
 	dht.routingTable = newRoutingTable(dht.KBucketSize, dht)
-	dht.peersManager = newPeersManager(dht)
-	dht.tokenManager = newTokenManager(dht.TokenExpiredAfter, dht)
 	dht.transactionManager = newTransactionManager(
 		dht.MaxTransactionCursor, dht)
 
+	// 爬虫模式跳过未使用的子系统，减少内存和 GC 压力。
+	// peersManager: 仅标准模式存储 peer（爬虫模式不维护 peer 列表）
+	// tokenManager: 爬虫模式使用固定 crawlToken，不需要 token 生成/验证
+	if dht.IsStandardMode() {
+		dht.peersManager = newPeersManager(dht)
+		dht.tokenManager = newTokenManager(dht.TokenExpiredAfter, dht)
+		go dht.tokenManager.clear()
+	}
+
 	go dht.transactionManager.run()
-	go dht.tokenManager.clear()
 	go dht.blackList.clear()
 	dht.startPacketWorkers()
 }

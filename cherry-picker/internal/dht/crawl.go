@@ -8,10 +8,13 @@
 //  2. 本文件提供 handleResponseCrawl() 替代标准路径：
 //     - 解析并插入响应中的 compact node 信息
 //     - 对 get_peers 响应的 values（peers）通过 crawlTxBuf 环形缓冲
-//       还原原始 info_hash，并触发 OnGetPeersResponse 回调。
+//     还原原始 info_hash，并触发 OnGetPeersResponse 回调。
 package dht
 
-import "net"
+import (
+	"net"
+	"sync/atomic"
+)
 
 // crawlToken 是爬虫模式 get_peers 响应中使用的固定 token。
 // 由于爬虫模式对所有 announce_peer 均接受（跳过 token 验证），
@@ -35,18 +38,22 @@ func handleResponseCrawl(dht *DHT, addr *net.UDPAddr, response map[string]interf
 		return false
 	}
 
-	// 解析 compact node 信息，将新发现的节点插入路由表
-	if nodesStr, ok := r["nodes"].(string); ok && len(nodesStr) > 0 && len(nodesStr)%26 == 0 {
-		for i := 0; i < len(nodesStr)/26; i++ {
-			no, err := newNodeFromCompactInfo(nodesStr[i*26:(i+1)*26], dht.Network)
-			if err == nil && !dht.blackList.in(no.addr.IP.String(), no.addr.Port) {
-				dht.routingTable.Insert(no)
+	tableFull := atomic.LoadInt64(&dht.routingTable.nodeCount) >= int64(dht.MaxNodes)
+
+	// 解析 compact node 信息，路由表未满时将新发现的节点插入。
+	// 路由表已满时完全跳过解析和插入：避免 newNode 分配 + 写锁竞争。
+	if !tableFull {
+		if nodesStr, ok := r["nodes"].(string); ok && len(nodesStr) > 0 && len(nodesStr)%26 == 0 {
+			for i := 0; i < len(nodesStr)/26; i++ {
+				no, err := newNodeFromCompactInfo(nodesStr[i*26:(i+1)*26], dht.Network)
+				if err == nil {
+					dht.routingTable.Insert(no)
+				}
 			}
 		}
 	}
 
 	// 处理 get_peers 响应中的 values（peer 列表）。
-	// 通过事务 ID 在 crawlTxBuf 中还原原始 info_hash。
 	if dht.OnGetPeersResponse != nil {
 		if values, ok := r["values"].([]interface{}); ok {
 			t := response["t"].(string)
@@ -65,9 +72,11 @@ func handleResponseCrawl(dht *DHT, addr *net.UDPAddr, response map[string]interf
 		}
 	}
 
-	// 将响应方插入路由表
-	if node, err := newNode(id, addr.Network(), addr.String()); err == nil {
-		dht.routingTable.Insert(node)
+	// 路由表未满时将响应方插入路由表
+	if !tableFull {
+		if no, err := newNodeFromAddr(id, addr); err == nil {
+			dht.routingTable.Insert(no)
+		}
 	}
 	return true
 }
