@@ -122,20 +122,20 @@ public sealed class MeiliIndexQueue : IHostedService, IDisposable
     {
         while (!ct.IsCancellationRequested)
         {
-            try { await Task.Delay(TimeSpan.FromSeconds(30), ct); }
+            try { await Task.Delay(TimeSpan.FromSeconds(10), ct); }
             catch (OperationCanceledException) { break; }
             List<Torrent> batch;
             lock (_lock)
             {
                 if (_buffer.Count == 0) continue;
-                batch = new List<Torrent>(_buffer);
+                batch = [.. _buffer];
                 _buffer.Clear();
             }
             await IndexWithRetryAsync(batch, ct);
         }
         // Final flush on shutdown
         List<Torrent> final;
-        lock (_lock) { final = new List<Torrent>(_buffer); _buffer.Clear(); }
+        lock (_lock) { final = [.. _buffer]; _buffer.Clear(); }
         if (final.Count > 0) await IndexWithRetryAsync(final, CancellationToken.None);
     }
 
