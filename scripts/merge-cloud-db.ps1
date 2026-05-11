@@ -64,15 +64,15 @@ Write-Host "=== Step 3: Dedup $tmpDB (remove $hashCount known hashes)" -Foregrou
 $tmpRemain = (& $pg -U $pgUser -p $pgPort -d $tmpDB -t -c "SELECT count(*) FROM torrents").Trim()
 Write-Host "  Temp DB after dedup: $tmpRemain torrents (will be merged)" -ForegroundColor Yellow
 
-# ---- Step 4: Dump cleaned temp DB ----
+# ---- Step 4: Dump cleaned temp DB (custom format = COPY-based, fast) ----
 Write-Host "=== Step 4: Dump cleaned $tmpDB" -ForegroundColor Cyan
-& $pgDump -U $pgUser -p $pgPort -d $tmpDB --data-only --inserts -f $tempDump
-$tmpSize = [math]::Round((Get-Item $tempDump).Length / 1KB, 1)
-Write-Host "  Temp dump: $tempDump ($tmpSize KB)" -ForegroundColor Green
+& $pgDump -U $pgUser -p $pgPort -d $tmpDB --data-only -Fc -f $tempDump
+$tmpSize = [math]::Round((Get-Item $tempDump).Length / 1MB, 1)
+Write-Host "  Temp dump: $tempDump ($tmpSize MB)" -ForegroundColor Green
 
-# ---- Step 5: Import into main DB ----
+# ---- Step 5: Restore into main DB (COPY-based, fast) ----
 Write-Host "=== Step 5: Import into $mainDB" -ForegroundColor Cyan
-& $pg -U $pgUser -p $pgPort -d $mainDB -f $tempDump
+& $pgRest -U $pgUser -p $pgPort -d $mainDB --data-only --single-transaction $tempDump
 $after = (& $pg -U $pgUser -p $pgPort -d $mainDB -t -c "SELECT count(*) FROM torrents").Trim()
 $added = [int]$after - [int]$before
 Write-Host "  Import OK: $before → $after (+$added torrents)" -ForegroundColor Green
