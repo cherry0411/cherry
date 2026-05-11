@@ -51,11 +51,12 @@ Write-Host "  Exported $hashCount hashes" -ForegroundColor Green
 
 # ---- Step 3: Dedup in temp DB ----
 Write-Host "=== Step 3: Dedup $tmpDB (remove $hashCount known hashes)" -ForegroundColor Cyan
-# Must run in ONE session because _h is a regular table shared across DELETE statements
+# Must run in ONE session because _h is shared across DELETE statements.
+# Use \copy (client-side read) — server-side COPY doesn't have filesystem access.
 & $pg -U $pgUser -p $pgPort -d $tmpDB -c "
   CREATE TABLE IF NOT EXISTS _h (info_hash varchar(40) PRIMARY KEY);
   TRUNCATE _h;
-  COPY _h FROM '$($hashesFile.Replace('\', '/'))';
+  \copy _h FROM '$($hashesFile.Replace('\', '/'))';
   ANALYZE _h;
   DELETE FROM torrent_files WHERE info_hash IN (SELECT info_hash FROM _h);
   DELETE FROM torrents WHERE info_hash IN (SELECT info_hash FROM _h);
