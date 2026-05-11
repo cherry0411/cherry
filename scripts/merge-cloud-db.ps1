@@ -16,7 +16,14 @@ $tempDump   = "$env:TEMP\cherry_tmp_clean.dump"
 $mainDB     = "cherry"
 $tmpDB      = "cherry_tmp_merge"
 $pgUser     = "postgres"
+$pgPass     = $env:PGPASSWORD
 $pgPort     = 5432
+
+if (-not $pgPass) {
+    $pgPass = Read-Host "Enter PostgreSQL password for $pgUser" -AsSecureString
+    $pgPass = [Runtime.InteropServices.Marshal]::PtrToStringAuto([Runtime.InteropServices.Marshal]::SecureStringToBSTR($pgPass))
+}
+$env:PGPASSWORD = $pgPass
 
 # ---- preflight ----
 if (-not (Test-Path $dumpFile)) { throw "cloud.dump not found at $dumpFile" }
@@ -30,7 +37,7 @@ Write-Host "  Backup OK: $backupFile ($backupSize MB) — torrents before: $befo
 
 # ---- Step 1: Restore cloud.dump → temp DB ----
 Write-Host "=== Step 1: Restore cloud.dump → $tmpDB" -ForegroundColor Cyan
-& $pg -U $pgUser -p $pgPort -c "DROP DATABASE IF EXISTS $tmpDB" 2>$null
+& $pg -U $pgUser -p $pgPort -c "DROP DATABASE IF EXISTS $tmpDB"
 & $pg -U $pgUser -p $pgPort -c "CREATE DATABASE $tmpDB"
 & $pgRest -U $pgUser -p $pgPort -d $tmpDB --clean --if-exists $dumpFile
 $tmpTotal = (& $pg -U $pgUser -p $pgPort -d $tmpDB -t -c "SELECT count(*) FROM torrents").Trim()
