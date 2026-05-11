@@ -30,7 +30,7 @@ if (-not (Test-Path $dumpFile)) { throw "cloud.dump not found at $dumpFile" }
 
 # ---- Step 0: Backup main DB ----
 Write-Host "=== Step 0: Backup $mainDB" -ForegroundColor Cyan
-$before = (& $pg -U $pgUser -p $pgPort -d $mainDB -t -c "SELECT count(*) FROM torrents").Trim()
+$before = [int]((& $pg -U $pgUser -p $pgPort -d $mainDB -t -c "SELECT count(*) FROM torrents") -join '').Trim()
 & $pgDump -U $pgUser -p $pgPort -d $mainDB -Fc -f $backupFile
 $backupSize = [math]::Round((Get-Item $backupFile).Length / 1MB, 1)
 Write-Host "  Backup OK: $backupFile ($backupSize MB) — torrents before: $before" -ForegroundColor Green
@@ -40,7 +40,7 @@ Write-Host "=== Step 1: Restore cloud.dump → $tmpDB" -ForegroundColor Cyan
 & $pg -U $pgUser -p $pgPort -c "DROP DATABASE IF EXISTS $tmpDB"
 & $pg -U $pgUser -p $pgPort -c "CREATE DATABASE $tmpDB"
 & $pgRest -U $pgUser -p $pgPort -d $tmpDB --clean --if-exists $dumpFile
-$tmpTotal = (& $pg -U $pgUser -p $pgPort -d $tmpDB -t -c "SELECT count(*) FROM torrents").Trim()
+$tmpTotal = [int]((& $pg -U $pgUser -p $pgPort -d $tmpDB -t -c "SELECT count(*) FROM torrents") -join '').Trim()
 Write-Host "  Temp DB ready: $tmpTotal torrents" -ForegroundColor Green
 
 # ---- Step 2: Export main DB hashes ----
@@ -65,7 +65,7 @@ DROP TABLE _h;
 [System.IO.File]::WriteAllText($dedupSQL, $dedupContent)
 & $pg -U $pgUser -p $pgPort -d $tmpDB -f $dedupSQL
 Remove-Item $dedupSQL -Force
-$tmpRemain = (& $pg -U $pgUser -p $pgPort -d $tmpDB -t -c "SELECT count(*) FROM torrents").Trim()
+$tmpRemain = [int]((& $pg -U $pgUser -p $pgPort -d $tmpDB -t -c "SELECT count(*) FROM torrents") -join '').Trim()
 Write-Host "  Temp DB after dedup: $tmpRemain torrents (will be merged)" -ForegroundColor Yellow
 
 # ---- Step 4: Dump cleaned temp DB (custom format = COPY-based, fast) ----
@@ -77,8 +77,9 @@ Write-Host "  Temp dump: $tempDump ($tmpSize MB)" -ForegroundColor Green
 # ---- Step 5: Restore into main DB (COPY-based, fast) ----
 Write-Host "=== Step 5: Import into $mainDB" -ForegroundColor Cyan
 & $pgRest -U $pgUser -p $pgPort -d $mainDB --data-only --single-transaction $tempDump
-$after = (& $pg -U $pgUser -p $pgPort -d $mainDB -t -c "SELECT count(*) FROM torrents").Trim()
-$added = [int]$after - [int]$before
+$afterRaw = & $pg -U $pgUser -p $pgPort -d $mainDB -t -c "SELECT count(*) FROM torrents"
+$after = [int](($afterRaw -join '').Trim())
+$added = $after - [int]$before
 Write-Host "  Import OK: $before → $after (+$added torrents)" -ForegroundColor Green
 
 # ---- Step 6: Verify no duplicates ----
