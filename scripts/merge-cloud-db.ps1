@@ -53,7 +53,7 @@ Write-Host "  Exported $hashCount hashes" -ForegroundColor Green
 Write-Host "=== Step 3: Dedup $tmpDB (remove $hashCount known hashes)" -ForegroundColor Cyan
 # Write SQL to a temp file — psql -f handles \copy meta-commands, -c does not
 $dedupSQL = "$env:TEMP\cherry_dedup.sql"
-Set-Content -Path $dedupSQL -Encoding utf8 @"
+$dedupContent = @"
 CREATE TABLE IF NOT EXISTS _h (info_hash varchar(40) PRIMARY KEY);
 TRUNCATE _h;
 \copy _h FROM '$($hashesFile.Replace('\', '/'))';
@@ -62,6 +62,7 @@ DELETE FROM torrent_files WHERE info_hash IN (SELECT info_hash FROM _h);
 DELETE FROM torrents WHERE info_hash IN (SELECT info_hash FROM _h);
 DROP TABLE _h;
 "@
+[System.IO.File]::WriteAllText($dedupSQL, $dedupContent)
 & $pg -U $pgUser -p $pgPort -d $tmpDB -f $dedupSQL
 Remove-Item $dedupSQL -Force
 $tmpRemain = (& $pg -U $pgUser -p $pgPort -d $tmpDB -t -c "SELECT count(*) FROM torrents").Trim()
