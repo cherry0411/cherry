@@ -51,17 +51,19 @@ Write-Host "  Exported $hashCount hashes" -ForegroundColor Green
 
 # ---- Step 3: Dedup in temp DB ----
 Write-Host "=== Step 3: Dedup $tmpDB (remove $hashCount known hashes)" -ForegroundColor Cyan
-# Must run in ONE session because _h is shared across DELETE statements.
-# Use \copy (client-side read) — server-side COPY doesn't have filesystem access.
-& $pg -U $pgUser -p $pgPort -d $tmpDB -c "
-  CREATE TABLE IF NOT EXISTS _h (info_hash varchar(40) PRIMARY KEY);
-  TRUNCATE _h;
-  \copy _h FROM '$($hashesFile.Replace('\', '/'))';
-  ANALYZE _h;
-  DELETE FROM torrent_files WHERE info_hash IN (SELECT info_hash FROM _h);
-  DELETE FROM torrents WHERE info_hash IN (SELECT info_hash FROM _h);
-  DROP TABLE _h;
-"
+# Write SQL to a temp file — psql -f handles \copy meta-commands, -c does not
+$dedupSQL = "$env:TEMP\cherry_dedup.sql"
+Set-Content -Path $dedupSQL -Encoding utf8 @"
+CREATE TABLE IF NOT EXISTS _h (info_hash varchar(40) PRIMARY KEY);
+TRUNCATE _h;
+\copy _h FROM '$($hashesFile.Replace('\', '/'))';
+ANALYZE _h;
+DELETE FROM torrent_files WHERE info_hash IN (SELECT info_hash FROM _h);
+DELETE FROM torrents WHERE info_hash IN (SELECT info_hash FROM _h);
+DROP TABLE _h;
+"@
+& $pg -U $pgUser -p $pgPort -d $tmpDB -f $dedupSQL
+Remove-Item $dedupSQL -Force
 $tmpRemain = (& $pg -U $pgUser -p $pgPort -d $tmpDB -t -c "SELECT count(*) FROM torrents").Trim()
 Write-Host "  Temp DB after dedup: $tmpRemain torrents (will be merged)" -ForegroundColor Yellow
 
