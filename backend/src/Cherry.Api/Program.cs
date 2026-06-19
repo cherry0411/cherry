@@ -73,6 +73,31 @@ builder.Services.AddSwaggerGen(options =>
 
 var app = builder.Build();
 
+var apiKey = builder.Configuration["ApiKey"];
+var protectedCrawlerPaths = new[]
+{
+    "/api/v1/torrents/batch",
+    "/api/v1/torrents/peers",
+    "/api/v1/torrents/reject"
+};
+
+app.Use(async (context, next) =>
+{
+    if (!string.IsNullOrWhiteSpace(apiKey) &&
+        protectedCrawlerPaths.Any(path => context.Request.Path.Equals(path, StringComparison.OrdinalIgnoreCase)))
+    {
+        var provided = context.Request.Headers["X-API-Key"].ToString();
+        if (!string.Equals(provided, apiKey, StringComparison.Ordinal))
+        {
+            context.Response.StatusCode = StatusCodes.Status401Unauthorized;
+            await context.Response.WriteAsJsonAsync(new { error = "Invalid API key" });
+            return;
+        }
+    }
+
+    await next();
+});
+
 // Persist CuckooFilter and RejectedHashStore on graceful shutdown
 app.Lifetime.ApplicationStopping.Register(() => dedup.Save());
 app.Lifetime.ApplicationStopping.Register(() => rejectedStore.Save());

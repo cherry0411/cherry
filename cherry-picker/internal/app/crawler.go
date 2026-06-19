@@ -1,4 +1,4 @@
-﻿// Package app 实现 Cherry DHT 爬虫的核心应用逻辑（高性能重写版）。
+// Package app 实现 Cherry DHT 爬虫的核心应用逻辑（高性能重写版）。
 //
 // 主要修复（相比 app.go）：
 //  1. seenSet（无限增长 map）→ 有界 LRU cache，内存严格上限
@@ -193,8 +193,11 @@ func (a *Application) Run(ctx context.Context) error {
 
 	// peer wire metadata 下载器
 	downloader := dht.NewWire(a.cfg.Metadata.BlackListSize, a.cfg.Metadata.RequestQueueSize, a.cfg.Metadata.WorkerQueueSize)
-	go a.consumeMetadata(ctx, downloader, events, stats)
-	go downloader.Run()
+	if a.cfg.Metadata.Enabled {
+		a.startMetadataConsumers(ctx, downloader, events, stats)
+		go downloader.Run()
+		go a.tuneWireWorkers(ctx, downloader)
+	}
 	a.logger.Printf("metadata workers: %d, queue: %d", a.cfg.Metadata.WorkerQueueSize, a.cfg.Metadata.RequestQueueSize)
 
 	// 共享回调（所有 DHT 实例共用同一套 handler，共享下载器和 LRU）
@@ -480,6 +483,75 @@ func (c *autoTuneController) nextAction(now time.Time, paused bool, heapAlloc, p
 	return autoTuneNoop
 }
 
+func (a *Application) tuneWireWorkers(ctx context.Context, downloader *dht.Wire) {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	maxWorkers := downloader.MaxWorkers()
+	minWorkers := clampInt(maxWorkers/8, 64, maxWorkers)
+	if maxWorkers < 64 {
+		minWorkers = 1
+	}
+
+	var prevDialAttempts, prevDialOK, prevHandshakeOK, prevDownloadOK int64
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			dialAttempts := downloader.Stats.DialAttempts.Load()
+			dialOK := downloader.Stats.DialOK.Load()
+			handshakeOK := downloader.Stats.HandshakeOK.Load()
+			downloadOK := downloader.Stats.DownloadOK.Load()
+
+			attemptsDelta := dialAttempts - prevDialAttempts
+			dialOKDelta := dialOK - prevDialOK
+			handshakeDelta := handshakeOK - prevHandshakeOK
+			downloadDelta := downloadOK - prevDownloadOK
+
+			prevDialAttempts = dialAttempts
+			prevDialOK = dialOK
+			prevHandshakeOK = handshakeOK
+			prevDownloadOK = downloadOK
+
+			active := downloader.ActiveWorkers()
+			target := active
+			reqDepth := downloader.RequestDepth()
+			respDepth := downloader.ResponseDepth()
+
+			if a.metaPaused.Load() {
+				target = minWorkers
+			} else if respDepth > active*8 && active > minWorkers {
+				target = active * 3 / 4
+			} else if attemptsDelta > 0 {
+				dialRate := float64(dialOKDelta) / float64(attemptsDelta)
+				handshakeRate := 0.0
+				if dialOKDelta > 0 {
+					handshakeRate = float64(handshakeDelta) / float64(dialOKDelta)
+				}
+
+				switch {
+				case attemptsDelta > int64(active*2) && (dialRate < 0.005 || (dialOKDelta > 32 && handshakeRate < 0.01)):
+					target = active * 3 / 4
+				case reqDepth > active*4 && dialRate >= 0.02 && handshakeRate >= 0.03:
+					target = active + maxInt(16, active/4)
+				case reqDepth > active && downloadDelta > int64(maxInt(8, active/2)):
+					target = active + maxInt(8, active/8)
+				}
+			}
+
+			target = clampInt(target, minWorkers, maxWorkers)
+			if target != active {
+				downloader.SetActiveWorkers(target)
+				a.logger.Printf(
+					"wire autotune: active=%d target=%d req_depth=%d resp_depth=%d attempts=%d dial_ok=%d handshake_ok=%d download_ok=%d paused=%v",
+					active, target, reqDepth, respDepth, attemptsDelta, dialOKDelta, handshakeDelta, downloadDelta, a.metaPaused.Load())
+			}
+		}
+	}
+}
+
 func newLRUCaps(cfg config.Config) lruCapConfig {
 	cpuScale := runtime.GOMAXPROCS(0)
 	if cpuScale < 1 {
@@ -604,6 +676,10 @@ func (a *Application) submitPeerEvent(events chan<- pipeline.Event, ihHex, ip st
 }
 
 func (a *Application) queueMetadataRequest(downloader *dht.Wire, ihHex, ip string, port int, stats *runtimeStats, checkQueue chan<- string) {
+	if !a.cfg.Metadata.Enabled {
+		return
+	}
+
 	requestKey := buildInfohashPeerKey(ihHex, ip, port)
 	if !a.metadataRequestSeen.Set(requestKey) {
 		stats.metadataRequestsDeduped.Add(1)
@@ -645,31 +721,54 @@ func (a *Application) incPeerCount(ihHex string) {
 	a.peerCountsMu.Unlock()
 }
 
-func (a *Application) consumeMetadata(ctx context.Context, downloader *dht.Wire, events chan<- pipeline.Event, stats *runtimeStats) {
+func (a *Application) startMetadataConsumers(ctx context.Context, downloader *dht.Wire, events chan<- pipeline.Event, stats *runtimeStats) {
+	workers := runtime.GOMAXPROCS(0) * 2
+	workers = clampInt(workers, 4, 64)
+	var ok, fail atomic.Uint64
+	for i := 0; i < workers; i++ {
+		go a.consumeMetadata(ctx, downloader, events, stats, &ok, &fail)
+	}
+
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				a.logger.Printf("metadata download: ok=%d fail=%d (30s)", ok.Swap(0), fail.Swap(0))
+			}
+		}
+	}()
+}
+
+func (a *Application) consumeMetadata(
+	ctx context.Context,
+	downloader *dht.Wire,
+	events chan<- pipeline.Event,
+	stats *runtimeStats,
+	ok *atomic.Uint64,
+	fail *atomic.Uint64,
+) {
 	responses := downloader.Response()
-	var ok, fail uint64
-	logTicker := time.NewTicker(30 * time.Second)
-	defer logTicker.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-logTicker.C:
-			a.logger.Printf("metadata download: ok=%d fail=%d (30s)", ok, fail)
-			ok, fail = 0, 0
 		case response := <-responses:
 			ihHex := hex.EncodeToString(response.InfoHash)
 			// G7: dedupe by infohash only; one result per hash is sufficient.
 			if !a.metadataResultSeen.Set(ihHex) {
 				stats.metadataEventsDeduped.Add(1)
-				fail++
+				fail.Add(1)
 				continue
 			}
 			metadata, err := normalizeMetadata(response.MetadataInfo)
 			if err != nil {
 				stats.metadataEventsDeduped.Add(1)
-				fail++
+				fail.Add(1)
 				continue
 			}
 			// Apply content filter rules before reporting to the backend.
@@ -686,7 +785,7 @@ func (a *Application) consumeMetadata(ctx context.Context, downloader *dht.Wire,
 				}
 				continue
 			}
-			ok++
+			ok.Add(1)
 			a.submitEvent(events, pipeline.Event{
 				Type:       pipeline.EventMetadataFetched,
 				Timestamp:  time.Now().UTC(),

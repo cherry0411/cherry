@@ -84,6 +84,52 @@ func handleResponseCrawl(dht *DHT, addr *net.UDPAddr, response map[string]interf
 	return true
 }
 
+func handleResponseCrawlFast(dht *DHT, addr *net.UDPAddr, pkt crawlPacket) bool {
+	if !pkt.hasPayload {
+		return false
+	}
+
+	tableFull := atomic.LoadInt64(&dht.routingTable.nodeCount) >= int64(dht.MaxNodes)
+
+	if dht.OnGetPeersResponse != nil && pkt.hasValues {
+		idx := crawlTxIdx(pkt.t)
+		ih := dht.crawlTxBuf[idx]
+		if ih != [20]byte{} {
+			infoHash := string(ih[:])
+			for _, v := range pkt.values {
+				peer, err := newPeerFromCompactIPPortInfo(v, pkt.token)
+				if err == nil {
+					dht.OnGetPeersResponse(infoHash, peer)
+				}
+			}
+		}
+		return true
+	}
+
+	if tableFull {
+		return true
+	}
+
+	if len(pkt.nodes) > 0 {
+		if len(pkt.nodes)%26 != 0 {
+			return false
+		}
+		for i := 0; i < len(pkt.nodes)/26; i++ {
+			no, err := newNodeFromCompactInfo(pkt.nodes[i*26:(i+1)*26], dht.Network)
+			if err == nil {
+				dht.routingTable.Insert(no)
+			}
+		}
+	}
+
+	if len(pkt.id) == 20 {
+		if no, err := newNodeFromAddr(pkt.id, addr); err == nil {
+			dht.routingTable.Insert(no)
+		}
+	}
+	return true
+}
+
 // crawlTxIdx 将 KRPC 事务 ID 字符串解码为 crawlTxBuf 的 16 位环形索引。
 // KRPC 事务 ID 是变长字节串；爬虫模式下我们用 2 字节（大端）编码 uint16 计数器。
 func crawlTxIdx(t string) uint16 {

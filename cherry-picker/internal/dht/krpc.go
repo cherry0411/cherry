@@ -820,6 +820,25 @@ var handlers = map[string]func(*DHT, *net.UDPAddr, map[string]interface{}) bool{
 func handle(dht *DHT, pkt packet) {
 	defer pkt.release(dht)
 
+	if dht.IsCrawlMode() {
+		if fastPkt, ok := parseCrawlPacket(pkt.data); ok {
+			switch fastPkt.y {
+			case "q":
+				if handleRequestCrawlFast(dht, pkt.raddr, fastPkt) {
+					dht.stats.handled.Add(1)
+				}
+				return
+			case "r":
+				if handleResponseCrawlFast(dht, pkt.raddr, fastPkt) {
+					dht.stats.handled.Add(1)
+				}
+				return
+			case "e":
+				return
+			}
+		}
+	}
+
 	data, err := Decode(pkt.data)
 	if err != nil {
 		dht.stats.decodeErrors.Add(1)

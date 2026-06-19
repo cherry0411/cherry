@@ -16,9 +16,9 @@ x-crawler-env: &crawler-env
   CHERRY_PICKER_DHT_MODE: crawl
   CHERRY_PICKER_EMIT_PEER_EVENTS: "true"
   CHERRY_PICKER_DHT_PACKET_WORKERS: "8"
-  CHERRY_PICKER_DHT_PACKET_JOBS: "512"
+  CHERRY_PICKER_DHT_PACKET_JOBS: "4096"
   CHERRY_PICKER_DHT_MAX_NODES: "5000"
-  CHERRY_PICKER_DHT_REFRESH_NODES: "64"
+  CHERRY_PICKER_DHT_REFRESH_NODES: "256"
   CHERRY_PICKER_METADATA_ENABLED: "true"
   CHERRY_PICKER_METADATA_BLACKLIST: "65536"
   CHERRY_PICKER_METADATA_REQUEST_QUEUE: "65536"
@@ -30,6 +30,8 @@ x-crawler-env: &crawler-env
   CHERRY_PICKER_EXPORTER_TIMEOUT: "60s"
   CHERRY_PICKER_EXPORTER_HTTP_RETRIES: "2"
   CHERRY_PICKER_EXPORTER_RETRY_BACKOFF: "5s"
+  CHERRY_PICKER_WAL_DIR: /data/wal
+  CHERRY_API_KEY: ${CHERRY_API_KEY:-}
 
 services:
   postgres:
@@ -59,6 +61,7 @@ services:
       ConnectionStrings__Default: >-
         Host=postgres;Port=5432;Database=${POSTGRES_DB:-cherry};Username=${POSTGRES_USER:-cherry};Password=${POSTGRES_PASSWORD:-cindy131120};Pooling=true;MaxPoolSize=64
       MeiliSearch__Url: http://meilisearch:7700
+      ApiKey: ${CHERRY_API_KEY:-}
     volumes:
       - apidata:/app/data
     ports:

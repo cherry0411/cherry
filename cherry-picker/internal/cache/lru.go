@@ -3,7 +3,6 @@ package cache
 
 import (
 	"container/list"
-	"hash/fnv"
 	"sync"
 )
 
@@ -145,7 +144,10 @@ func (c *LRU) shardFor(key string) *lruShard {
 		return c.shards[0]
 	}
 
-	h := fnv.New32a()
-	_, _ = h.Write([]byte(key))
-	return c.shards[uint(h.Sum32())%uint(len(c.shards))]
+	var h uint32 = 2166136261
+	for i := 0; i < len(key); i++ {
+		h ^= uint32(key[i])
+		h *= 16777619
+	}
+	return c.shards[uint(h)%uint(len(c.shards))]
 }

@@ -3,8 +3,7 @@
 // 修复的问题：
 //  1. wire.queue 改为有界 LRU，防止 syncedMap 无限增长
 //  2. fetchMetadata 完成后（成功/失败）从 queue 中删除 key，原版不删除
-//  3. Wire.Run() 改为 semaphore 等待模式：goroutine 数量达到上限时阻塞
-//     而不是 `default: continue` 直接丢弃，保证高负载下 metadata 请求不丢失
+//  3. Wire.Run() 使用固定 worker 池，减少极高负载下的 goroutine 调度开销
 //  4. 用 io.LimitReader 替换 ioutil.ReadAll 的无限读取
 //  5. 去除 ioutil（已废弃），改用 io 包
 package dht
@@ -16,6 +15,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -37,6 +37,8 @@ const (
 	BLOCK = 16384
 	// MaxMetadataSize 限制单个 metadata 最大尺寸（1 MB）
 	MaxMetadataSize = BLOCK * 64
+	// MaxWireMessageSize 限制单条 peer-wire 消息长度，避免异常 peer 用长度前缀放大内存。
+	MaxWireMessageSize = MaxMetadataSize + 4096
 	// EXTENDED 表示扩展消息类型
 	EXTENDED = 20
 	// HANDSHAKE 表示握手位
@@ -69,6 +71,10 @@ func readMessage(conn *net.TCPConn, data *bytes.Buffer) (length int, err error) 
 	if length == 0 {
 		return
 	}
+	if length > MaxWireMessageSize {
+		err = errors.New("wire message too long")
+		return
+	}
 
 	if err = read(conn, length, data); err != nil {
 		return
@@ -78,13 +84,11 @@ func readMessage(conn *net.TCPConn, data *bytes.Buffer) (length int, err error) 
 
 // sendMessage 向连接发送带长度前缀的消息。
 func sendMessage(conn *net.TCPConn, data []byte) error {
-	length := int32(len(data))
-
-	buffer := bytes.NewBuffer(nil)
-	binary.Write(buffer, binary.BigEndian, length)
-
 	conn.SetWriteDeadline(time.Now().Add(time.Second * 2))
-	_, err := conn.Write(append(buffer.Bytes(), data...))
+	buffer := make([]byte, 4+len(data))
+	binary.BigEndian.PutUint32(buffer[:4], uint32(len(data)))
+	copy(buffer[4:], data)
+	_, err := conn.Write(buffer)
 	return err
 }
 
@@ -178,14 +182,16 @@ type WireStats struct {
 //
 // 改动：
 //   - queue 改为有界 LRU（防止无限增长）
-//   - Run() 改为 semaphore 等待模式（不再丢弃请求）
+//   - Run() 使用固定 worker 池，降低高负载调度开销
 type Wire struct {
-	blackList    *blackList
-	queue        *cache.LRU // 有界 LRU，替代原来的 syncedMap
-	requests     chan Request
-	responses    chan Response
-	workerTokens chan struct{} // semaphore：控制并发 goroutine 数量
-	Stats        WireStats
+	blackList   *blackList
+	queue       *cache.LRU // 有界 LRU，替代原来的 syncedMap
+	requests    chan Request
+	responses   chan Response
+	workerCount int
+	active      atomic.Int64
+	peerID      []byte
+	Stats       WireStats
 }
 
 // NewWire 创建一个 Wire 实例。
@@ -204,13 +210,20 @@ func NewWire(blackListSize, requestQueueSize, workerQueueSize int) *Wire {
 	if queueCap < 4096 {
 		queueCap = 4096
 	}
-	return &Wire{
-		blackList:    newBlackList(blackListSize),
-		queue:        cache.NewLRU(queueCap),
-		requests:     make(chan Request, requestQueueSize),
-		responses:    make(chan Response, workerQueueSize*2),
-		workerTokens: make(chan struct{}, workerQueueSize),
+	responseQueueSize := workerQueueSize * 16
+	if responseQueueSize < 4096 {
+		responseQueueSize = 4096
 	}
+	w := &Wire{
+		blackList:   newBlackList(blackListSize),
+		queue:       cache.NewLRU(queueCap),
+		requests:    make(chan Request, requestQueueSize),
+		responses:   make(chan Response, responseQueueSize),
+		workerCount: workerQueueSize,
+		peerID:      []byte("-CH0001-" + randomString(12)),
+	}
+	w.active.Store(int64(workerQueueSize))
+	return w
 }
 
 // Request 将请求放入队列。队列满时直接丢弃（调用方是 UDP 包处理 goroutine，不能阻塞）。
@@ -224,6 +237,32 @@ func (wire *Wire) Request(infoHash []byte, ip string, port int) {
 // Response 返回 metadata 响应 channel，供上层消费。
 func (wire *Wire) Response() <-chan Response {
 	return wire.responses
+}
+
+func (wire *Wire) SetActiveWorkers(n int) {
+	if n < 1 {
+		n = 1
+	}
+	if n > wire.workerCount {
+		n = wire.workerCount
+	}
+	wire.active.Store(int64(n))
+}
+
+func (wire *Wire) ActiveWorkers() int {
+	return int(wire.active.Load())
+}
+
+func (wire *Wire) MaxWorkers() int {
+	return wire.workerCount
+}
+
+func (wire *Wire) RequestDepth() int {
+	return len(wire.requests)
+}
+
+func (wire *Wire) ResponseDepth() int {
+	return len(wire.responses)
 }
 
 // isDone 检查所有分片是否已下载完成。
@@ -245,17 +284,18 @@ func (wire *Wire) requestPieces(
 		buffer[0] = EXTENDED
 		buffer[1] = byte(utMetadata)
 
-		msg := Encode(map[string]interface{}{
-			"msg_type": REQUEST,
-			"piece":    i,
-		})
+		length := appendMetadataRequest(buffer[:2], i)
 
-		length := len(msg) + 2
-		copy(buffer[2:length], msg)
-
-		sendMessage(conn, buffer[:length])
+		_ = sendMessage(conn, buffer[:length])
 	}
 	buffer = nil
+}
+
+func appendMetadataRequest(buf []byte, piece int) int {
+	buf = append(buf, "d8:msg_typei0e5:piecei"...)
+	buf = strconv.AppendInt(buf, int64(piece), 10)
+	buf = append(buf, "ee"...)
+	return len(buf)
 }
 
 // extractInfoBytes 从原始 .torrent 文件字节中提取 info dict 的原始 bencode 字节。
@@ -321,7 +361,7 @@ func (wire *Wire) fetchMetadata(r Request, key string) {
 	data := bytes.NewBuffer(nil)
 	data.Grow(BLOCK)
 
-	if sendHandshake(conn, infoHash, []byte(randomString(20))) != nil ||
+	if sendHandshake(conn, infoHash, wire.peerID) != nil ||
 		read(conn, 68, data) != nil ||
 		onHandshake(data.Next(68)) != nil ||
 		sendExtHandshake(conn) != nil {
@@ -407,8 +447,15 @@ func (wire *Wire) fetchMetadata(r Request, key string) {
 			piece := dict["piece"].(int)
 			pieceLen := length - 2 - index
 
-			if (piece != piecesNum-1 && pieceLen != BLOCK) ||
-				(piece == piecesNum-1 && pieceLen != metadataSize%BLOCK) {
+			if piece < 0 || piece >= piecesNum {
+				return
+			}
+
+			expectedPieceLen := BLOCK
+			if piece == piecesNum-1 && metadataSize%BLOCK != 0 {
+				expectedPieceLen = metadataSize % BLOCK
+			}
+			if pieceLen != expectedPieceLen {
 				return
 			}
 
@@ -437,45 +484,47 @@ func (wire *Wire) fetchMetadata(r Request, key string) {
 
 // Run 启动 peer wire 协议处理循环。
 //
-// 关键改动：semaphore 等待模式。
-// 原版在 workerTokens 满时执行 `default: continue` 直接丢弃请求，
-// 高负载下导致大量 metadata 请求被丢弃。
-// 新版改为阻塞等待 token（wire.workerTokens <- struct{}{}），
-// 背压自然传导到 wire.requests channel，不会丢失已入队的请求。
+// 固定 worker 池比“每个请求一个 goroutine + semaphore”更适合极高负载：
+// 并发上限严格固定，调度开销低，请求 channel 的背压仍然自然传导给上游。
 func (wire *Wire) Run() {
 	go wire.blackList.clear()
 
-	for r := range wire.requests {
-		// 生成去重 key：infohash:ip:port
-		key := strings.Join([]string{
-			string(r.InfoHash), genAddress(r.IP, r.Port),
-		}, ":")
-
-		// 基本校验：infohash 必须是 20 字节，且不在黑名单
-		if len(r.InfoHash) != 20 || wire.blackList.in(r.IP, r.Port) {
-			if len(r.InfoHash) == 20 {
-				wire.Stats.Blacklisted.Add(1)
-			}
-			continue
-		}
-
-		// 有界 LRU 去重：key 已存在（正在下载或最近下载过）则跳过
-		// Set 返回 false 表示已存在（seen），返回 true 表示首次出现
-		if !wire.queue.Set(key) {
-			continue
-		}
-
-		// 阻塞等待 semaphore token（替代原版的 default: continue 丢弃模式）
-		// 背压机制：当并发 goroutine 达到上限时，从 requests channel 读取会暂停，
-		// 上游 UDP 包处理的 default 分支会开始丢弃新请求，但已入队的不会丢失。
-		wire.workerTokens <- struct{}{}
-
-		go func(r Request, key string) {
-			defer func() {
-				// 释放 semaphore token
-				<-wire.workerTokens
-			}()
-			wire.fetchMetadata(r, key)
-		}(r, key)
+	for i := 0; i < wire.workerCount; i++ {
+		go wire.runWorker(i)
 	}
+
+	select {}
+}
+
+func (wire *Wire) runWorker(workerID int) {
+	for {
+		if workerID >= wire.ActiveWorkers() {
+			time.Sleep(250 * time.Millisecond)
+			continue
+		}
+		r, ok := <-wire.requests
+		if !ok {
+			return
+		}
+		wire.handleRequest(r)
+	}
+}
+
+func (wire *Wire) handleRequest(r Request) {
+	key := strings.Join([]string{
+		string(r.InfoHash), genAddress(r.IP, r.Port),
+	}, ":")
+
+	if len(r.InfoHash) != 20 || wire.blackList.in(r.IP, r.Port) {
+		if len(r.InfoHash) == 20 {
+			wire.Stats.Blacklisted.Add(1)
+		}
+		return
+	}
+
+	if !wire.queue.Set(key) {
+		return
+	}
+
+	wire.fetchMetadata(r, key)
 }

@@ -218,6 +218,57 @@ func handleRequestCrawl(dht *DHT, addr *net.UDPAddr,
 	return true
 }
 
+func handleRequestCrawlFast(dht *DHT, addr *net.UDPAddr, pkt crawlPacket) bool {
+	if pkt.t == "" || len(pkt.id) != 20 {
+		return false
+	}
+
+	switch pkt.q {
+	case pingType:
+		sendCrawlPingResp(dht, addr, pkt.t, pkt.id)
+
+	case findNodeType:
+		if len(pkt.target) != 20 {
+			return false
+		}
+		sendCrawlNodesResp(dht, addr, pkt.t, pkt.target,
+			dht.routingTable.GetCachedNeighborNodes())
+
+	case getPeersType:
+		if len(pkt.infoHash) != 20 {
+			return false
+		}
+		sendCrawlGetPeersResp(dht, addr, pkt.t, pkt.infoHash,
+			dht.routingTable.GetCachedNeighborNodes())
+		if dht.OnGetPeers != nil {
+			dht.OnGetPeers(pkt.infoHash, addr.IP.String(), addr.Port)
+		}
+
+	case announcePeerType:
+		if len(pkt.infoHash) != 20 {
+			return false
+		}
+		port := pkt.port
+		if pkt.implied != 0 {
+			port = addr.Port
+		}
+		sendCrawlPingResp(dht, addr, pkt.t, pkt.id)
+		if dht.OnAnnouncePeer != nil {
+			dht.OnAnnouncePeer(pkt.infoHash, addr.IP.String(), port)
+		}
+
+	default:
+		return false
+	}
+
+	if atomic.LoadInt64(&dht.routingTable.nodeCount) < int64(dht.MaxNodes) {
+		if no, err := newNodeFromAddr(pkt.id, addr); err == nil {
+			dht.routingTable.Insert(no)
+		}
+	}
+	return true
+}
+
 // newNodeFromAddr 从原始 ID 和 UDPAddr 创建节点，避免 newNode 中
 // net.ResolveUDPAddr(addr.String()) 的字符串往返分配。
 func newNodeFromAddr(id string, addr *net.UDPAddr) (*node, error) {

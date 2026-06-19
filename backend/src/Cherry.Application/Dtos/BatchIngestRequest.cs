@@ -55,3 +55,9 @@ public class CrawlerFile
     [JsonPropertyName("length")]
     public long Length { get; init; }
 }
+
+public class PeerCountsRequest
+{
+    [JsonPropertyName("hashes")]
+    public Dictionary<string, int> Hashes { get; init; } = [];
+}

@@ -339,10 +339,17 @@ public static class TorrentEndpoints
     }
 
     private static async Task<IResult> UpdatePeerCountsAsync(
-        Dictionary<string, int> hashes,
+        [FromBody] PeerCountsRequest? request,
         ITorrentRepository repo,
         CancellationToken ct)
     {
+        var hashes = request?.Hashes
+            .Where(kv =>
+                kv.Value > 0 &&
+                kv.Key.Length == 40 &&
+                kv.Key.All(c => c is >= 'a' and <= 'f' or >= '0' and <= '9'))
+            .ToDictionary(kv => kv.Key.ToLowerInvariant(), kv => kv.Value) ?? [];
+
         if (hashes.Count == 0) return Results.Ok();
         await repo.BatchUpdatePeerCountsAsync(hashes, ct);
         return Results.Ok();
