@@ -1,10 +1,53 @@
 package app
 
 import (
+	"context"
 	"testing"
 
 	"cherry-picker/internal/config"
+	"cherry-picker/internal/pipeline"
 )
+
+func TestSubmitMetadataEventSendsWhenSpace(t *testing.T) {
+	app := New(defaultTestConfig(), testLogger())
+	events := make(chan pipeline.Event, 1)
+	stats := &runtimeStats{}
+
+	app.submitMetadataEvent(context.Background(), events, pipeline.Event{
+		Type: pipeline.EventMetadataFetched, Metadata: &pipeline.Metadata{Name: "x"},
+	}, stats)
+
+	if got := len(events); got != 1 {
+		t.Fatalf("len(events) = %d, want 1", got)
+	}
+	if got := stats.metadataEventsSent.Load(); got != 1 {
+		t.Fatalf("sent = %d, want 1", got)
+	}
+	if got := stats.metadataEventsDropped.Load(); got != 0 {
+		t.Fatalf("dropped = %d, want 0", got)
+	}
+}
+
+func TestSubmitMetadataEventBlocksThenDropsOnCancel(t *testing.T) {
+	app := New(defaultTestConfig(), testLogger())
+	events := make(chan pipeline.Event, 1)
+	events <- pipeline.Event{Type: pipeline.EventMetadataFetched} // fill it
+	stats := &runtimeStats{}
+
+	// 通道已满 + ctx 已取消 → 不应无限阻塞，应记为 drop（而非静默丢弃或死锁）
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	app.submitMetadataEvent(ctx, events, pipeline.Event{
+		Type: pipeline.EventMetadataFetched, Metadata: &pipeline.Metadata{Name: "y"},
+	}, stats)
+
+	if got := stats.metadataEventsSent.Load(); got != 0 {
+		t.Fatalf("sent = %d, want 0", got)
+	}
+	if got := stats.metadataEventsDropped.Load(); got != 1 {
+		t.Fatalf("dropped = %d, want 1 (should count drop on ctx cancel, not deadlock)", got)
+	}
+}
 
 func TestResolveMemLimitExplicitConfig(t *testing.T) {
 	cfg := config.Config{MemLimitMB: 4096}

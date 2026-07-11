@@ -267,6 +267,7 @@ func (a *Application) Run(ctx context.Context) error {
 		dhtCfg.Address = addr
 		dhtCfg.PacketWorkerLimit = a.cfg.Discovery.PacketWorkers
 		dhtCfg.PacketJobLimit = a.cfg.Discovery.PacketJobs
+		dhtCfg.PacketReadWorkers = a.cfg.Discovery.ReadWorkers
 		dhtCfg.MaxNodes = a.cfg.Discovery.MaxNodes
 		dhtCfg.RefreshNodeNum = a.cfg.Discovery.RefreshNodes
 		dhtCfg.NodeIDFile = a.nodeIDPath(i)
@@ -916,7 +917,12 @@ func (a *Application) consumeMetadata(
 			// 只累加 peer count）。热门种子有成百上千个宣告 peer，缺少这一行
 			// 会导致同一 metadata 被完整重复下载，浪费稀缺的 wire worker。
 			a.remoteKnown.Set(ihHex)
-			a.submitEvent(events, pipeline.Event{
+			// metadata 是整条流水线的产物：下载它花了一个稀缺 wire worker 的
+			// 拨号+握手+传输。这里用阻塞式提交而非丢弃——导出通道满（后端 429
+			// 背压时 httpSink 会 sleep 30s）时宁可让 consumeMetadata 等待，
+			// 背压经 responses/requests 通道自然回传到拨号侧放慢下载，也绝不
+			// 丢弃已下载的 metadata。peer/infohash 事件廉价、可丢，仍走非阻塞。
+			a.submitMetadataEvent(ctx, events, pipeline.Event{
 				Type:       pipeline.EventMetadataFetched,
 				Timestamp:  time.Now().UTC(),
 				InstanceID: a.cfg.InstanceID,
@@ -925,7 +931,7 @@ func (a *Application) consumeMetadata(
 				IP:         response.IP,
 				Port:       response.Port,
 				Metadata:   metadata,
-			}, stats.metadataEventsDropped.Add, stats.metadataEventsSent.Add)
+			}, stats)
 		}
 	}
 }
@@ -1072,6 +1078,30 @@ func (a *Application) submitEvent(events chan<- pipeline.Event, event pipeline.E
 		onSuccess(1)
 	default:
 		onDrop(1)
+	}
+}
+
+// submitMetadataEvent 阻塞式提交 metadata 事件，永不丢弃已下载的产物。
+// 通道满时等待，直到导出侧腾出空间或进程退出（ctx 取消）。
+func (a *Application) submitMetadataEvent(ctx context.Context, events chan<- pipeline.Event, event pipeline.Event, stats *runtimeStats) {
+	if !a.shouldExportEvent(event) {
+		return
+	}
+
+	// 快路径：通道有空位立即入队，不进入 select 的调度开销。
+	select {
+	case events <- event:
+		stats.metadataEventsSent.Add(1)
+		return
+	default:
+	}
+
+	// 慢路径：通道已满（后端背压），阻塞等待而非丢弃。
+	select {
+	case events <- event:
+		stats.metadataEventsSent.Add(1)
+	case <-ctx.Done():
+		stats.metadataEventsDropped.Add(1)
 	}
 }
 

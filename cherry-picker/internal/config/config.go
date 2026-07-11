@@ -39,6 +39,7 @@ type DiscoveryConfig struct {
 	EmitPeerEvents bool
 	PacketWorkers  int
 	PacketJobs     int
+	ReadWorkers    int
 	MaxNodes       int
 	RefreshNodes   int
 	NodeIDFile     string
@@ -114,6 +115,7 @@ func Load() (Config, error) {
 			EmitPeerEvents: getenvBool("CHERRY_PICKER_EMIT_PEER_EVENTS", true),
 			PacketWorkers:  getenvInt("CHERRY_PICKER_DHT_PACKET_WORKERS", defaultPacketWorkers()),
 			PacketJobs:     getenvInt("CHERRY_PICKER_DHT_PACKET_JOBS", defaultPacketJobs()),
+			ReadWorkers:    getenvInt("CHERRY_PICKER_DHT_READ_WORKERS", 0),
 			MaxNodes:       getenvInt("CHERRY_PICKER_DHT_MAX_NODES", defaultMaxNodes()),
 			RefreshNodes:   getenvInt("CHERRY_PICKER_DHT_REFRESH_NODES", defaultRefreshNodes()),
 			NodeIDFile:     getenvDefault("CHERRY_PICKER_NODE_ID_FILE", ""),
@@ -181,6 +183,7 @@ func loadFromFile(path string) (Config, error) {
 			EmitPeerEvents: raw.Discovery.EmitPeerEvents,
 			PacketWorkers:  intOrDefault(raw.Discovery.PacketWorkers, 512),
 			PacketJobs:     intOrDefault(raw.Discovery.PacketJobs, 65536),
+			ReadWorkers:    raw.Discovery.ReadWorkers,
 			MaxNodes:       intOrDefault(raw.Discovery.MaxNodes, 50000),
 			RefreshNodes:   intOrDefault(raw.Discovery.RefreshNodes, 2048),
 			NodeIDFile:     strings.TrimSpace(raw.Discovery.NodeIDFile),
@@ -328,6 +331,7 @@ type fileDiscoveryConfig struct {
 	EmitPeerEvents bool   `json:"emit_peer_events"`
 	PacketWorkers  int    `json:"packet_workers"`
 	PacketJobs     int    `json:"packet_jobs"`
+	ReadWorkers    int    `json:"read_workers"`
 	MaxNodes       int    `json:"max_nodes"`
 	RefreshNodes   int    `json:"refresh_nodes"`
 	NodeIDFile     string `json:"node_id_file"`

@@ -73,6 +73,11 @@ type Config struct {
 	PacketJobLimit int
 	// the size of packet handler
 	PacketWorkerLimit int
+	// PacketReadWorkers 是并发从 UDP socket 读取的 goroutine 数。
+	// 单读取 goroutine 时"read syscall → 入队 → 再 read"串行执行，高包率下
+	// 会在内核 recv buffer 溢出前先卡在用户态；多读取 goroutine 让多个
+	// recvfrom syscall 并发在飞，把内核缓冲的包及时取走。0 = 自动。
+	PacketReadWorkers int
 	// the nodes num to be fresh in a kbucket
 	RefreshNodeNum int
 	// NodeIDFile is the path to persist the node ID across restarts.
@@ -292,34 +297,61 @@ func (dht *DHT) join() {
 	}
 }
 
-// listen receives message from udp.
+// listen receives message from udp. It runs readWorkerCount() concurrent
+// reader goroutines, each pulling datagrams off the shared socket. ReadFromUDP
+// is safe for concurrent use; each call returns a distinct datagram.
 func (dht *DHT) listen() {
-	go func() {
-		for {
-			buff := dht.packetPool.Get().([]byte)
-			n, raddr, err := dht.conn.ReadFromUDP(buff)
-			if err != nil {
-				dht.packetPool.Put(buff)
-				continue
-			}
-			dht.stats.received.Add(1)
-			dht.stats.bytesReceived.Add(uint64(n))
+	readers := dht.readWorkerCount()
+	for i := 0; i < readers; i++ {
+		go dht.readLoop()
+	}
+}
 
-			pkt := packet{
-				data:   buff[:n],
-				buffer: buff,
-				raddr:  raddr,
-			}
-
-			select {
-			case dht.packets <- pkt:
-				dht.stats.enqueued.Add(1)
-			default:
-				dht.stats.dropped.Add(1)
-				pkt.release(dht)
-			}
+func (dht *DHT) readLoop() {
+	for {
+		buff := dht.packetPool.Get().([]byte)
+		n, raddr, err := dht.conn.ReadFromUDP(buff)
+		if err != nil {
+			dht.packetPool.Put(buff)
+			continue
 		}
-	}()
+		dht.stats.received.Add(1)
+		dht.stats.bytesReceived.Add(uint64(n))
+
+		pkt := packet{
+			data:   buff[:n],
+			buffer: buff,
+			raddr:  raddr,
+		}
+
+		select {
+		case dht.packets <- pkt:
+			dht.stats.enqueued.Add(1)
+		default:
+			dht.stats.dropped.Add(1)
+			pkt.release(dht)
+		}
+	}
+}
+
+// readWorkerCount returns how many concurrent socket readers to run.
+func (dht *DHT) readWorkerCount() int {
+	if dht.PacketReadWorkers > 0 {
+		return dht.PacketReadWorkers
+	}
+	if !dht.IsCrawlMode() {
+		return 1
+	}
+	// 爬虫模式：默认 2 个读取 goroutine/socket。部署通常已有多个监听端口
+	// （各自独立 socket），无需在单 socket 上堆太多读取协程。
+	readers := runtime.NumCPU() / 2
+	if readers < 2 {
+		readers = 2
+	}
+	if readers > 8 {
+		readers = 8
+	}
+	return readers
 }
 
 func (dht *DHT) PacketStats() PacketStats {
