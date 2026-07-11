@@ -151,19 +151,23 @@ type DHT struct {
 }
 
 type packetStats struct {
-	received     atomic.Uint64
-	enqueued     atomic.Uint64
-	dropped      atomic.Uint64
-	handled      atomic.Uint64
-	decodeErrors atomic.Uint64
+	received      atomic.Uint64
+	enqueued      atomic.Uint64
+	dropped       atomic.Uint64
+	handled       atomic.Uint64
+	decodeErrors  atomic.Uint64
+	bytesReceived atomic.Uint64
+	bytesSent     atomic.Uint64
 }
 
 type PacketStats struct {
-	Received     uint64
-	Enqueued     uint64
-	Dropped      uint64
-	Handled      uint64
-	DecodeErrors uint64
+	Received      uint64
+	Enqueued      uint64
+	Dropped       uint64
+	Handled       uint64
+	DecodeErrors  uint64
+	BytesReceived uint64
+	BytesSent     uint64
 }
 
 // New returns a DHT pointer. If config is nil, then config will be set to
@@ -299,6 +303,7 @@ func (dht *DHT) listen() {
 				continue
 			}
 			dht.stats.received.Add(1)
+			dht.stats.bytesReceived.Add(uint64(n))
 
 			pkt := packet{
 				data:   buff[:n],
@@ -319,12 +324,24 @@ func (dht *DHT) listen() {
 
 func (dht *DHT) PacketStats() PacketStats {
 	return PacketStats{
-		Received:     dht.stats.received.Load(),
-		Enqueued:     dht.stats.enqueued.Load(),
-		Dropped:      dht.stats.dropped.Load(),
-		Handled:      dht.stats.handled.Load(),
-		DecodeErrors: dht.stats.decodeErrors.Load(),
+		Received:      dht.stats.received.Load(),
+		Enqueued:      dht.stats.enqueued.Load(),
+		Dropped:       dht.stats.dropped.Load(),
+		Handled:       dht.stats.handled.Load(),
+		DecodeErrors:  dht.stats.decodeErrors.Load(),
+		BytesReceived: dht.stats.bytesReceived.Load(),
+		BytesSent:     dht.stats.bytesSent.Load(),
 	}
+}
+
+// writeToUDP 发送 UDP 报文并累加出站字节计数（带宽可观测性）。
+// 所有出站路径（快速路径直接构造 + 标准 Encode 路径）都应经由此方法。
+func (dht *DHT) writeToUDP(buf []byte, addr *net.UDPAddr) (int, error) {
+	n, err := dht.conn.WriteToUDP(buf, addr)
+	if n > 0 {
+		dht.stats.bytesSent.Add(uint64(n))
+	}
+	return n, err
 }
 
 // id returns a id near to target if target is not null, otherwise it returns

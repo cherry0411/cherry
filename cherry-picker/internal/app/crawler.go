@@ -36,6 +36,7 @@ import (
 	"cherry-picker/internal/export"
 	"cherry-picker/internal/filter"
 	"cherry-picker/internal/pipeline"
+	"cherry-picker/internal/sysres"
 
 	"golang.org/x/text/encoding/simplifiedchinese"
 	"golang.org/x/text/transform"
@@ -70,6 +71,13 @@ type Application struct {
 
 	// 自适应调优：内存压力高时暂停 metadata 请求入队
 	metaPaused atomic.Bool
+
+	// memLimit 是启动时探测的进程内存上限（字节），用于推导 LRU 容量、
+	// GC 软上限和 autotune 阈值。
+	memLimit uint64
+	// cpuUtilPct 是 autotune 采样的 Go 进程 CPU 利用率（百分比 ×100，
+	// 即 9550 = 95.50%），供 tuneWireWorkers 等其他调优回路无锁读取。
+	cpuUtilPct atomic.Uint64
 
 	// filterChain 在 metadata 上报前执行规则过滤。
 	filterChain *filter.Chain
@@ -120,6 +128,8 @@ type statsSnapshot struct {
 	dhtPacketsDropped       uint64
 	dhtPacketsHandled       uint64
 	dhtPacketDecodeErrors   uint64
+	dhtBytesReceived        uint64
+	dhtBytesSent            uint64
 	wireDialAttempts        int64
 	wireDialOK              int64
 	wireHandshakeOK         int64
@@ -156,10 +166,12 @@ func New(cfg config.Config, logger *log.Logger) *Application {
 	if logger == nil {
 		logger = log.Default()
 	}
-	lruCaps := newLRUCaps(cfg)
+	memLimit := resolveMemLimit(cfg)
+	lruCaps := newLRUCaps(cfg, memLimit)
 	return &Application{
-		cfg:    cfg,
-		logger: logger,
+		cfg:      cfg,
+		logger:   logger,
+		memLimit: memLimit,
 
 		infohashSeen:        cache.NewLRU(lruCaps.infohashSeen),
 		peerSeen:            cache.NewLRU(lruCaps.peerSeen),
@@ -170,8 +182,31 @@ func New(cfg config.Config, logger *log.Logger) *Application {
 		peerCounts:  make(map[string]int, 4096),
 		filterChain: buildFilterChain(cfg.Filter),
 		rejectQueue: make(chan string, 10_000),
-		apiClient:   &http.Client{Timeout: 10 * time.Second},
+		// check/peers/reject 三条上报回路共用此 client，均为对同一后端 host
+		// 的高频小 POST。默认 Transport 的 MaxIdleConnsPerHost=2 会导致
+		// 并发 worker 不断新建/关闭 TCP 连接，这里放大空闲连接池。
+		apiClient: &http.Client{
+			Timeout: 10 * time.Second,
+			Transport: &http.Transport{
+				MaxIdleConns:        128,
+				MaxIdleConnsPerHost: 64,
+				IdleConnTimeout:     90 * time.Second,
+			},
+		},
 	}
+}
+
+// resolveMemLimit 返回进程可用内存上限（字节）。
+// 优先级：显式配置 > 系统/cgroup 探测（取 70%，为 OS 和其他进程留余量）> 2GB 兜底。
+func resolveMemLimit(cfg config.Config) uint64 {
+	if cfg.MemLimitMB > 0 {
+		return uint64(cfg.MemLimitMB) * 1024 * 1024
+	}
+	if total := sysres.TotalMemory(); total > 0 {
+		limit := total * 70 / 100
+		return clampUint64(limit, 1<<30, 64<<30) // [1GB, 64GB]
+	}
+	return 2 << 30
 }
 
 // Run 启动爬虫，阻塞直到 ctx 取消。
@@ -243,6 +278,17 @@ func (a *Application) Run(ctx context.Context) error {
 		go d.Run()
 	}
 
+	// GC 策略：软上限设为探测到的内存上限（cgroup/物理内存的 70%），
+	// GOGC 初始 200 拿内存换 CPU；autoTuneLoop 会根据 heap 水位在
+	// 100~400 之间动态调节（见 tuneGC）。必须在 autoTuneLoop 启动前设置，
+	// 因为 autoTuneThresholds 会读取当前 memory limit。
+	debug.SetMemoryLimit(int64(a.memLimit))
+	debug.SetGCPercent(gogcDefault)
+	a.logger.Printf("resources: mem_limit=%dMB gogc=%d lru=[ih=%d peer=%d metaReq=%d metaRes=%d remote=%d]",
+		a.memLimit/1024/1024, gogcDefault,
+		a.infohashSeen.Cap(), a.peerSeen.Cap(),
+		a.metadataRequestSeen.Cap(), a.metadataResultSeen.Cap(), a.remoteKnown.Cap())
+
 	// 后台 goroutines
 	go a.emitStats(ctx, events, stats, downloader)
 	go a.flushPeerCountsLoop(ctx)
@@ -251,8 +297,6 @@ func (a *Application) Run(ctx context.Context) error {
 	if a.cfg.AutoTune {
 		go a.autoTuneLoop(ctx)
 	}
-	debug.SetGCPercent(100)
-	debug.SetMemoryLimit(2_000_000_000) // 2GB — 防止 heap 增长到 3GB+ 触发系统 swap
 
 	a.logger.Printf("started: instance=%s listen=%v meta_workers=%d nodes_per_dht=%d dht_count=%d",
 		a.cfg.InstanceID, addrs,
@@ -400,16 +444,28 @@ func (a *Application) pollPendingRequests(ctx context.Context) {
 	}
 }
 
-// autoTuneLoop 每30秒采样内存和队列状态，动态调整 metadata 入队。
+// gogcDefault 是启动时的 GOGC；autotune 在 gogcMin~gogcMax 间动态调节。
+const (
+	gogcDefault = 200
+	gogcMin     = 100
+	gogcMax     = 400
+)
+
+// autoTuneLoop 每30秒采样内存、CPU 和队列状态，动态调整运行参数。
 //
-// 策略：
-//   - HeapInuse > 500MB → 暂停 metadata 请求入队，强制 GC，等内存降下来
-//   - HeapInuse < 300MB → 恢复入队
+// 调节的参数：
+//   - metaPaused：heap 接近内存上限时暂停 metadata 请求入队（防 OOM 最后防线）
+//   - GOGC：按 heap 水位在 100~400 间调节——内存富余时少跑 GC 省 CPU，
+//     内存紧张时勤跑 GC 压 heap（见 tuneGC）
+//   - cpuUtilPct：采样进程 CPU 利用率，供 tuneWireWorkers 读取
 func (a *Application) autoTuneLoop(ctx context.Context) {
-	ticker := time.NewTicker(30 * time.Second)
+	const tickInterval = 30 * time.Second
+	ticker := time.NewTicker(tickInterval)
 	defer ticker.Stop()
 	pauseThreshold, resumeThreshold := a.autoTuneThresholds()
 	controller := &autoTuneController{}
+	gogcCurrent := gogcDefault
+	var prevIdleCPU, prevTotalCPU float64
 	a.logger.Printf("autotune: enabled pause=%dMB resume=%dMB", pauseThreshold/1024/1024, resumeThreshold/1024/1024)
 
 	for {
@@ -421,11 +477,32 @@ func (a *Application) autoTuneLoop(ctx context.Context) {
 			samples := []runtimemetrics.Sample{
 				{Name: "/memory/classes/heap/objects:bytes"},
 				{Name: "/memory/classes/heap/inuse:bytes"},
+				{Name: "/cpu/classes/idle:cpu-seconds"},
+				{Name: "/cpu/classes/total:cpu-seconds"},
 			}
 			runtimemetrics.Read(samples)
 			heapAlloc := samples[0].Value.Uint64()
 			heapInUse := samples[1].Value.Uint64()
+			idleCPU := samples[2].Value.Float64()
+			totalCPU := samples[3].Value.Float64()
 			paused := a.metaPaused.Load()
+
+			// CPU 利用率 = 1 - idle/total（本采样周期的增量）
+			cpuUtil := 0.0
+			if dTotal := totalCPU - prevTotalCPU; dTotal > 0 {
+				cpuUtil = 1 - (idleCPU-prevIdleCPU)/dTotal
+				if cpuUtil < 0 {
+					cpuUtil = 0
+				}
+				if cpuUtil > 1 {
+					cpuUtil = 1
+				}
+			}
+			prevIdleCPU, prevTotalCPU = idleCPU, totalCPU
+			a.cpuUtilPct.Store(uint64(cpuUtil * 10_000))
+
+			// 按 heap 水位调节 GOGC（内存换 CPU 的核心旋钮）
+			gogcCurrent = a.tuneGC(gogcCurrent, heapInUse)
 
 			action := controller.nextAction(time.Now(), paused, heapAlloc, pauseThreshold, resumeThreshold)
 
@@ -440,13 +517,34 @@ func (a *Application) autoTuneLoop(ctx context.Context) {
 				a.logger.Printf("autotune: metadata resumed (heap_alloc=%dMB < %dMB, heap_inuse=%dMB)",
 					heapAlloc/1024/1024, resumeThreshold/1024/1024, heapInUse/1024/1024)
 			default:
-				a.logger.Printf("autotune: heap_alloc=%dMB heap_inuse=%dMB paused=%v seenSizes=[ih=%d peer=%d metaReq=%d remote=%d]",
-					heapAlloc/1024/1024, heapInUse/1024/1024, paused,
+				a.logger.Printf("autotune: heap_alloc=%dMB heap_inuse=%dMB cpu=%.0f%% gogc=%d paused=%v seenSizes=[ih=%d peer=%d metaReq=%d remote=%d]",
+					heapAlloc/1024/1024, heapInUse/1024/1024, cpuUtil*100, gogcCurrent, paused,
 					a.infohashSeen.Len(), a.peerSeen.Len(),
 					a.metadataRequestSeen.Len(), a.remoteKnown.Len())
 			}
 		}
 	}
+}
+
+// tuneGC 按 heap 占内存上限的比例调节 GOGC，返回生效值。
+//
+//	< 50% → GOGC 400：内存富余，让 heap 涨、GC 少跑，省下的 CPU 给收发包
+//	50~70% → GOGC 200：过渡区
+//	> 70% → GOGC 100：接近上限，勤跑 GC 压住 heap（配合 SetMemoryLimit 兜底）
+func (a *Application) tuneGC(current int, heapInUse uint64) int {
+	target := gogcDefault
+	switch {
+	case heapInUse > a.memLimit*70/100:
+		target = gogcMin
+	case heapInUse < a.memLimit*50/100:
+		target = gogcMax
+	}
+	if target != current {
+		debug.SetGCPercent(target)
+		a.logger.Printf("autotune: gogc %d -> %d (heap_inuse=%dMB / limit=%dMB)",
+			current, target, heapInUse/1024/1024, a.memLimit/1024/1024)
+	}
+	return target
 }
 
 func (c *autoTuneController) nextAction(now time.Time, paused bool, heapAlloc, pauseThreshold, resumeThreshold uint64) autoTuneAction {
@@ -520,8 +618,15 @@ func (a *Application) tuneWireWorkers(ctx context.Context, downloader *dht.Wire)
 			reqDepth := downloader.RequestDepth()
 			respDepth := downloader.ResponseDepth()
 
+			// CPU 利用率（由 autoTuneLoop 采样；autotune 关闭时恒为 0，不影响判断）
+			cpuUtil := float64(a.cpuUtilPct.Load()) / 10_000
+
 			if a.metaPaused.Load() {
 				target = minWorkers
+			} else if cpuUtil > 0.95 && active > minWorkers {
+				// CPU 过载：wire worker 的握手/SHA1/bencode 解析在抢占
+				// UDP 收包和 DHT 处理的 CPU，收缩让位给发现侧
+				target = active * 3 / 4
 			} else if respDepth > active*8 && active > minWorkers {
 				target = active * 3 / 4
 			} else if attemptsDelta > 0 {
@@ -534,6 +639,8 @@ func (a *Application) tuneWireWorkers(ctx context.Context, downloader *dht.Wire)
 				switch {
 				case attemptsDelta > int64(active*2) && (dialRate < 0.005 || (dialOKDelta > 32 && handshakeRate < 0.01)):
 					target = active * 3 / 4
+				case cpuUtil > 0.90:
+					// CPU 接近饱和：保持现状，不再扩容
 				case reqDepth > active*4 && dialRate >= 0.02 && handshakeRate >= 0.03:
 					target = active + maxInt(16, active/4)
 				case reqDepth > active && downloadDelta > int64(maxInt(8, active/2)):
@@ -552,22 +659,40 @@ func (a *Application) tuneWireWorkers(ctx context.Context, downloader *dht.Wire)
 	}
 }
 
-func newLRUCaps(cfg config.Config) lruCapConfig {
-	cpuScale := runtime.GOMAXPROCS(0)
-	if cpuScale < 1 {
-		cpuScale = 1
-	}
+// lruEntryBytes 是单个 LRU 条目的估算内存占用：
+// map bucket + list.Element + entry 结构 + key 字符串（40~90 字节）。
+const lruEntryBytes = 192
 
-	peerCap := clampInt(cpuScale*10_000, 20_000, 80_000)
-	infohashCap := clampInt(cpuScale*12_000, 24_000, 80_000)
-	metadataRequestCap := clampInt(cpuScale*16_000, 32_000, 120_000)
-	metadataResultCap := clampInt(cpuScale*12_000, 24_000, 80_000)
-	remoteKnownCap := clampInt(cpuScale*16_000, 32_000, 120_000)
+// newLRUCaps 按内存上限缩放各去重 LRU 的容量。
+//
+// 去重缓存是"内存换带宽"最直接的杠杆：容量不足时 remoteKnown /
+// metadataRequestSeen 频繁淘汰，同一 infohash 被反复拨号、重复下载，
+// 浪费 wire worker 和带宽。这里拿内存上限的 ~15% 做去重预算，
+// 一台 8GB 机器（limit≈5.6GB）可支撑约 440 万条目。
+func newLRUCaps(cfg config.Config, memLimit uint64) lruCapConfig {
+	if memLimit == 0 {
+		memLimit = 2 << 30
+	}
+	budget := memLimit * 15 / 100
+	totalEntries := int(budget / lruEntryBytes)
+	// 下限保持旧版最小值量级，避免极小内存机器上容量过低
+	totalEntries = clampInt(totalEntries, 200_000, 50_000_000)
+
+	// 分配比例：拦截重复下载的两个缓存（remoteKnown、metadataRequestSeen）
+	// 直接节省 wire worker，拿最大份额。
+	remoteKnownCap := totalEntries * 30 / 100
+	metadataRequestCap := totalEntries * 30 / 100
+	infohashCap := totalEntries * 15 / 100
+	peerCap := totalEntries * 15 / 100
+	metadataResultCap := totalEntries * 10 / 100
 
 	switch cfg.Role {
 	case "discovery":
-		metadataRequestCap = 32_000
-		metadataResultCap = 32_000
+		// discovery 不下载 metadata，把预算让给 peer/infohash 去重
+		metadataRequestCap = totalEntries * 5 / 100
+		metadataResultCap = totalEntries * 5 / 100
+		infohashCap = totalEntries * 30 / 100
+		peerCap = totalEntries * 30 / 100
 	case "metadata":
 		peerCap /= 2
 		infohashCap /= 2
@@ -786,6 +911,11 @@ func (a *Application) consumeMetadata(
 				continue
 			}
 			ok.Add(1)
+			// 下载成功后立即标记为已知：后续同一 hash 的其他 peer 宣告会在
+			// queueMetadataRequest 的 remoteKnown 检查处被短路（跳过重复下载，
+			// 只累加 peer count）。热门种子有成百上千个宣告 peer，缺少这一行
+			// 会导致同一 metadata 被完整重复下载，浪费稀缺的 wire worker。
+			a.remoteKnown.Set(ihHex)
 			a.submitEvent(events, pipeline.Event{
 				Type:       pipeline.EventMetadataFetched,
 				Timestamp:  time.Now().UTC(),
@@ -831,6 +961,8 @@ func (a *Application) emitStats(ctx context.Context, events chan<- pipeline.Even
 				dhtPacketsDropped:       packetStats.Dropped,
 				dhtPacketsHandled:       packetStats.Handled,
 				dhtPacketDecodeErrors:   packetStats.DecodeErrors,
+				dhtBytesReceived:        packetStats.BytesReceived,
+				dhtBytesSent:            packetStats.BytesSent,
 				wireDialAttempts:        downloader.Stats.DialAttempts.Load(),
 				wireDialOK:              downloader.Stats.DialOK.Load(),
 				wireHandshakeOK:         downloader.Stats.HandshakeOK.Load(),
@@ -868,6 +1000,8 @@ func (a *Application) emitStats(ctx context.Context, events chan<- pipeline.Even
 					"dht_packets_dropped":       current.dhtPacketsDropped,
 					"dht_packets_handled":       current.dhtPacketsHandled,
 					"dht_packet_decode_errors":  current.dhtPacketDecodeErrors,
+					"dht_bytes_received":        current.dhtBytesReceived,
+					"dht_bytes_sent":            current.dhtBytesSent,
 				},
 			}, func(delta uint64) uint64 { return delta }, func(delta uint64) uint64 { return delta })
 		}
@@ -875,12 +1009,18 @@ func (a *Application) emitStats(ctx context.Context, events chan<- pipeline.Even
 }
 
 func (a *Application) logRuntimeDelta(current, previous statsSnapshot) {
+	// DHT UDP 带宽（不含 peer-wire TCP 流量），KB/s
+	const interval = 30
+	netInKBps := (current.dhtBytesReceived - previous.dhtBytesReceived) / 1024 / interval
+	netOutKBps := (current.dhtBytesSent - previous.dhtBytesSent) / 1024 / interval
 	a.logger.Printf(
-		"runtime 30s: dht_recv=%d handled=%d dropped=%d decode_err=%d peer_sent=%d peer_drop=%d peer_dedup=%d meta_req=%d meta_req_dedup=%d meta_sent=%d meta_drop=%d meta_dedup=%d meta_filtered=%d check_drop=%d paused=%v wire_dial=%d wire_conn=%d wire_hs=%d wire_ok=%d wire_bl=%d",
+		"runtime 30s: dht_recv=%d handled=%d dropped=%d decode_err=%d net_in=%dKB/s net_out=%dKB/s peer_sent=%d peer_drop=%d peer_dedup=%d meta_req=%d meta_req_dedup=%d meta_sent=%d meta_drop=%d meta_dedup=%d meta_filtered=%d check_drop=%d paused=%v wire_dial=%d wire_conn=%d wire_hs=%d wire_ok=%d wire_bl=%d",
 		current.dhtPacketsReceived-previous.dhtPacketsReceived,
 		current.dhtPacketsHandled-previous.dhtPacketsHandled,
 		current.dhtPacketsDropped-previous.dhtPacketsDropped,
 		current.dhtPacketDecodeErrors-previous.dhtPacketDecodeErrors,
+		netInKBps,
+		netOutKBps,
 		current.peerEventsSent-previous.peerEventsSent,
 		current.peerEventsDropped-previous.peerEventsDropped,
 		current.peerEventsDeduped-previous.peerEventsDeduped,
@@ -1047,6 +1187,8 @@ func (a *Application) aggregatePacketStats() dht.PacketStats {
 		agg.Dropped += ps.Dropped
 		agg.Handled += ps.Handled
 		agg.DecodeErrors += ps.DecodeErrors
+		agg.BytesReceived += ps.BytesReceived
+		agg.BytesSent += ps.BytesSent
 	}
 	return agg
 }

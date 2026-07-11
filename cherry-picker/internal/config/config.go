@@ -24,6 +24,9 @@ type Config struct {
 	Exporter    ExporterConfig
 	AutoTune    bool
 	TargetCPU   float64
+	// MemLimitMB 显式指定进程内存上限（MB）。0 = 自动探测
+	// （Linux 取 min(物理内存, cgroup 限制)，Windows 取物理内存，各留 30% 余量）。
+	MemLimitMB int
 }
 
 type DedupeConfig struct {
@@ -99,8 +102,9 @@ func Load() (Config, error) {
 		ListenAddrs: getenvDefault("CHERRY_PICKER_LISTEN_ADDRS", ""),
 		EventQueue:  getenvInt("CHERRY_PICKER_EVENT_QUEUE", defaultEventQueue()),
 		BrokerURL:   getenvDefault("CHERRY_PICKER_BROKER_URL", ""),
-		AutoTune:    getenvBool("CHERRY_PICKER_AUTO_TUNE", false),
+		AutoTune:    getenvBool("CHERRY_PICKER_AUTO_TUNE", true),
 		TargetCPU:   float64(getenvInt("CHERRY_PICKER_TARGET_CPU", 80)) / 100.0,
+		MemLimitMB:  getenvInt("CHERRY_PICKER_MEM_LIMIT_MB", 0),
 		Dedupe: DedupeConfig{
 			PeerTTL:     getenvDuration("CHERRY_PICKER_DEDUPE_PEER_TTL", 10*time.Minute),
 			MetadataTTL: getenvDuration("CHERRY_PICKER_DEDUPE_METADATA_TTL", 30*time.Minute),
@@ -154,12 +158,20 @@ func loadFromFile(path string) (Config, error) {
 		return Config{}, err
 	}
 
+	// auto_tune 未在 JSON 中出现时默认开启
+	autoTune := true
+	if raw.AutoTune != nil {
+		autoTune = *raw.AutoTune
+	}
+
 	cfg := Config{
 		Role:        strings.ToLower(strings.TrimSpace(raw.Role)),
 		InstanceID:  strings.TrimSpace(raw.InstanceID),
 		ListenAddr:  strings.TrimSpace(raw.ListenAddr),
 		ListenAddrs: strings.TrimSpace(raw.ListenAddrs),
 		EventQueue:  raw.EventQueue,
+		AutoTune:    autoTune,
+		MemLimitMB:  raw.MemLimitMB,
 		Dedupe: DedupeConfig{
 			PeerTTL:     parseDuration(raw.Dedupe.PeerTTL),
 			MetadataTTL: parseDuration(raw.Dedupe.MetadataTTL),
@@ -291,6 +303,8 @@ type fileConfig struct {
 	ListenAddr  string              `json:"listen_addr"`
 	ListenAddrs string              `json:"listen_addrs"`
 	EventQueue  int                 `json:"event_queue"`
+	AutoTune    *bool               `json:"auto_tune"`
+	MemLimitMB  int                 `json:"mem_limit_mb"`
 	Dedupe      fileDedupeConfig    `json:"dedupe"`
 	Discovery   fileDiscoveryConfig `json:"discovery"`
 	Metadata    fileMetadataConfig  `json:"metadata"`
@@ -425,12 +439,15 @@ func defaultRefreshNodes() int {
 }
 
 func defaultMetadataWorkers() int {
-	value := cpuScale() * 256
-	if value < 512 {
-		return 512
+	// wire worker 是 I/O-bound（绝大部分时间阻塞在拨号超时/网络读），
+	// 上限可远超核数；实际并发由 tuneWireWorkers 按拨号成功率和 CPU
+	// 利用率动态收缩，这里只定天花板。
+	value := cpuScale() * 512
+	if value < 1024 {
+		return 1024
 	}
-	if value > 2048 {
-		return 2048
+	if value > 4096 {
+		return 4096
 	}
 	return value
 }

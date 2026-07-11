@@ -50,7 +50,7 @@ func sendCrawlPingResp(dht *DHT, addr *net.UDPAddr, t, targetID string) {
 	buf = append(buf, ':')
 	buf = append(buf, t...)
 	buf = append(buf, "1:y1:re"...)
-	dht.conn.WriteToUDP(buf, addr)
+	dht.writeToUDP(buf, addr)
 	crawlResponsePool.Put(buf)
 }
 
@@ -69,7 +69,7 @@ func sendCrawlNodesResp(dht *DHT, addr *net.UDPAddr, t, targetID, nodes string) 
 	buf = append(buf, ':')
 	buf = append(buf, t...)
 	buf = append(buf, "1:y1:re"...)
-	dht.conn.WriteToUDP(buf, addr)
+	dht.writeToUDP(buf, addr)
 	crawlResponsePool.Put(buf)
 }
 
@@ -88,7 +88,7 @@ func sendCrawlGetPeersResp(dht *DHT, addr *net.UDPAddr, t, infoHash, nodes strin
 	buf = append(buf, ':')
 	buf = append(buf, t...)
 	buf = append(buf, "1:y1:re"...)
-	dht.conn.WriteToUDP(buf, addr)
+	dht.writeToUDP(buf, addr)
 	crawlResponsePool.Put(buf)
 }
 
@@ -109,7 +109,7 @@ func sendCrawlFindNodeQuery(dht *DHT, addr *net.UDPAddr, target string) {
 	buf = append(buf, ':')
 	buf = append(buf, txID...)
 	buf = append(buf, "1:y1:qe"...)
-	dht.conn.WriteToUDP(buf, addr)
+	dht.writeToUDP(buf, addr)
 	crawlResponsePool.Put(buf)
 }
 
@@ -134,7 +134,7 @@ func sendCrawlGetPeersQuery(dht *DHT, no *node, infoHash string) {
 	buf = append(buf, ':')
 	buf = append(buf, txID...)
 	buf = append(buf, "1:y1:qe"...)
-	dht.conn.WriteToUDP(buf, no.addr)
+	dht.writeToUDP(buf, no.addr)
 	crawlResponsePool.Put(buf)
 }
 

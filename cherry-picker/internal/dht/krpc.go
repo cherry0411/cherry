@@ -135,7 +135,7 @@ func makeError(t string, errCode int, errMsg string) map[string]interface{} {
 func send(dht *DHT, addr *net.UDPAddr, data map[string]interface{}) error {
 	// 使用 EncodeBytes 直接编码到 []byte，避免 Encode() → string → []byte 的双重拷贝。
 	buf := EncodeBytes(data)
-	_, err := dht.conn.WriteToUDP(buf, addr)
+	_, err := dht.writeToUDP(buf, addr)
 	if err != nil && !dht.IsCrawlMode() {
 		dht.blackList.insert(addr.IP.String(), -1)
 	}

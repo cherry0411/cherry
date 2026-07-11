@@ -52,10 +52,17 @@ func NewLRU(capacity int) *LRU {
 		if shardCap < 1 {
 			shardCap = 1
 		}
+		// map 初始 hint 封顶：make(map, n) 会立即预分配 n 容量的桶数组，
+		// 百万级容量下 5 个 LRU 会在启动时空耗数百 MB。让 map 按实际
+		// 填充增长，容量上限仍由 evict 保证。
+		hint := shardCap
+		if hint > 4096 {
+			hint = 4096
+		}
 		shards = append(shards, &lruShard{
 			capacity: shardCap,
 			list:     list.New(),
-			items:    make(map[string]*list.Element, shardCap),
+			items:    make(map[string]*list.Element, hint),
 		})
 	}
 
@@ -116,6 +123,15 @@ func (c *LRU) Delete(key string) bool {
 	shard.list.Remove(elem)
 	delete(shard.items, key)
 	return true
+}
+
+// Cap 返回缓存的总容量。
+func (c *LRU) Cap() int {
+	total := 0
+	for _, shard := range c.shards {
+		total += shard.capacity
+	}
+	return total
 }
 
 // Len 返回当前缓存中的条目数。
