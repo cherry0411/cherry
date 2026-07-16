@@ -2,6 +2,8 @@ package app
 
 import (
 	"context"
+	runtimemetrics "runtime/metrics"
+	"slices"
 	"testing"
 
 	"cherry-picker/internal/config"
@@ -88,5 +90,61 @@ func TestTuneGCByHeapWatermark(t *testing.T) {
 	}
 	if got := a.tuneGC(gogcDefault, 800); got != gogcMin {
 		t.Fatalf("high watermark: gogc = %d, want %d", got, gogcMin)
+	}
+}
+
+func TestReadRuntimeResources(t *testing.T) {
+	samples := []runtimemetrics.Sample{
+		{Name: "/memory/classes/heap/objects:bytes"},
+		{Name: "/memory/classes/heap/unused:bytes"},
+		{Name: "/cpu/classes/idle:cpu-seconds"},
+		{Name: "/cpu/classes/total:cpu-seconds"},
+	}
+	heapAlloc, heapInUse, _, totalCPU, ok := readRuntimeResources(samples)
+	if !ok {
+		t.Fatal("stable runtime resource metrics should be available")
+	}
+	if heapAlloc == 0 || heapInUse < heapAlloc {
+		t.Fatalf("invalid heap metrics: alloc=%d inuse=%d", heapAlloc, heapInUse)
+	}
+	if totalCPU < 0 {
+		t.Fatalf("total CPU must be non-negative: %f", totalCPU)
+	}
+}
+
+func TestReadRuntimeResourcesRejectsUnavailableMetric(t *testing.T) {
+	samples := []runtimemetrics.Sample{
+		{Name: "/memory/classes/heap/objects:bytes"},
+		{Name: "/memory/classes/heap/not-a-real-metric:bytes"},
+		{Name: "/cpu/classes/idle:cpu-seconds"},
+		{Name: "/cpu/classes/total:cpu-seconds"},
+	}
+	if _, _, _, _, ok := readRuntimeResources(samples); ok {
+		t.Fatal("unavailable metric should be rejected instead of panicking")
+	}
+}
+
+func TestListenAddrsExpandsInstances(t *testing.T) {
+	a := &Application{cfg: config.Config{
+		ListenAddr: ":20003",
+		Discovery:  config.DiscoveryConfig{Instances: 3},
+	}}
+	got, err := a.listenAddrs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{":20003", ":20004", ":20005"}
+	if !slices.Equal(got, want) {
+		t.Fatalf("listenAddrs = %v, want %v", got, want)
+	}
+}
+
+func TestListenAddrsRejectsPortOverflow(t *testing.T) {
+	a := &Application{cfg: config.Config{
+		ListenAddr: ":65535",
+		Discovery:  config.DiscoveryConfig{Instances: 2},
+	}}
+	if _, err := a.listenAddrs(); err == nil {
+		t.Fatal("listenAddrs accepted a port range above 65535")
 	}
 }

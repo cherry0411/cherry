@@ -171,11 +171,14 @@ type Response struct {
 
 // WireStats 提供 wire 层的诊断计数器，所有字段均为原子操作安全。
 type WireStats struct {
-	DialAttempts atomic.Int64 // TCP dial 尝试次数
-	DialOK       atomic.Int64 // TCP dial 成功
-	HandshakeOK  atomic.Int64 // BT + extension 握手成功
-	DownloadOK   atomic.Int64 // metadata 下载并校验成功
-	Blacklisted  atomic.Int64 // 被黑名单跳过的请求数
+	DialAttempts    atomic.Int64 // TCP dial 尝试次数
+	DialOK          atomic.Int64 // TCP dial 成功
+	DialFailed      atomic.Int64 // TCP dial 失败
+	HandshakeOK     atomic.Int64 // BT + extension 握手成功
+	HandshakeFailed atomic.Int64 // BT 或 extension 握手失败
+	DownloadOK      atomic.Int64 // metadata 下载并校验成功
+	DownloadFailed  atomic.Int64 // 握手后 metadata 下载或校验失败
+	Blacklisted     atomic.Int64 // 被黑名单跳过的请求数
 }
 
 // Wire 表示 peer wire 协议下载器。
@@ -321,9 +324,6 @@ func extractInfoBytes(torrentData []byte) ([]byte, error) {
 // fetchMetadata 连接 peer，通过 extension protocol 下载 info dict。
 // 完成后（成功或失败）都会从 queue 中删除 key，避免泄漏。
 func (wire *Wire) fetchMetadata(r Request, key string) {
-	// 请求完成后释放 inflight 去重键，允许同一 peer 在后续重新尝试。
-	defer wire.queue.Delete(key)
-
 	var (
 		length       int
 		msgType      byte
@@ -333,9 +333,32 @@ func (wire *Wire) fetchMetadata(r Request, key string) {
 		metadataSize int
 	)
 
+	const (
+		wireStageDial = iota
+		wireStageHandshake
+		wireStageDownload
+		wireStageDone
+	)
+	stage := wireStageDial
+
 	defer func() {
+		// 请求完成后释放 inflight 去重键，允许同一 peer 在后续重新尝试。
+		wire.queue.Delete(key)
 		pieces = nil
-		recover()
+		_ = recover()
+
+		switch stage {
+		case wireStageDial:
+			wire.Stats.DialFailed.Add(1)
+			wire.blackList.insert(r.IP, r.Port)
+		case wireStageHandshake:
+			wire.Stats.HandshakeFailed.Add(1)
+			// 一个不支持 BT/extension 握手的 endpoint 对其它 infohash 也没有
+			// 下载价值；尽早淘汰，避免热点坏节点反复占用 worker。
+			wire.blackList.insert(r.IP, r.Port)
+		case wireStageDownload:
+			wire.Stats.DownloadFailed.Add(1)
+		}
 	}()
 
 	infoHash := r.InfoHash
@@ -344,10 +367,10 @@ func (wire *Wire) fetchMetadata(r Request, key string) {
 	wire.Stats.DialAttempts.Add(1)
 	dial, err := net.DialTimeout("tcp", address, 500*time.Millisecond)
 	if err != nil {
-		wire.blackList.insert(r.IP, r.Port)
 		return
 	}
 	wire.Stats.DialOK.Add(1)
+	stage = wireStageHandshake
 	conn := dial.(*net.TCPConn)
 	conn.SetLinger(0)
 	defer conn.Close()
@@ -368,6 +391,7 @@ func (wire *Wire) fetchMetadata(r Request, key string) {
 		return
 	}
 	wire.Stats.HandshakeOK.Add(1)
+	stage = wireStageDownload
 
 	for {
 		if time.Now().After(deadline) {
@@ -474,6 +498,7 @@ func (wire *Wire) fetchMetadata(r Request, key string) {
 					Request:      r,
 					MetadataInfo: metadataInfo,
 				}
+				stage = wireStageDone
 				return
 			}
 		default:

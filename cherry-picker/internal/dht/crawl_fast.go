@@ -121,8 +121,7 @@ func sendCrawlGetPeersQuery(dht *DHT, no *node, infoHash string) {
 		return
 	}
 	txID := dht.crawlGenTxID()
-	idx := crawlTxIdx(txID)
-	copy(dht.crawlTxBuf[idx][:], infoHash)
+	dht.rememberCrawlInfoHash(txID, infoHash)
 
 	buf := crawlResponsePool.Get().([]byte)[:0]
 	buf = append(buf, "d1:ad2:id20:"...)

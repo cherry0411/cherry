@@ -291,8 +291,7 @@ func (tm *transactionManager) query(q *query, try int) {
 		if q.data["q"] == getPeersType {
 			if a, ok := q.data["a"].(map[string]interface{}); ok {
 				if ih, ok := a["info_hash"].(string); ok && len(ih) == 20 {
-					idx := crawlTxIdx(q.data["t"].(string))
-					copy(tm.dht.crawlTxBuf[idx][:], ih)
+					tm.dht.rememberCrawlInfoHash(q.data["t"].(string), ih)
 				}
 			}
 		}

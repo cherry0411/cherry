@@ -81,30 +81,38 @@ func (be *BatchExporter) Run(ctx context.Context) error {
 	defer ticker.Stop()
 
 	batch := make([]pipeline.Event, 0, be.batchSize)
-	flush := func() {
+	flush := func() bool {
 		if len(batch) == 0 {
-			return
+			return true
 		}
 		flushCtx, cancel := context.WithTimeout(context.Background(), be.flushTimeout)
 		defer cancel()
 		if err := be.sink.WriteBatch(flushCtx, batch); err != nil {
 			be.logger.Printf("export batch failed: %v", err)
+			return false
 		}
 		batch = batch[:0]
+		return true
 	}
 
 	for {
+		// 持久化失败时暂停消费事件，保持 batch 有界并把背压传回生产者。
+		// WAL 正常时 WriteBatch 会确认成功，不会进入此路径。
+		var eventInput <-chan pipeline.Event
+		if len(batch) < be.batchSize {
+			eventInput = be.events
+		}
 		select {
 		case <-ctx.Done():
-			flush()
+			_ = flush()
 			return nil
-		case event := <-be.events:
+		case event := <-eventInput:
 			batch = append(batch, event)
 			if len(batch) >= be.batchSize {
-				flush()
+				_ = flush()
 			}
 		case <-ticker.C:
-			flush()
+			_ = flush()
 		}
 	}
 }

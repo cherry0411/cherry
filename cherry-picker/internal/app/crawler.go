@@ -15,8 +15,10 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"path/filepath"
 	"runtime"
@@ -105,6 +107,9 @@ type runtimeStats struct {
 	checkBatchesQueued      atomic.Uint64
 	checkBatchesDropped     atomic.Uint64
 	checkBatchesProcessed   atomic.Uint64
+	activeLookupsQueued     atomic.Uint64
+	activeLookupsDropped    atomic.Uint64
+	activeLookupsSent       atomic.Uint64
 }
 
 type statsSnapshot struct {
@@ -119,6 +124,9 @@ type statsSnapshot struct {
 	checkBatchesQueued      uint64
 	checkBatchesDropped     uint64
 	checkBatchesProcessed   uint64
+	activeLookupsQueued     uint64
+	activeLookupsDropped    uint64
+	activeLookupsSent       uint64
 	metadataEventsSent      uint64
 	metadataEventsDropped   uint64
 	metadataEventsDeduped   uint64
@@ -132,8 +140,11 @@ type statsSnapshot struct {
 	dhtBytesSent            uint64
 	wireDialAttempts        int64
 	wireDialOK              int64
+	wireDialFailed          int64
 	wireHandshakeOK         int64
+	wireHandshakeFailed     int64
 	wireDownloadOK          int64
+	wireDownloadFailed      int64
 	wireBlacklisted         int64
 }
 
@@ -225,6 +236,7 @@ func (a *Application) Run(ctx context.Context) error {
 	// checkQueue：批量向 API 检查 hash 是否已存在
 	checkQueue := make(chan string, 16_384)
 	go a.runCheckLoop(ctx, checkQueue, stats)
+	lookupQueue := make(chan string, a.cfg.Discovery.LookupQueue)
 
 	// peer wire metadata 下载器
 	downloader := dht.NewWire(a.cfg.Metadata.BlackListSize, a.cfg.Metadata.RequestQueueSize, a.cfg.Metadata.WorkerQueueSize)
@@ -240,6 +252,7 @@ func (a *Application) Run(ctx context.Context) error {
 		now := time.Now().UTC()
 		ihHex := hex.EncodeToString([]byte(infoHash))
 		a.submitInfohashEvent(events, ihHex, ip, port, "get_peers", stats, now)
+		a.queueActiveLookup(lookupQueue, ihHex, stats)
 	}
 	onGetPeersResponse := func(infoHash string, peer *dht.Peer) {
 		now := time.Now().UTC()
@@ -258,13 +271,20 @@ func (a *Application) Run(ctx context.Context) error {
 		a.queueMetadataRequest(downloader, ihHex, ip, port, stats, checkQueue)
 	}
 
-	addrs := a.listenAddrs()
+	addrs, err := a.listenAddrs()
+	if err != nil {
+		return err
+	}
+	dhtErrors := make(chan error, len(addrs))
 	for i, addr := range addrs {
 		dhtCfg := dht.NewCrawlConfig()
 		if a.cfg.Discovery.Mode == "standard" {
 			dhtCfg = dht.NewStandardConfig()
 		}
 		dhtCfg.Address = addr
+		if primeNodes := splitCommaSeparated(a.cfg.Discovery.PrimeNodes); len(primeNodes) > 0 {
+			dhtCfg.PrimeNodes = primeNodes
+		}
 		dhtCfg.PacketWorkerLimit = a.cfg.Discovery.PacketWorkers
 		dhtCfg.PacketJobLimit = a.cfg.Discovery.PacketJobs
 		dhtCfg.PacketReadWorkers = a.cfg.Discovery.ReadWorkers
@@ -276,7 +296,14 @@ func (a *Application) Run(ctx context.Context) error {
 		dhtCfg.OnAnnouncePeer = onAnnouncePeer
 		d := dht.New(dhtCfg)
 		a.dhts = append(a.dhts, d)
-		go d.Run()
+		go func(addr string, d *dht.DHT) {
+			if runErr := d.Run(); runErr != nil {
+				dhtErrors <- fmt.Errorf("start DHT listener %s: %w", addr, runErr)
+			}
+		}(addr, d)
+	}
+	if a.cfg.Metadata.Enabled && a.cfg.Discovery.ActiveLookup {
+		go a.runActiveLookupLoop(ctx, lookupQueue, stats)
 	}
 
 	// GC 策略：软上限设为探测到的内存上限（cgroup/物理内存的 70%），
@@ -303,9 +330,64 @@ func (a *Application) Run(ctx context.Context) error {
 		a.cfg.InstanceID, addrs,
 		a.cfg.Metadata.WorkerQueueSize, a.cfg.Discovery.MaxNodes, len(a.dhts))
 
-	<-ctx.Done()
-	a.logger.Printf("shutdown")
-	return nil
+	select {
+	case <-ctx.Done():
+		a.logger.Printf("shutdown")
+		return nil
+	case err := <-dhtErrors:
+		return err
+	}
+}
+
+func (a *Application) queueActiveLookup(queue chan<- string, infoHash string, stats *runtimeStats) {
+	if !a.cfg.Metadata.Enabled || !a.cfg.Discovery.ActiveLookup || a.remoteKnown.ContainsAndTouch(infoHash) {
+		return
+	}
+	// Prefix keeps these keys distinct from the source/peer keys that share the
+	// same bounded LRU in discovery and combined modes.
+	if !a.infohashSeen.Set("lookup|" + infoHash) {
+		return
+	}
+	select {
+	case queue <- infoHash:
+		stats.activeLookupsQueued.Add(1)
+	default:
+		stats.activeLookupsDropped.Add(1)
+	}
+}
+
+func (a *Application) runActiveLookupLoop(ctx context.Context, queue <-chan string, stats *runtimeStats) {
+	rate := a.cfg.Discovery.LookupRate
+	interval := time.Second / time.Duration(rate)
+	if interval < time.Millisecond {
+		interval = time.Millisecond
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	cursor := 0
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case infoHash := <-queue:
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+			}
+			if len(a.dhts) == 0 || a.remoteKnown.ContainsAndTouch(infoHash) {
+				continue
+			}
+			count := min(a.cfg.Discovery.LookupDHTs, len(a.dhts))
+			for i := 0; i < count; i++ {
+				d := a.dhts[(cursor+i)%len(a.dhts)]
+				if d.GetPeersLimit(infoHash, a.cfg.Discovery.LookupNodes) == nil {
+					stats.activeLookupsSent.Add(1)
+				}
+			}
+			cursor = (cursor + count) % len(a.dhts)
+		}
+	}
 }
 
 // --- 内部 goroutine ---
@@ -467,6 +549,15 @@ func (a *Application) autoTuneLoop(ctx context.Context) {
 	controller := &autoTuneController{}
 	gogcCurrent := gogcDefault
 	var prevIdleCPU, prevTotalCPU float64
+	// runtime/metrics has no /memory/classes/heap/inuse metric. HeapInuse is
+	// equivalent to object bytes plus the unused tail space in in-use spans.
+	// Allocate this slice once; the 30s control loop can safely reuse it.
+	samples := []runtimemetrics.Sample{
+		{Name: "/memory/classes/heap/objects:bytes"},
+		{Name: "/memory/classes/heap/unused:bytes"},
+		{Name: "/cpu/classes/idle:cpu-seconds"},
+		{Name: "/cpu/classes/total:cpu-seconds"},
+	}
 	a.logger.Printf("autotune: enabled pause=%dMB resume=%dMB", pauseThreshold/1024/1024, resumeThreshold/1024/1024)
 
 	for {
@@ -475,17 +566,11 @@ func (a *Application) autoTuneLoop(ctx context.Context) {
 			return
 		case <-ticker.C:
 			// G11: runtime/metrics avoids STW unlike ReadMemStats.
-			samples := []runtimemetrics.Sample{
-				{Name: "/memory/classes/heap/objects:bytes"},
-				{Name: "/memory/classes/heap/inuse:bytes"},
-				{Name: "/cpu/classes/idle:cpu-seconds"},
-				{Name: "/cpu/classes/total:cpu-seconds"},
+			heapAlloc, heapInUse, idleCPU, totalCPU, ok := readRuntimeResources(samples)
+			if !ok {
+				a.logger.Printf("autotune: runtime metrics unavailable; skipping sample")
+				continue
 			}
-			runtimemetrics.Read(samples)
-			heapAlloc := samples[0].Value.Uint64()
-			heapInUse := samples[1].Value.Uint64()
-			idleCPU := samples[2].Value.Float64()
-			totalCPU := samples[3].Value.Float64()
 			paused := a.metaPaused.Load()
 
 			// CPU 利用率 = 1 - idle/total（本采样周期的增量）
@@ -525,6 +610,27 @@ func (a *Application) autoTuneLoop(ctx context.Context) {
 			}
 		}
 	}
+}
+
+// readRuntimeResources reads the small set of stable runtime metrics used by
+// the controller. Checking Kind before accessing values keeps a renamed or
+// unavailable metric from crashing a long-running crawler.
+func readRuntimeResources(samples []runtimemetrics.Sample) (heapAlloc, heapInUse uint64, idleCPU, totalCPU float64, ok bool) {
+	if len(samples) != 4 {
+		return 0, 0, 0, 0, false
+	}
+	runtimemetrics.Read(samples)
+	if samples[0].Value.Kind() != runtimemetrics.KindUint64 ||
+		samples[1].Value.Kind() != runtimemetrics.KindUint64 ||
+		samples[2].Value.Kind() != runtimemetrics.KindFloat64 ||
+		samples[3].Value.Kind() != runtimemetrics.KindFloat64 {
+		return 0, 0, 0, 0, false
+	}
+	heapAlloc = samples[0].Value.Uint64()
+	heapInUse = heapAlloc + samples[1].Value.Uint64()
+	idleCPU = samples[2].Value.Float64()
+	totalCPU = samples[3].Value.Float64()
+	return heapAlloc, heapInUse, idleCPU, totalCPU, true
 }
 
 // tuneGC 按 heap 占内存上限的比例调节 GOGC，返回生效值。
@@ -815,7 +921,7 @@ func (a *Application) queueMetadataRequest(downloader *dht.Wire, ihHex, ip strin
 	}
 
 	// 已被远端 API 确认存在：跳过下载，只累加 peer count
-	if a.remoteKnown.Contains(ihHex) {
+	if a.remoteKnown.ContainsAndTouch(ihHex) {
 		stats.metadataRequestsDeduped.Add(1)
 		a.incPeerCount(ihHex)
 		return
@@ -958,6 +1064,9 @@ func (a *Application) emitStats(ctx context.Context, events chan<- pipeline.Even
 				checkBatchesQueued:      stats.checkBatchesQueued.Load(),
 				checkBatchesDropped:     stats.checkBatchesDropped.Load(),
 				checkBatchesProcessed:   stats.checkBatchesProcessed.Load(),
+				activeLookupsQueued:     stats.activeLookupsQueued.Load(),
+				activeLookupsDropped:    stats.activeLookupsDropped.Load(),
+				activeLookupsSent:       stats.activeLookupsSent.Load(),
 				metadataEventsSent:      stats.metadataEventsSent.Load(),
 				metadataEventsDropped:   stats.metadataEventsDropped.Load(),
 				metadataEventsDeduped:   stats.metadataEventsDeduped.Load(),
@@ -971,8 +1080,11 @@ func (a *Application) emitStats(ctx context.Context, events chan<- pipeline.Even
 				dhtBytesSent:            packetStats.BytesSent,
 				wireDialAttempts:        downloader.Stats.DialAttempts.Load(),
 				wireDialOK:              downloader.Stats.DialOK.Load(),
+				wireDialFailed:          downloader.Stats.DialFailed.Load(),
 				wireHandshakeOK:         downloader.Stats.HandshakeOK.Load(),
+				wireHandshakeFailed:     downloader.Stats.HandshakeFailed.Load(),
 				wireDownloadOK:          downloader.Stats.DownloadOK.Load(),
+				wireDownloadFailed:      downloader.Stats.DownloadFailed.Load(),
 				wireBlacklisted:         downloader.Stats.Blacklisted.Load(),
 			}
 			a.logRuntimeDelta(current, previous)
@@ -997,6 +1109,9 @@ func (a *Application) emitStats(ctx context.Context, events chan<- pipeline.Even
 					"check_batches_queued":      current.checkBatchesQueued,
 					"check_batches_dropped":     current.checkBatchesDropped,
 					"check_batches_processed":   current.checkBatchesProcessed,
+					"active_lookups_queued":     current.activeLookupsQueued,
+					"active_lookups_dropped":    current.activeLookupsDropped,
+					"active_lookups_sent":       current.activeLookupsSent,
 					"metadata_events_sent":      current.metadataEventsSent,
 					"metadata_events_dropped":   current.metadataEventsDropped,
 					"metadata_events_deduped":   current.metadataEventsDeduped,
@@ -1008,6 +1123,14 @@ func (a *Application) emitStats(ctx context.Context, events chan<- pipeline.Even
 					"dht_packet_decode_errors":  current.dhtPacketDecodeErrors,
 					"dht_bytes_received":        current.dhtBytesReceived,
 					"dht_bytes_sent":            current.dhtBytesSent,
+					"wire_dial_attempts":        uint64(current.wireDialAttempts),
+					"wire_dial_ok":              uint64(current.wireDialOK),
+					"wire_dial_failed":          uint64(current.wireDialFailed),
+					"wire_handshake_ok":         uint64(current.wireHandshakeOK),
+					"wire_handshake_failed":     uint64(current.wireHandshakeFailed),
+					"wire_download_ok":          uint64(current.wireDownloadOK),
+					"wire_download_failed":      uint64(current.wireDownloadFailed),
+					"wire_blacklisted":          uint64(current.wireBlacklisted),
 				},
 			}, func(delta uint64) uint64 { return delta }, func(delta uint64) uint64 { return delta })
 		}
@@ -1020,13 +1143,16 @@ func (a *Application) logRuntimeDelta(current, previous statsSnapshot) {
 	netInKBps := (current.dhtBytesReceived - previous.dhtBytesReceived) / 1024 / interval
 	netOutKBps := (current.dhtBytesSent - previous.dhtBytesSent) / 1024 / interval
 	a.logger.Printf(
-		"runtime 30s: dht_recv=%d handled=%d dropped=%d decode_err=%d net_in=%dKB/s net_out=%dKB/s peer_sent=%d peer_drop=%d peer_dedup=%d meta_req=%d meta_req_dedup=%d meta_sent=%d meta_drop=%d meta_dedup=%d meta_filtered=%d check_drop=%d paused=%v wire_dial=%d wire_conn=%d wire_hs=%d wire_ok=%d wire_bl=%d",
+		"runtime 30s: dht_recv=%d handled=%d dropped=%d decode_err=%d net_in=%dKB/s net_out=%dKB/s lookup_queue=%d lookup_drop=%d lookup_sent=%d peer_sent=%d peer_drop=%d peer_dedup=%d meta_req=%d meta_req_dedup=%d meta_sent=%d meta_drop=%d meta_dedup=%d meta_filtered=%d check_drop=%d paused=%v wire_dial=%d wire_conn=%d wire_dial_fail=%d wire_hs=%d wire_hs_fail=%d wire_ok=%d wire_dl_fail=%d wire_bl=%d",
 		current.dhtPacketsReceived-previous.dhtPacketsReceived,
 		current.dhtPacketsHandled-previous.dhtPacketsHandled,
 		current.dhtPacketsDropped-previous.dhtPacketsDropped,
 		current.dhtPacketDecodeErrors-previous.dhtPacketDecodeErrors,
 		netInKBps,
 		netOutKBps,
+		current.activeLookupsQueued-previous.activeLookupsQueued,
+		current.activeLookupsDropped-previous.activeLookupsDropped,
+		current.activeLookupsSent-previous.activeLookupsSent,
 		current.peerEventsSent-previous.peerEventsSent,
 		current.peerEventsDropped-previous.peerEventsDropped,
 		current.peerEventsDeduped-previous.peerEventsDeduped,
@@ -1040,8 +1166,11 @@ func (a *Application) logRuntimeDelta(current, previous statsSnapshot) {
 		a.metaPaused.Load(),
 		current.wireDialAttempts-previous.wireDialAttempts,
 		current.wireDialOK-previous.wireDialOK,
+		current.wireDialFailed-previous.wireDialFailed,
 		current.wireHandshakeOK-previous.wireHandshakeOK,
+		current.wireHandshakeFailed-previous.wireHandshakeFailed,
 		current.wireDownloadOK-previous.wireDownloadOK,
+		current.wireDownloadFailed-previous.wireDownloadFailed,
 		current.wireBlacklisted-previous.wireBlacklisted,
 	)
 }
@@ -1182,20 +1311,38 @@ func buildFilterChain(cfg config.FilterConfig) *filter.Chain {
 
 // --- 辅助函数 ---
 
-func (a *Application) listenAddrs() []string {
-	if a.cfg.ListenAddrs != "" {
-		parts := strings.Split(a.cfg.ListenAddrs, ",")
-		addrs := make([]string, 0, len(parts))
-		for _, p := range parts {
-			if p = strings.TrimSpace(p); p != "" {
-				addrs = append(addrs, p)
-			}
-		}
-		if len(addrs) > 0 {
-			return addrs
+func (a *Application) listenAddrs() ([]string, error) {
+	if addrs := splitCommaSeparated(a.cfg.ListenAddrs); len(addrs) > 0 {
+		return addrs, nil
+	}
+	count := a.cfg.Discovery.Instances
+	if count <= 1 {
+		return []string{a.cfg.ListenAddr}, nil
+	}
+	host, rawPort, err := net.SplitHostPort(a.cfg.ListenAddr)
+	if err != nil {
+		return nil, fmt.Errorf("expand listen address %q: %w", a.cfg.ListenAddr, err)
+	}
+	startPort, err := strconv.Atoi(rawPort)
+	if err != nil || startPort < 1 || startPort+count-1 > 65535 {
+		return nil, fmt.Errorf("cannot allocate %d DHT ports from %q", count, a.cfg.ListenAddr)
+	}
+	addrs := make([]string, count)
+	for i := range addrs {
+		addrs[i] = net.JoinHostPort(host, strconv.Itoa(startPort+i))
+	}
+	return addrs, nil
+}
+
+func splitCommaSeparated(value string) []string {
+	parts := strings.Split(value, ",")
+	result := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if part = strings.TrimSpace(part); part != "" {
+			result = append(result, part)
 		}
 	}
-	return []string{a.cfg.ListenAddr}
+	return result
 }
 
 func (a *Application) nodeIDPath(idx int) string {

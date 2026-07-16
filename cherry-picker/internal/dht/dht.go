@@ -3,6 +3,7 @@
 package dht
 
 import (
+	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"math"
@@ -28,6 +29,8 @@ var (
 	// ErrOnGetPeersResponseNotSet is the error that config
 	// OnGetPeersResponseNotSet is not set when call dht.GetPeers.
 	ErrOnGetPeersResponseNotSet = errors.New("OnGetPeersResponse is not set")
+	// ErrInvalidInfoHash indicates a get_peers target that is not exactly 20 bytes.
+	ErrInvalidInfoHash = errors.New("infohash must be 20 raw bytes or 40 hex characters")
 )
 
 // Config represents the configure of dht.
@@ -148,11 +151,18 @@ type DHT struct {
 	packetPool         sync.Pool
 	stats              packetStats
 
-	// crawl 模式轻量级事务环形缓冲（无锁，1.28MB）。
+	// crawl 模式轻量级事务环形缓冲（约 1.5MB）。
 	// 存储 get_peers 出站请求的 info_hash，用于响应到达时还原原始 info_hash
-	// 并触发 OnGetPeersResponse 回调。索引为 16 位计数器取模。
-	crawlTxBuf [1 << 16][20]byte
+	// 并触发 OnGetPeersResponse 回调。32 位事务号用于代际校验，低 16 位
+	// 作为环形索引；分片锁避免响应读取与槽位复用并发时的数据竞争。
+	crawlTxBuf [1 << 16]crawlTxEntry
+	crawlTxMu  [256]sync.RWMutex
 	crawlTxCtr atomic.Uint32
+}
+
+type crawlTxEntry struct {
+	counter  uint32
+	infoHash [20]byte
 }
 
 type packetStats struct {
@@ -228,10 +238,10 @@ func (dht *DHT) IsCrawlMode() bool {
 }
 
 // init initializes global varables.
-func (dht *DHT) init() {
+func (dht *DHT) init() error {
 	listener, err := net.ListenPacket(dht.Network, dht.Address)
 	if err != nil {
-		panic(err)
+		return err
 	}
 
 	dht.conn = listener.(*net.UDPConn)
@@ -256,6 +266,7 @@ func (dht *DHT) init() {
 	go dht.transactionManager.run()
 	go dht.blackList.clear()
 	dht.startPacketWorkers()
+	return nil
 }
 
 func (dht *DHT) startPacketWorkers() {
@@ -408,16 +419,63 @@ func loadOrGenerateNodeID(path string) string {
 	return randomString(20)
 }
 
-// crawlGenTxID 生成 2 字节爬虫模式事务 ID（无锁，原子计数器）。
-// 返回的字符串可通过 crawlTxIdx() 还原为 crawlTxBuf 的索引。
+// crawlGenTxID 生成 4 字节爬虫模式事务 ID（无锁，原子计数器）。
+// 4 字节避免高吞吐下 16 位 ID 每几十秒回绕并把迟到响应错配给新请求。
 func (dht *DHT) crawlGenTxID() string {
 	ctr := dht.crawlTxCtr.Add(1)
+	var txID [4]byte
+	binary.BigEndian.PutUint32(txID[:], ctr)
+	return string(txID[:])
+}
+
+func crawlTxCounter(txID string) (uint32, bool) {
+	if len(txID) != 4 {
+		return 0, false
+	}
+	return binary.BigEndian.Uint32([]byte(txID)), true
+}
+
+func (dht *DHT) rememberCrawlInfoHash(txID, infoHash string) bool {
+	ctr, ok := crawlTxCounter(txID)
+	if !ok || len(infoHash) != 20 {
+		return false
+	}
 	idx := uint16(ctr)
-	return string([]byte{byte(idx >> 8), byte(idx)})
+	mu := &dht.crawlTxMu[idx>>8]
+	mu.Lock()
+	entry := &dht.crawlTxBuf[idx]
+	entry.counter = ctr
+	copy(entry.infoHash[:], infoHash)
+	mu.Unlock()
+	return true
+}
+
+func (dht *DHT) crawlInfoHash(txID string) ([20]byte, bool) {
+	ctr, ok := crawlTxCounter(txID)
+	if !ok {
+		return [20]byte{}, false
+	}
+	idx := uint16(ctr)
+	mu := &dht.crawlTxMu[idx>>8]
+	mu.RLock()
+	entry := dht.crawlTxBuf[idx]
+	mu.RUnlock()
+	if entry.counter != ctr || entry.infoHash == [20]byte{} {
+		return [20]byte{}, false
+	}
+	return entry.infoHash, true
 }
 
 // GetPeers returns peers who have announced having infoHash.
 func (dht *DHT) GetPeers(infoHash string) error {
+	return dht.GetPeersLimit(infoHash, 0)
+}
+
+// GetPeersLimit queries at most limit routing-table nodes closest to infoHash.
+// A non-positive limit preserves the legacy behavior of querying every node.
+// Bounded lookups let the crawler turn high-volume inbound get_peers hashes
+// into peer candidates without creating an unbounded UDP amplification loop.
+func (dht *DHT) GetPeersLimit(infoHash string, limit int) error {
 	if !dht.Ready {
 		return ErrNotReady
 	}
@@ -433,8 +491,12 @@ func (dht *DHT) GetPeers(infoHash string) error {
 		}
 		infoHash = string(data)
 	}
+	if len(infoHash) != 20 {
+		return ErrInvalidInfoHash
+	}
 
-	neighbors := dht.routingTable.AllNodes()
+	target := newBitmapFromString(infoHash)
+	neighbors := dht.routingTable.GetNeighbors(target, limit)
 
 	for _, no := range neighbors {
 		dht.transactionManager.getPeers(no, infoHash)
@@ -444,8 +506,10 @@ func (dht *DHT) GetPeers(infoHash string) error {
 }
 
 // Run starts the dht.
-func (dht *DHT) Run() {
-	dht.init()
+func (dht *DHT) Run() error {
+	if err := dht.init(); err != nil {
+		return err
+	}
 	dht.listen()
 	dht.join()
 

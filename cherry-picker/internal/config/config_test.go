@@ -34,3 +34,48 @@ func TestLoadFromFileAppliesRoleDefaults(t *testing.T) {
 		t.Fatalf("expected metadata config fixture: %v", err)
 	}
 }
+
+func TestLoadPrimeNodesFromEnvironment(t *testing.T) {
+	t.Setenv("CHERRY_PICKER_CONFIG", "")
+	t.Setenv("CHERRY_PICKER_DHT_PRIME_NODES", "87.98.162.88:6881,212.129.33.59:6881")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if got := cfg.Discovery.PrimeNodes; got != "87.98.162.88:6881,212.129.33.59:6881" {
+		t.Fatalf("PrimeNodes = %q", got)
+	}
+}
+
+func TestLoadDHTInstancesFromEnvironment(t *testing.T) {
+	t.Setenv("CHERRY_PICKER_CONFIG", "")
+	t.Setenv("CHERRY_PICKER_DHT_INSTANCES", "96")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.Discovery.Instances != 96 {
+		t.Fatalf("Instances = %d, want 96", cfg.Discovery.Instances)
+	}
+}
+
+func TestLoadActiveLookupFromEnvironment(t *testing.T) {
+	t.Setenv("CHERRY_PICKER_CONFIG", "")
+	t.Setenv("CHERRY_PICKER_DHT_ACTIVE_LOOKUP", "false")
+	t.Setenv("CHERRY_PICKER_DHT_LOOKUP_NODES", "48")
+	t.Setenv("CHERRY_PICKER_DHT_LOOKUP_DHTS", "2")
+	t.Setenv("CHERRY_PICKER_DHT_LOOKUP_QUEUE", "4096")
+	t.Setenv("CHERRY_PICKER_DHT_LOOKUP_RATE", "75")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.Discovery.ActiveLookup || cfg.Discovery.LookupNodes != 48 ||
+		cfg.Discovery.LookupDHTs != 2 || cfg.Discovery.LookupQueue != 4096 ||
+		cfg.Discovery.LookupRate != 75 {
+		t.Fatalf("unexpected lookup config: %+v", cfg.Discovery)
+	}
+}

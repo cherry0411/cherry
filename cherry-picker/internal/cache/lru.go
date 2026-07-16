@@ -11,6 +11,7 @@ import (
 // 语义：
 //   - Set(key) bool：key 不存在时插入并返回 true（新条目），存在时将其移至链表头部并返回 false（已见过）
 //   - Contains(key) bool：检查 key 是否存在，不更新 LRU 顺序（用于只读检查）
+//   - ContainsAndTouch(key) bool：检查 key，并在命中时刷新 LRU 顺序
 //   - Add(key) bool：同 Set，语义一致，供外部调用
 type LRU struct {
 	shards []*lruShard
@@ -101,6 +102,21 @@ func (c *LRU) Contains(key string) bool {
 	shard.mu.Lock()
 	defer shard.mu.Unlock()
 	_, ok := shard.items[key]
+	return ok
+}
+
+// ContainsAndTouch 检查 key 是否存在；命中时将其移到链表头部。
+// 适用于 remote-known 之类的热点集合，避免持续命中的 key 因插入洪峰
+// 仍被当成冷数据淘汰。
+func (c *LRU) ContainsAndTouch(key string) bool {
+	shard := c.shardFor(key)
+	shard.mu.Lock()
+	defer shard.mu.Unlock()
+
+	elem, ok := shard.items[key]
+	if ok {
+		shard.list.MoveToFront(elem)
+	}
 	return ok
 }
 

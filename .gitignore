@@ -2,5 +2,6 @@
 backups/
 *.sql.gz
 node_modules/
+cherry-picker/.bench/
 migration/node_modules/
 scripts/node_modules/

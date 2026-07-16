@@ -1,10 +1,10 @@
 package export
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"path/filepath"
@@ -43,9 +43,11 @@ func newWalSink(inner Sink, walDir string) (*walSink, error) {
 
 func (w *walSink) WriteBatch(ctx context.Context, batch []pipeline.Event) error {
 	if err := w.inner.WriteBatch(ctx, batch); err != nil {
-		// 写入失败：序列化到 WAL 文件，不向上报错（避免 BatchExporter 重置 batch）
+		// 写入失败：序列化到 WAL。只有 WAL 持久化成功才确认该 batch，
+		// 否则把错误返回给 BatchExporter，让它保留 batch 并施加背压。
 		if walErr := w.appendToWAL(batch); walErr != nil {
 			log.Printf("wal: failed to write fallback: %v (original: %v)", walErr, err)
+			return fmt.Errorf("wal fallback failed: %v (original: %w)", walErr, err)
 		} else {
 			log.Printf("wal: %d events queued for retry (original error: %v)", len(batch), err)
 		}
@@ -96,13 +98,41 @@ func (w *walSink) replayLoop() {
 }
 
 func (w *walSink) replayAll() {
-	files, err := filepath.Glob(filepath.Join(w.walDir, "wal_*.jsonl"))
+	// 先在 append 锁内把活跃 WAL 原子重命名成快照。后续 append 会创建
+	// 新文件，因此慢速 HTTP 重放不会阻塞 crawler，也不会删除并发追加的数据。
+	activeFiles, err := filepath.Glob(filepath.Join(w.walDir, "wal_*.jsonl"))
 	if err != nil {
 		return
 	}
-	for _, path := range files {
+	snapshots, _ := filepath.Glob(filepath.Join(w.walDir, "replay_*.jsonl"))
+	for _, path := range activeFiles {
+		if snapshot, snapshotErr := w.snapshotWAL(path); snapshotErr != nil {
+			log.Printf("wal: failed to snapshot %s: %v", filepath.Base(path), snapshotErr)
+		} else if snapshot != "" {
+			snapshots = append(snapshots, snapshot)
+		}
+	}
+	for _, path := range snapshots {
 		w.replayFile(path)
 	}
+}
+
+func (w *walSink) snapshotWAL(path string) (string, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if _, err := os.Stat(path); err != nil {
+		if os.IsNotExist(err) {
+			return "", nil
+		}
+		return "", err
+	}
+	snapshot := filepath.Join(w.walDir, fmt.Sprintf(
+		"replay_%d_%s", time.Now().UnixNano(), filepath.Base(path)))
+	if err := os.Rename(path, snapshot); err != nil {
+		return "", err
+	}
+	return snapshot, nil
 }
 
 func (w *walSink) replayFile(path string) {
@@ -124,43 +154,36 @@ func (w *walSink) replayFile(path string) {
 	}
 	defer f.Close()
 
-	var batches [][]pipeline.Event
-	scanner := bufio.NewScanner(f)
-	// 单行最大 8MB（防止超大 batch 导致 scanner buffer 溢出）
-	scanner.Buffer(make([]byte, 8*1024*1024), 8*1024*1024)
-	for scanner.Scan() {
-		var entry walEntry
-		if err := json.Unmarshal(scanner.Bytes(), &entry); err != nil {
-			continue
-		}
-		if len(entry.Events) > 0 {
-			batches = append(batches, entry.Events)
-		}
-	}
-
-	if len(batches) == 0 {
-		os.Remove(path)
-		return
-	}
-
-	// 重放所有 batch，任何失败都停止（等下次重试）
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
-	allOK := true
 	total := 0
-	for _, batch := range batches {
-		if err := w.inner.WriteBatch(ctx, batch); err != nil {
-			log.Printf("wal: replay failed for %s: %v", filepath.Base(path), err)
-			allOK = false
-			break
+	decoder := json.NewDecoder(f)
+	for {
+		var entry walEntry
+		if err := decoder.Decode(&entry); err != nil {
+			if err == io.EOF {
+				break
+			}
+			// 保留文件，避免把超大或部分写入的 batch 当作空文件删除。
+			log.Printf("wal: decode failed for %s: %v", filepath.Base(path), err)
+			return
 		}
-		total += len(batch)
+		if len(entry.Events) == 0 {
+			continue
+		}
+		if err := w.inner.WriteBatch(ctx, entry.Events); err != nil {
+			log.Printf("wal: replay failed for %s: %v", filepath.Base(path), err)
+			return
+		}
+		total += len(entry.Events)
 	}
 
-	if allOK {
-		f.Close()
+	if total == 0 {
 		os.Remove(path)
-		log.Printf("wal: replayed %d events from %s", total, filepath.Base(path))
+		return
 	}
+	f.Close()
+	os.Remove(path)
+	log.Printf("wal: replayed %d events from %s", total, filepath.Base(path))
 }
