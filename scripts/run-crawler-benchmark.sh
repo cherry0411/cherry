@@ -94,6 +94,7 @@ case "${mode}" in
   steady|warm-restart) node_dir="${RUNTIME_ROOT}/state/nodes/${cohort}" ;;
 esac
 mkdir -p "${node_dir}"
+node_ids_before="$(find "${node_dir}" -maxdepth 1 -type f -name 'node_*' 2>/dev/null | wc -l)"
 
 effective_config="${run_dir}/config.json"
 prepare_args=(
@@ -149,6 +150,7 @@ export RUN_ID="${run_id}" LABEL="${label}" VARIANT="${variant}" MODE="${mode}" C
 export WARMUP_SECONDS="${warmup_seconds}" MEASURE_SECONDS="${measure_seconds}" PORT="${port}"
 export BINARY="${binary}" BINARY_SHA="${binary_sha}" CONFIG="${effective_config}" CONFIG_SHA="${config_sha}"
 export NODE_DIR="${node_dir}" SINK_URL="${sink_url}"
+export NODE_IDS_BEFORE="${node_ids_before}"
 if ((${#overrides[@]})); then
   OVERRIDES="$(printf '%s\n' "${overrides[@]}")"
 else
@@ -159,7 +161,7 @@ export BUILD_JSON="${run_dir}/build.json"
 python3 - "${run_dir}/manifest.json" <<'PY'
 import json, os, sys
 keys = ["RUN_ID", "LABEL", "VARIANT", "MODE", "COHORT", "WARMUP_SECONDS", "MEASURE_SECONDS",
-        "PORT", "BINARY", "BINARY_SHA", "CONFIG", "CONFIG_SHA", "NODE_DIR", "SINK_URL"]
+        "PORT", "BINARY", "BINARY_SHA", "CONFIG", "CONFIG_SHA", "NODE_DIR", "NODE_IDS_BEFORE", "SINK_URL"]
 manifest = {key.lower(): os.environ[key] for key in keys}
 manifest["schema_version"] = 1
 manifest["overrides"] = os.environ.get("OVERRIDES", "").splitlines() if os.environ.get("OVERRIDES") else []

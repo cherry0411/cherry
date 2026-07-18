@@ -31,7 +31,9 @@ Three run modes deliberately answer different questions:
 
 Ports do not rotate implicitly. Port and node-ID changes are separate variables,
 which prevents a “cold identity + new port + new binary” bundle from becoming an
-uninterpretable experiment.
+uninterpretable experiment. The manifest also records how many cohort node-ID
+files existed before startup, so the first nominally steady run of a new cohort
+cannot be mistaken for a genuinely warm restart.
 
 ## Run one benchmark
 
