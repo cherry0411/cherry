@@ -195,6 +195,12 @@ fi
 cd "${REPO_DIR}"
 docker compose --env-file "${ENV_FILE}" -f deploy/storage/compose.yml config --quiet
 docker compose --env-file "${ENV_FILE}" -f deploy/storage/compose.yml build api
+# A fresh bind mount is root-owned, while the pinned Alpine image initializes
+# PostgreSQL as its internal `postgres` user. Establish image-native ownership
+# before the first start; a failed server cannot repair its own PGDATA.
+docker compose --env-file "${ENV_FILE}" -f deploy/storage/compose.yml run --rm --no-deps \
+  --user root --entrypoint chown postgres -R postgres:postgres \
+  /var/lib/postgresql/data /var/lib/postgresql/wal-archive
 docker compose --env-file "${ENV_FILE}" -f deploy/storage/compose.yml up -d
 if [[ "${first_v2_bootstrap}" -eq 1 ]]; then
   marker_tmp="${V2_BOOTSTRAP_MARKER}.tmp.$$"
@@ -203,9 +209,6 @@ if [[ "${first_v2_bootstrap}" -eq 1 ]]; then
   mv -- "${marker_tmp}" "${V2_BOOTSTRAP_MARKER}"
   sync -d "${DATA_ROOT}" 2>/dev/null || sync
 fi
-docker compose --env-file "${ENV_FILE}" -f deploy/storage/compose.yml exec -T -u root postgres \
-  chown -R postgres:postgres /var/lib/postgresql/wal-archive
-
 # Off-host rclone crypt is fail-closed by default. Only the exact audited
 # I_ACCEPT_DATA_LOSS opt-out below permits a deliberately single-copy authority.
 BACKUP_ENV=/etc/cherry-backup.env

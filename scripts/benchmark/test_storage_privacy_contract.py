@@ -171,5 +171,14 @@ def test_unbacked_authority_requires_exact_audited_opt_out() -> None:
     assert 'UNBACKED_MARKER="/var/lib/cherry-backup/UNBACKED_AUTHORITY"' in setup
     assert "systemctl disable --now cherry-storage-backup.timer" in setup
     assert "archive_mode=${CHERRY_PG_ARCHIVE_MODE:-on}" in compose
+
+
+def test_storage_bootstrap_owns_postgres_bind_mount_before_first_start() -> None:
+    setup = (ROOT / "scripts" / "setup-storage-server.sh").read_text(encoding="utf-8")
+    ownership = ' --user root --entrypoint chown postgres -R postgres:postgres '
+    start = 'docker compose --env-file "${ENV_FILE}" -f deploy/storage/compose.yml up -d'
+    assert ownership in setup.replace("\\\n", " ")
+    assert setup.index("--entrypoint chown postgres") < setup.index(start)
+    assert "exec -T -u root postgres" not in setup
     assert "desired_archive_mode" in setup and "printf off || printf on" in setup
     assert "postgres-and-heat-are-single-copy-authorities" in setup
