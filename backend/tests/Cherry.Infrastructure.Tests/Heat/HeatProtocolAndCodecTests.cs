@@ -469,6 +469,149 @@ public sealed class HeatProtocolAndCodecTests
     }
 
     [Fact]
+    public async Task RollingBulkApplyPreservesTopTwoHoursExactRevisionAndReplayIdempotency()
+    {
+        var directory = Path.Combine(Path.GetTempPath(), $"cherry-rolling-{Guid.NewGuid():N}");
+        var store = new HeatRollingStore(Options(directory));
+        var current = HeatRollingStore.UnixHour(DateTime.UtcNow);
+        var target = current - 1;
+        var hash = new byte[20];
+        hash[0] = 42;
+        var batches = new[]
+        {
+            BatchAt(target - 2, hash, [1, 2], 1),
+            BatchAt(target, hash, [1, 3], 2),
+            BatchAt(current, hash, [1, 2], 3)
+        };
+        try
+        {
+            await store.ApplyAsync(batches, CancellationToken.None);
+
+            await using (var sqlite = await OpenSqliteAsync(store.Path))
+            {
+                await using var rows = sqlite.CreateCommand();
+                rows.CommandText =
+                    """
+                    SELECT active.actor,active.last_seen_hour,active.previous_seen_hour
+                      FROM active JOIN hashes USING(hash_id)
+                     WHERE hashes.info_hash=$hash ORDER BY active.actor
+                    """;
+                rows.Parameters.Add("$hash", SqliteType.Blob).Value = hash;
+                await using var reader = await rows.ExecuteReaderAsync();
+                Assert.True(await reader.ReadAsync());
+                Assert.Equal(1, reader.GetInt64(0));
+                Assert.Equal(current, reader.GetInt64(1));
+                Assert.Equal(target, reader.GetInt64(2));
+                Assert.True(await reader.ReadAsync());
+                Assert.Equal(2, reader.GetInt64(0));
+                Assert.Equal(current, reader.GetInt64(1));
+                Assert.Equal(target - 2, reader.GetInt64(2));
+                Assert.True(await reader.ReadAsync());
+                Assert.Equal(3, reader.GetInt64(0));
+                Assert.Equal(target, reader.GetInt64(1));
+                Assert.True(reader.IsDBNull(2));
+                Assert.False(await reader.ReadAsync());
+            }
+
+            var first = Assert.Single(
+                (await store.ReadChangesAsync(target, CancellationToken.None)).Changes);
+            Assert.Equal(3, first.CurrentCount);
+            // Six active-row mutations occurred across the three wire batches;
+            // the bulk path must retain the trigger-era revision value, not
+            // merely increment once per hash or per ApplyAsync call.
+            Assert.Equal(6, first.Revision);
+            await store.CommitProjectionAsync(
+                target, [(hash, first.CurrentCount, first.Revision)], [], CancellationToken.None);
+
+            await store.ApplyAsync(batches, CancellationToken.None);
+            Assert.Empty((await store.ReadChangesAsync(target, CancellationToken.None)).Changes);
+            await using var replaySqlite = await OpenSqliteAsync(store.Path);
+            await using var revision = replaySqlite.CreateCommand();
+            revision.CommandText =
+                "SELECT revision FROM dirty_hashes JOIN hashes USING(hash_id) WHERE info_hash=$hash";
+            revision.Parameters.Add("$hash", SqliteType.Blob).Value = hash;
+            Assert.Equal(6L, Convert.ToInt64(await revision.ExecuteScalarAsync()));
+            revision.Parameters.Clear();
+            revision.CommandText = "SELECT COUNT(*) FROM rolling_ingest_control";
+            Assert.Equal(0L, Convert.ToInt64(await revision.ExecuteScalarAsync()));
+        }
+        finally
+        {
+            if (Directory.Exists(directory)) Directory.Delete(directory, true);
+        }
+    }
+
+    [Fact]
+    public async Task RollingBulkStagingPreservesFullSignedActorBitRange()
+    {
+        var directory = Path.Combine(Path.GetTempPath(), $"cherry-rolling-{Guid.NewGuid():N}");
+        var store = new HeatRollingStore(Options(directory));
+        var target = HeatRollingStore.UnixHour(DateTime.UtcNow) - 1;
+        var hash = new byte[20];
+        hash[0] = 43;
+        try
+        {
+            await store.ApplyAsync(
+                [BatchAt(target, hash, [long.MinValue, -1, 0, long.MaxValue], 1)],
+                CancellationToken.None);
+            var change = Assert.Single(
+                (await store.ReadChangesAsync(target, CancellationToken.None)).Changes);
+            Assert.Equal(4, change.CurrentCount);
+
+            await using var sqlite = await OpenSqliteAsync(store.Path);
+            await using var actors = sqlite.CreateCommand();
+            actors.CommandText = "SELECT actor FROM active ORDER BY actor";
+            await using var reader = await actors.ExecuteReaderAsync();
+            var actual = new List<long>();
+            while (await reader.ReadAsync()) actual.Add(reader.GetInt64(0));
+            Assert.Equal([long.MinValue, -1, 0, long.MaxValue], actual);
+        }
+        finally
+        {
+            if (Directory.Exists(directory)) Directory.Delete(directory, true);
+        }
+    }
+
+    [Fact]
+    public async Task RollingBulkApplyIsExactAcrossObservationChunkBoundary()
+    {
+        var directory = Path.Combine(Path.GetTempPath(), $"cherry-rolling-{Guid.NewGuid():N}");
+        var store = new HeatRollingStore(Options(directory));
+        var target = HeatRollingStore.UnixHour(DateTime.UtcNow) - 1;
+        var hash = new byte[20];
+        hash[0] = 44;
+        var actors = Enumerable.Range(1, 1_025).Select(value => (long)value).ToArray();
+        var batch = BatchAt(target, hash, actors, 1);
+        try
+        {
+            await store.ApplyAsync([batch], CancellationToken.None);
+            var first = Assert.Single(
+                (await store.ReadChangesAsync(target, CancellationToken.None)).Changes);
+            Assert.Equal(1_025, first.CurrentCount);
+            Assert.Equal(1_025, first.Revision);
+
+            // The 1,025th actor is written by a second JSON staging command.
+            // Replaying across that boundary must neither mutate active nor
+            // advance the exact per-row dirty revision.
+            await store.ApplyAsync([batch], CancellationToken.None);
+            var replay = Assert.Single(
+                (await store.ReadChangesAsync(target, CancellationToken.None)).Changes);
+            Assert.Equal(1_025, replay.CurrentCount);
+            Assert.Equal(first.Revision, replay.Revision);
+
+            await store.CommitProjectionAsync(
+                target, [(hash, replay.CurrentCount, replay.Revision)], [],
+                CancellationToken.None);
+            await store.ApplyAsync([batch], CancellationToken.None);
+            Assert.Empty((await store.ReadChangesAsync(target, CancellationToken.None)).Changes);
+        }
+        finally
+        {
+            if (Directory.Exists(directory)) Directory.Delete(directory, true);
+        }
+    }
+
+    [Fact]
     public async Task RollingStaleCommitCannotClearLateCompletedHourActor()
     {
         var directory = Path.Combine(Path.GetTempPath(), $"cherry-rolling-{Guid.NewGuid():N}");

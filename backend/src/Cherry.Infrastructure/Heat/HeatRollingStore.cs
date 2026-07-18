@@ -1,4 +1,6 @@
 using Microsoft.Data.Sqlite;
+using System.Globalization;
+using System.Text;
 
 namespace Cherry.Infrastructure.Heat;
 
@@ -35,6 +37,10 @@ public sealed class HeatRollingCapacityException : IOException
 /// </summary>
 public sealed class HeatRollingStore
 {
+    // At the maximum textual width of slot + signed actor, 1,024 rows stay
+    // safely below the ~85 KiB LOH threshold for both StringBuilder's char
+    // storage and the bound JSON string.
+    private const int StagingRowsPerCommand = 1_024;
     private readonly string _path;
     private readonly long _maxBytes;
     private readonly long _minFreeBytes;
@@ -168,35 +174,34 @@ public sealed class HeatRollingStore
     {
         if (batches.Count == 0) return;
         await using var connection = await OpenAsync(cancellationToken);
+        await using (var createStaging = connection.CreateCommand())
+        {
+            // One protocol batch is bounded to 250k observations. Process and
+            // clear it before staging the next batch so group commit does not
+            // multiply that memory bound by CommitBatchRequests.
+            createStaging.CommandText =
+                """
+                PRAGMA temp_store=MEMORY;
+                CREATE TEMP TABLE ingest_hashes (
+                    slot INTEGER PRIMARY KEY,
+                    info_hash BLOB NOT NULL CHECK(length(info_hash)=20),
+                    hash_id INTEGER NULL
+                );
+                CREATE TEMP TABLE ingest_observations (
+                    ordinal INTEGER PRIMARY KEY,
+                    slot INTEGER NOT NULL,
+                    actor INTEGER NOT NULL
+                );
+                CREATE TEMP TABLE ingest_mutations (
+                    hash_id INTEGER NOT NULL,
+                    actor INTEGER NOT NULL,
+                    PRIMARY KEY(hash_id,actor)
+                ) WITHOUT ROWID;
+                """;
+            await createStaging.ExecuteNonQueryAsync(cancellationToken);
+        }
         await using var transaction =
             (SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken);
-        await using var insertHash = connection.CreateCommand();
-        insertHash.Transaction = transaction;
-        insertHash.CommandText = "INSERT OR IGNORE INTO hashes(info_hash) VALUES($hash)";
-        var insertHashValue = insertHash.Parameters.Add("$hash", SqliteType.Blob);
-        await using var findHash = connection.CreateCommand();
-        findHash.Transaction = transaction;
-        findHash.CommandText = "SELECT hash_id FROM hashes WHERE info_hash=$hash";
-        var findHashValue = findHash.Parameters.Add("$hash", SqliteType.Blob);
-        await using var upsert = connection.CreateCommand();
-        upsert.Transaction = transaction;
-        upsert.CommandText =
-            "INSERT INTO active(hash_id,actor,last_seen_hour,previous_seen_hour) " +
-            "VALUES($hash_id,$actor,$hour,NULL) " +
-            "ON CONFLICT(hash_id,actor) DO UPDATE SET " +
-            "previous_seen_hour=CASE " +
-            "WHEN excluded.last_seen_hour>active.last_seen_hour THEN active.last_seen_hour " +
-            "WHEN active.previous_seen_hour IS NULL OR " +
-            "excluded.last_seen_hour>active.previous_seen_hour THEN excluded.last_seen_hour " +
-            "ELSE active.previous_seen_hour END," +
-            "last_seen_hour=MAX(active.last_seen_hour,excluded.last_seen_hour) " +
-            "WHERE excluded.last_seen_hour>active.last_seen_hour OR " +
-            "(excluded.last_seen_hour<active.last_seen_hour AND " +
-            "(active.previous_seen_hour IS NULL OR " +
-            "excluded.last_seen_hour>active.previous_seen_hour))";
-        var activeHash = upsert.Parameters.Add("$hash_id", SqliteType.Integer);
-        var activeActor = upsert.Parameters.Add("$actor", SqliteType.Integer);
-        var activeHour = upsert.Parameters.Add("$hour", SqliteType.Integer);
         var currentHour = UnixHour(DateTime.UtcNow);
         var oldestAccepted = currentHour - 24;
 
@@ -206,23 +211,238 @@ public sealed class HeatRollingStore
             if (bucket > currentHour)
                 throw new InvalidDataException("Rolling heat observation is from a future UTC hour");
             if (bucket < oldestAccepted) continue;
-            activeHour.Value = bucket;
-            foreach (var group in batch.Groups)
+            await ClearStagingAsync(connection, transaction, cancellationToken);
+            await StageHashesAsync(connection, transaction, batch.Groups, cancellationToken);
+            await StageObservationsAsync(connection, transaction, batch.Groups, cancellationToken);
+
+            await using (var resolveHashes = connection.CreateCommand())
             {
-                insertHashValue.Value = group.InfoHash;
-                await insertHash.ExecuteNonQueryAsync(cancellationToken);
-                findHashValue.Value = group.InfoHash;
-                activeHash.Value = (long)(await findHash.ExecuteScalarAsync(cancellationToken)
-                    ?? throw new InvalidDataException("Rolling heat hash lookup failed"));
-                foreach (var actor in group.ActorFingerprints)
-                {
-                    activeActor.Value = actor;
-                    await upsert.ExecuteNonQueryAsync(cancellationToken);
-                }
+                resolveHashes.Transaction = transaction;
+                // Resolve every distinct hash once inside SQLite. The old path
+                // crossed the provider boundary for both INSERT and SELECT on
+                // every group before doing so again for every actor UPSERT.
+                resolveHashes.CommandText =
+                    """
+                    INSERT OR IGNORE INTO hashes(info_hash)
+                    SELECT info_hash FROM ingest_hashes ORDER BY slot;
+                    UPDATE ingest_hashes
+                       SET hash_id=(SELECT hashes.hash_id FROM hashes
+                                     WHERE hashes.info_hash=ingest_hashes.info_hash);
+                    """;
+                await resolveHashes.ExecuteNonQueryAsync(cancellationToken);
+            }
+
+            await using (var identifyMutations = connection.CreateCommand())
+            {
+                identifyMutations.Transaction = transaction;
+                identifyMutations.CommandText =
+                    """
+                    INSERT OR IGNORE INTO ingest_mutations(hash_id,actor)
+                    SELECT incoming.hash_id,observation.actor
+                      FROM ingest_observations observation
+                      JOIN ingest_hashes incoming USING(slot)
+                      LEFT JOIN active ON active.hash_id=incoming.hash_id
+                                      AND active.actor=observation.actor
+                     WHERE active.hash_id IS NULL
+                        OR $hour>active.last_seen_hour
+                        OR ($hour<active.last_seen_hour AND
+                            (active.previous_seen_hour IS NULL OR
+                             $hour>active.previous_seen_hour));
+                    INSERT INTO rolling_ingest_control(singleton) VALUES(1);
+                    """;
+                identifyMutations.Parameters.AddWithValue("$hour", bucket);
+                await identifyMutations.ExecuteNonQueryAsync(cancellationToken);
+            }
+
+            await using var upsert = connection.CreateCommand();
+            upsert.Transaction = transaction;
+            // CHHT groups are unique within a protocol batch and every row in
+            // the batch has the same UTC hour. Ordering by the wire ordinal
+            // also preserves the legacy behavior for directly constructed
+            // duplicate test inputs. The unchanged conflict predicate means a
+            // replay fires no trigger, while every real insert/update advances
+            // dirty_hashes exactly as before.
+            upsert.CommandText =
+                """
+                INSERT INTO active(hash_id,actor,last_seen_hour,previous_seen_hour)
+                SELECT incoming.hash_id,observation.actor,$hour,NULL
+                  FROM ingest_observations observation
+                  JOIN ingest_hashes incoming USING(slot)
+                 WHERE true
+                 ORDER BY observation.ordinal
+                ON CONFLICT(hash_id,actor) DO UPDATE SET
+                    previous_seen_hour=CASE
+                    WHEN excluded.last_seen_hour>active.last_seen_hour THEN active.last_seen_hour
+                    WHEN active.previous_seen_hour IS NULL OR
+                    excluded.last_seen_hour>active.previous_seen_hour THEN excluded.last_seen_hour
+                    ELSE active.previous_seen_hour END,
+                    last_seen_hour=MAX(active.last_seen_hour,excluded.last_seen_hour)
+                WHERE excluded.last_seen_hour>active.last_seen_hour OR
+                (excluded.last_seen_hour<active.last_seen_hour AND
+                (active.previous_seen_hour IS NULL OR
+                excluded.last_seen_hour>active.previous_seen_hour));
+                """;
+            upsert.Parameters.AddWithValue("$hour", bucket);
+            await upsert.ExecuteNonQueryAsync(cancellationToken);
+
+            await using (var recordMutations = connection.CreateCommand())
+            {
+                recordMutations.Transaction = transaction;
+                // Suppressing the row triggers avoids repeating the same dirty
+                // hash and deferred lookups for every actor. The aggregate adds
+                // the exact number of active-row mutations, preserving revision
+                // CAS values as well as monotonicity. Deferred invalidation is
+                // derived from the touched rows' final top-two hours and is
+                // equivalent to the INSERT/UPDATE trigger predicates.
+                recordMutations.CommandText =
+                    """
+                    INSERT INTO dirty_hashes(hash_id,revision)
+                    SELECT hash_id,COUNT(*) FROM ingest_mutations GROUP BY hash_id
+                    ON CONFLICT(hash_id) DO UPDATE SET
+                        revision=dirty_hashes.revision+excluded.revision;
+                    DELETE FROM deferred_hashes
+                     WHERE hash_id IN (
+                        SELECT DISTINCT mutation.hash_id
+                          FROM ingest_mutations mutation
+                          JOIN active ON active.hash_id=mutation.hash_id
+                                     AND active.actor=mutation.actor
+                          JOIN projection_state state ON state.singleton=1
+                         WHERE active.last_seen_hour BETWEEN state.projected_hour-23
+                                                         AND state.projected_hour
+                            OR active.previous_seen_hour BETWEEN state.projected_hour-23
+                                                             AND state.projected_hour
+                     );
+                    DELETE FROM rolling_ingest_control WHERE singleton=1;
+                    """;
+                await recordMutations.ExecuteNonQueryAsync(cancellationToken);
             }
         }
         ThrowIfCapacityExceeded(await ReadCapacityStatusAsync(connection, cancellationToken));
         await transaction.CommitAsync(cancellationToken);
+    }
+
+    private static async Task ClearStagingAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        CancellationToken cancellationToken)
+    {
+        await using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText =
+            "DELETE FROM ingest_mutations; DELETE FROM ingest_observations; DELETE FROM ingest_hashes";
+        await command.ExecuteNonQueryAsync(cancellationToken);
+    }
+
+    private static async Task StageHashesAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        IReadOnlyList<ChhtHashGroup> groups,
+        CancellationToken cancellationToken)
+    {
+        if (groups.Count == 0) return;
+        var packed = GC.AllocateUninitializedArray<byte>(checked(groups.Count * 20));
+        for (var slot = 0; slot < groups.Count; slot++)
+        {
+            var hash = groups[slot].InfoHash;
+            if (hash.Length != 20)
+                throw new InvalidDataException("Rolling heat info hash must be exactly 20 bytes");
+            hash.CopyTo(packed, slot * 20);
+        }
+        await using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        // All protocol hashes are fixed width, so a single packed BLOB removes
+        // 2*N provider parameters. The recursive counter is wholly inside
+        // SQLite and creates one bounded temp row per hash.
+        command.CommandText =
+            """
+            WITH RECURSIVE slots(slot) AS (
+                SELECT 0
+                UNION ALL
+                SELECT slot+1 FROM slots WHERE slot+1 < $count
+            )
+            INSERT INTO ingest_hashes(slot,info_hash)
+            SELECT slot,substr($packed,slot*20+1,20) FROM slots;
+            """;
+        command.Parameters.AddWithValue("$count", groups.Count);
+        command.Parameters.Add("$packed", SqliteType.Blob).Value = packed;
+        await command.ExecuteNonQueryAsync(cancellationToken);
+    }
+
+    private static async Task StageObservationsAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        IReadOnlyList<ChhtHashGroup> groups,
+        CancellationToken cancellationToken)
+    {
+        var totalRecords = 0;
+        foreach (var group in groups)
+            totalRecords = checked(totalRecords + group.ActorFingerprints.Count);
+        if (totalRecords == 0) return;
+
+        var json = CreateObservationJson(
+            Math.Min(StagingRowsPerCommand, totalRecords));
+        var staged = 0;
+        var ordinal = 0;
+        for (var slot = 0; slot < groups.Count; slot++)
+            foreach (var actor in groups[slot].ActorFingerprints)
+            {
+                if (staged != 0) json.Append(',');
+                json.Append('[');
+                AppendInvariant(json, slot);
+                json.Append(',');
+                AppendInvariant(json, actor);
+                json.Append(']');
+                staged++;
+                if (staged == StagingRowsPerCommand)
+                {
+                    json.Append(']');
+                    await InsertObservationRowsAsync(
+                        connection, transaction, json.ToString(), ordinal, cancellationToken);
+                    ordinal += staged;
+                    staged = 0;
+                    json = CreateObservationJson(
+                        Math.Min(StagingRowsPerCommand, totalRecords - ordinal));
+                }
+            }
+        if (staged != 0)
+        {
+            json.Append(']');
+            await InsertObservationRowsAsync(
+                connection, transaction, json.ToString(), ordinal, cancellationToken);
+        }
+    }
+
+    private static StringBuilder CreateObservationJson(int recordCapacity) =>
+        new StringBuilder(Math.Max(2, checked(recordCapacity * 32 + 2))).Append('[');
+
+    private static void AppendInvariant(StringBuilder builder, long value)
+    {
+        Span<char> buffer = stackalloc char[20];
+        if (!value.TryFormat(buffer, out var written, provider: CultureInfo.InvariantCulture))
+            throw new InvalidOperationException("Failed to format rolling heat integer");
+        builder.Append(buffer[..written]);
+    }
+
+    private static async Task InsertObservationRowsAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        string rowsJson,
+        int ordinal,
+        CancellationToken cancellationToken)
+    {
+        await using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText =
+            """
+            INSERT INTO ingest_observations(ordinal,slot,actor)
+            SELECT $ordinal+CAST(key AS INTEGER),
+                   CAST(json_extract(value,'$[0]') AS INTEGER),
+                   CAST(json_extract(value,'$[1]') AS INTEGER)
+              FROM json_each($rows);
+            """;
+        command.Parameters.AddWithValue("$ordinal", ordinal);
+        command.Parameters.AddWithValue("$rows", rowsJson);
+        await command.ExecuteNonQueryAsync(cancellationToken);
     }
 
     public async Task<(long? ProjectedHour, IReadOnlyList<RollingHeatChange> Changes)> ReadChangesAsync(
@@ -657,6 +877,9 @@ public sealed class HeatRollingStore
                 singleton INTEGER PRIMARY KEY CHECK(singleton=1),
                 last_compacted_hour INTEGER NOT NULL
             ) WITHOUT ROWID;
+            CREATE TABLE IF NOT EXISTS rolling_ingest_control (
+                singleton INTEGER PRIMARY KEY CHECK(singleton=1)
+            ) WITHOUT ROWID;
             """;
             await command.ExecuteNonQueryAsync(cancellationToken);
 
@@ -695,7 +918,9 @@ public sealed class HeatRollingStore
                 DROP TRIGGER IF EXISTS trg_heat_rolling_active_delete;
                 DROP TABLE IF EXISTS current_counts;
                 CREATE TRIGGER trg_heat_rolling_active_insert
-                AFTER INSERT ON active BEGIN
+                AFTER INSERT ON active
+                WHEN NOT EXISTS(SELECT 1 FROM rolling_ingest_control WHERE singleton=1)
+                BEGIN
                     INSERT INTO dirty_hashes(hash_id,revision) VALUES(new.hash_id,1)
                     ON CONFLICT(hash_id) DO UPDATE SET revision=dirty_hashes.revision+1;
                     DELETE FROM deferred_hashes
@@ -705,7 +930,9 @@ public sealed class HeatRollingStore
                                                       AND state.projected_hour);
                 END;
                 CREATE TRIGGER trg_heat_rolling_active_update
-                AFTER UPDATE OF last_seen_hour,previous_seen_hour ON active BEGIN
+                AFTER UPDATE OF last_seen_hour,previous_seen_hour ON active
+                WHEN NOT EXISTS(SELECT 1 FROM rolling_ingest_control WHERE singleton=1)
+                BEGIN
                     INSERT INTO dirty_hashes(hash_id,revision) VALUES(new.hash_id,1)
                     ON CONFLICT(hash_id) DO UPDATE SET revision=dirty_hashes.revision+1;
                     DELETE FROM deferred_hashes
