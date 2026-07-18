@@ -109,7 +109,7 @@ public static class HeatEndpoints
                     new { error = "Invalid CHHT authentication" }, statusCode: 401),
                 ChhtProtocolError.Future => Results.Json(
                     new { code = "clock_skew", retryable = true, error = exception.Message },
-                    statusCode: StatusCodes.Status425TooEarly),
+                    statusCode: 425),
                 _ => Results.BadRequest(new { error = "Invalid CHHT request" })
             };
         }
@@ -195,7 +195,7 @@ public static class HeatEndpoints
                     new { error = "Invalid CHHT authentication" }, statusCode: 401),
                 ChhtProtocolError.Future => Results.Json(
                     new { code = "clock_skew", retryable = true, error = exception.Message },
-                    statusCode: StatusCodes.Status425TooEarly),
+                    statusCode: 425),
                 _ => Results.BadRequest(new { error = "Invalid CHHT completion" })
             };
         }
