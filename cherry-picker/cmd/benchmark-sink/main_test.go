@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/sha256"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -151,5 +152,83 @@ func TestStoreRejectsBaselineAsOverlay(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "oracle.bin")
 	if _, err := openStoreWithBaseline(path, path); err == nil {
 		t.Fatal("same baseline and overlay path should fail")
+	}
+}
+
+func TestFinalizeMergesOverlaysWithoutMutatingInputs(t *testing.T) {
+	dir := t.TempDir()
+	productionPath := filepath.Join(dir, "production.bin")
+	overlayOnePath := filepath.Join(dir, "one.bin")
+	overlayTwoPath := filepath.Join(dir, "two.bin")
+	first, _ := parseHash(testHash)
+	second, _ := parseHash(secondTestHash)
+	third, _ := parseHash("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+
+	production, err := openStore(productionPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, _ = production.add(recordMetadata, []hashKey{first})
+	if err := production.close(); err != nil {
+		t.Fatal(err)
+	}
+	overlayOne, _ := openStore(overlayOnePath)
+	_, _, _ = overlayOne.add(recordRejected, []hashKey{second})
+	if err := overlayOne.close(); err != nil {
+		t.Fatal(err)
+	}
+	overlayTwo, _ := openStore(overlayTwoPath)
+	_, _, _ = overlayTwo.add(recordMetadata, []hashKey{second, third})
+	if err := overlayTwo.close(); err != nil {
+		t.Fatal(err)
+	}
+	oneBefore, _ := os.ReadFile(overlayOnePath)
+	twoBefore, _ := os.ReadFile(overlayTwoPath)
+
+	stats, err := mergeStoresAtomically(productionPath, []string{overlayOnePath, overlayTwoPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.MetadataAdded != 2 || stats.RejectedAdded != 0 {
+		t.Fatalf("unexpected merge stats: %#v", stats)
+	}
+	merged, err := openStore(productionPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer merged.close()
+	if len(merged.metadata) != 3 || len(merged.rejected) != 0 {
+		t.Fatalf("metadata=%d rejected=%d", len(merged.metadata), len(merged.rejected))
+	}
+	oneAfter, _ := os.ReadFile(overlayOnePath)
+	twoAfter, _ := os.ReadFile(overlayTwoPath)
+	if sha256.Sum256(oneBefore) != sha256.Sum256(oneAfter) || sha256.Sum256(twoBefore) != sha256.Sum256(twoAfter) {
+		t.Fatal("finalize mutated a source overlay")
+	}
+}
+
+func TestFinalizeCorruptOverlayLeavesProductionUnchanged(t *testing.T) {
+	dir := t.TempDir()
+	productionPath := filepath.Join(dir, "production.bin")
+	production, err := openStore(productionPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key, _ := parseHash(testHash)
+	_, _, _ = production.add(recordMetadata, []hashKey{key})
+	if err := production.close(); err != nil {
+		t.Fatal(err)
+	}
+	before, _ := os.ReadFile(productionPath)
+	corruptPath := filepath.Join(dir, "corrupt.bin")
+	if err := os.WriteFile(corruptPath, []byte("partial"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mergeStoresAtomically(productionPath, []string{corruptPath}); err == nil {
+		t.Fatal("corrupt overlay should fail finalization")
+	}
+	after, _ := os.ReadFile(productionPath)
+	if sha256.Sum256(before) != sha256.Sum256(after) {
+		t.Fatal("failed finalization mutated production")
 	}
 }

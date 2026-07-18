@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import importlib.util
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -51,6 +52,18 @@ def record(arm: str, run: str, unique_rate: float, *, udp: int = 0, cohort: str 
 
 
 class AnalyzerTests(unittest.TestCase):
+    def test_runtime_parser_keeps_locale_proxy_counters(self):
+        with tempfile.TemporaryDirectory() as raw:
+            log = Path(raw) / "crawler.log"
+            log.write_text(
+                "prefix runtime 30s: meta_locale_n=20 meta_han=8 "
+                "meta_kana=2 meta_hangul=1 meta_zh_proxy=6 paused=false\n",
+                encoding="utf-8",
+            )
+            rows = analyze.parse_runtime(log, 0)
+            self.assertEqual(rows[0]["meta_locale_n"], 20)
+            self.assertEqual(rows[0]["meta_zh_proxy"], 6)
+
     def test_json_counter_delta_supports_new_sink_counters(self):
         self.assertEqual(analyze.json_counter_delta({"check_found": 10}, {"check_found": 17}, "check_found"), 7)
         self.assertIsNone(analyze.json_counter_delta({}, {"check_found": 17}, "check_found"))
@@ -107,6 +120,33 @@ class ComparatorTests(unittest.TestCase):
             record("A", "01", 10, cohort="one"), record("B", "02", 12, cohort="two")
         )
         self.assertTrue(any("cohort" in error for error in errors))
+
+    def test_isolated_pair_requires_same_baseline_and_distinct_overlays(self):
+        first = record("A", "01", 10)
+        second = record("B", "02", 12)
+        first["manifest"].update({
+            "oracle_mode": "isolated", "oracle_baseline_sha": "frozen", "oracle_overlay": "one.bin",
+        })
+        second["manifest"].update({
+            "oracle_mode": "isolated", "oracle_baseline_sha": "frozen", "oracle_overlay": "two.bin",
+        })
+        errors, _ = compare.validate_pair(first, second)
+        self.assertEqual(errors, [])
+        second["manifest"]["oracle_overlay"] = "one.bin"
+        errors, _ = compare.validate_pair(first, second)
+        self.assertTrue(any("reused" in error for error in errors))
+
+    def test_isolated_pair_rejects_different_baselines(self):
+        first = record("A", "01", 10)
+        second = record("B", "02", 12)
+        first["manifest"].update({
+            "oracle_mode": "isolated", "oracle_baseline_sha": "one", "oracle_overlay": "one.bin",
+        })
+        second["manifest"].update({
+            "oracle_mode": "isolated", "oracle_baseline_sha": "two", "oracle_overlay": "two.bin",
+        })
+        errors, _ = compare.validate_pair(first, second)
+        self.assertTrue(any("different oracle baselines" in error for error in errors))
 
     def test_sign_test_is_exact(self):
         result = compare.sign_test([1, 1, 1, 1, 1])

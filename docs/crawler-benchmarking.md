@@ -142,14 +142,23 @@ local mechanical efficiency is treated as a depletion warning, not a win.
 
 Balanced order removes the first-order advantage of running earlier, but it
 does not make a shared oracle non-depleting: `/check` responses also change the
-crawler's work, so later blocks face a different admission stream. Before a
-configuration is promoted to long confirmation, the controller should support
-an immutable experiment-start oracle baseline plus an empty per-block overlay.
-Every arm then sees the same pre-existing hashes, while hashes discovered during
-its own warmup/measurement remain deduplicated normally. Overlays can be merged
-back into the production oracle only after the experiment. Until that isolation
-exists, short shared-oracle screens are evidence about direction and mechanical
-efficiency, not an unbiased estimate of the durable global effect.
+crawler's work, so later blocks face a different admission stream. Use
+`run-crawler-abab.sh --oracle-mode isolated` for confirmation runs. The
+controller stops and flushes the managed production sink, freezes one immutable
+baseline, and starts every block with a fresh writable overlay. Every arm then
+sees the same pre-existing hashes, while hashes discovered during its own
+warmup/measurement remain deduplicated normally.
+
+Isolation never merges results by default. Each experiment has a manifest,
+baseline digest, per-block overlay digests, controller logs, and a companion
+manifest digest under `bench/oracle-experiments/`. Add `--finalize-oracle` only
+after deciding that every completed block should enter production. Finalize
+validates all 21-byte records, merges metadata before rejections, builds and
+fsyncs a temporary production file, then replaces production. Source overlays
+remain preserved. If the production digest changes during the experiment,
+finalization refuses to run. Shared mode remains the default for compatibility;
+its short screens are evidence about direction and mechanical efficiency, not
+an unbiased estimate of the durable global effect.
 
 Monitor gaps are written as missing values rather than zero. The analyzer
 rejects missing or non-monotonic samples and averages the next delta across the

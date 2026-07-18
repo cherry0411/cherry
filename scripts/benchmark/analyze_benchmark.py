@@ -220,6 +220,11 @@ def main() -> None:
         1.0 - oracle_sample_coverage,
     )
     transient_slope = oracle_rate_slope(metrics, args.warmup_seconds)
+    locale_classified = total(runtime_rows, "meta_locale_n")
+    locale_han = total(runtime_rows, "meta_han")
+    locale_kana = total(runtime_rows, "meta_kana")
+    locale_hangul = total(runtime_rows, "meta_hangul")
+    locale_chinese_proxy = total(runtime_rows, "meta_zh_proxy")
     result = {
         "schema_version": 1,
         "run_id": args.run_id,
@@ -251,6 +256,23 @@ def main() -> None:
             "last_window_metadata": local_windows[-1] if local_windows else None,
             "peak_window_metadata": max(local_windows) if local_windows else None,
             "median_window_metadata": statistics.median(local_windows) if local_windows else None,
+        },
+        # Script-level signals are regional comparison proxies, not language
+        # detection. In particular, Han-only Japanese/Korean names can satisfy
+        # chinese_proxy; Kana and Hangul are reported separately so that bias is
+        # visible instead of hidden in one headline number.
+        "metadata_locale": {
+            "classified": locale_classified,
+            "name_path_han": locale_han,
+            "name_path_kana": locale_kana,
+            "name_path_hangul": locale_hangul,
+            "chinese_proxy": locale_chinese_proxy,
+            "han_ratio": locale_han / locale_classified if locale_classified else None,
+            "kana_ratio": locale_kana / locale_classified if locale_classified else None,
+            "hangul_ratio": locale_hangul / locale_classified if locale_classified else None,
+            "chinese_proxy_ratio": (
+                locale_chinese_proxy / locale_classified if locale_classified else None
+            ),
         },
         "discovery": {
             "dht_packets_received": total(runtime_rows, "dht_recv"),
@@ -292,6 +314,7 @@ def main() -> None:
         f" global_unique={unique_delta}"
         f" global_unique_s={unique_delta / args.measure_seconds:.3f}"
         f" local_meta_s={result['local_funnel']['metadata_per_second']:.3f}"
+        f" zh_proxy={locale_chinese_proxy}"
         f" rss_max_mb={result['resources']['rss_mb_max']:.1f}"
         f" windows={len(runtime_rows)}"
     )

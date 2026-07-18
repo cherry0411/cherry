@@ -115,6 +115,7 @@ type runtimeStats struct {
 	sampleResponses         atomic.Uint64
 	sampleHashesReceived    atomic.Uint64
 	sampleHashesQueued      atomic.Uint64
+	metadataLocale          metadataLocaleCounters
 }
 
 type statsSnapshot struct {
@@ -140,6 +141,7 @@ type statsSnapshot struct {
 	metadataEventsDropped   uint64
 	metadataEventsDeduped   uint64
 	metadataEventsFiltered  uint64
+	metadataLocale          metadataLocaleSnapshot
 	dhtPacketsReceived      uint64
 	dhtPacketsEnqueued      uint64
 	dhtPacketsDropped       uint64
@@ -1107,6 +1109,9 @@ func (a *Application) consumeMetadata(
 				fail.Add(1)
 				continue
 			}
+			// Record script-level regional signals before content filtering so
+			// filter policy cannot bias cross-region comparisons.
+			stats.metadataLocale.observe(metadata)
 			// Apply content filter rules before reporting to the backend.
 			if reason := a.filterChain.Apply(metadata); reason != filter.ReasonPass {
 				stats.metadataEventsFiltered.Add(1)
@@ -1179,6 +1184,7 @@ func (a *Application) emitStats(ctx context.Context, events chan<- pipeline.Even
 				metadataEventsDropped:   stats.metadataEventsDropped.Load(),
 				metadataEventsDeduped:   stats.metadataEventsDeduped.Load(),
 				metadataEventsFiltered:  stats.metadataEventsFiltered.Load(),
+				metadataLocale:          stats.metadataLocale.snapshot(),
 				dhtPacketsReceived:      packetStats.Received,
 				dhtPacketsEnqueued:      packetStats.Enqueued,
 				dhtPacketsDropped:       packetStats.Dropped,
@@ -1206,56 +1212,58 @@ func (a *Application) emitStats(ctx context.Context, events chan<- pipeline.Even
 			if !a.shouldEmitWorkerStats() {
 				continue
 			}
+			workerStats := map[string]uint64{
+				"infohash_events_sent":      current.infohashEventsSent,
+				"infohash_events_dropped":   current.infohashEventsDropped,
+				"infohash_events_deduped":   current.infohashEventsDeduped,
+				"peer_events_sent":          current.peerEventsSent,
+				"peer_events_dropped":       current.peerEventsDropped,
+				"peer_events_deduped":       current.peerEventsDeduped,
+				"metadata_requests_queued":  current.metadataRequestsQueued,
+				"metadata_requests_deduped": current.metadataRequestsDeduped,
+				"check_batches_queued":      current.checkBatchesQueued,
+				"check_batches_dropped":     current.checkBatchesDropped,
+				"check_batches_processed":   current.checkBatchesProcessed,
+				"active_lookups_queued":     current.activeLookupsQueued,
+				"active_lookups_dropped":    current.activeLookupsDropped,
+				"active_lookups_sent":       current.activeLookupsSent,
+				"sample_queries_sent":       current.sampleQueriesSent,
+				"sample_responses":          current.sampleResponses,
+				"sample_hashes_received":    current.sampleHashesReceived,
+				"sample_hashes_queued":      current.sampleHashesQueued,
+				"metadata_events_sent":      current.metadataEventsSent,
+				"metadata_events_dropped":   current.metadataEventsDropped,
+				"metadata_events_deduped":   current.metadataEventsDeduped,
+				"metadata_events_filtered":  current.metadataEventsFiltered,
+				"dht_packets_received":      current.dhtPacketsReceived,
+				"dht_packets_enqueued":      current.dhtPacketsEnqueued,
+				"dht_packets_dropped":       current.dhtPacketsDropped,
+				"dht_packets_handled":       current.dhtPacketsHandled,
+				"dht_packet_decode_errors":  current.dhtPacketDecodeErrors,
+				"dht_bytes_received":        current.dhtBytesReceived,
+				"dht_bytes_sent":            current.dhtBytesSent,
+				"dht_followups_sent":        current.dhtFollowupsSent,
+				"dht_routing_nodes":         current.dhtRoutingNodes,
+				"dht_nodes_inserted":        current.dhtNodesInserted,
+				"dht_nodes_removed":         current.dhtNodesRemoved,
+				"dht_refresh_queries":       current.dhtRefreshQueries,
+				"wire_queue_dropped":        uint64(current.wireQueueDropped),
+				"wire_dial_attempts":        uint64(current.wireDialAttempts),
+				"wire_dial_ok":              uint64(current.wireDialOK),
+				"wire_dial_failed":          uint64(current.wireDialFailed),
+				"wire_handshake_ok":         uint64(current.wireHandshakeOK),
+				"wire_handshake_failed":     uint64(current.wireHandshakeFailed),
+				"wire_download_ok":          uint64(current.wireDownloadOK),
+				"wire_download_failed":      uint64(current.wireDownloadFailed),
+				"wire_blacklisted":          uint64(current.wireBlacklisted),
+			}
+			current.metadataLocale.addWorkerStats(workerStats)
 			a.submitEvent(events, pipeline.Event{
 				Type:       pipeline.EventWorkerStats,
 				Timestamp:  time.Now().UTC(),
 				InstanceID: a.cfg.InstanceID,
 				Source:     "runtime",
-				Stats: map[string]uint64{
-					"infohash_events_sent":      current.infohashEventsSent,
-					"infohash_events_dropped":   current.infohashEventsDropped,
-					"infohash_events_deduped":   current.infohashEventsDeduped,
-					"peer_events_sent":          current.peerEventsSent,
-					"peer_events_dropped":       current.peerEventsDropped,
-					"peer_events_deduped":       current.peerEventsDeduped,
-					"metadata_requests_queued":  current.metadataRequestsQueued,
-					"metadata_requests_deduped": current.metadataRequestsDeduped,
-					"check_batches_queued":      current.checkBatchesQueued,
-					"check_batches_dropped":     current.checkBatchesDropped,
-					"check_batches_processed":   current.checkBatchesProcessed,
-					"active_lookups_queued":     current.activeLookupsQueued,
-					"active_lookups_dropped":    current.activeLookupsDropped,
-					"active_lookups_sent":       current.activeLookupsSent,
-					"sample_queries_sent":       current.sampleQueriesSent,
-					"sample_responses":          current.sampleResponses,
-					"sample_hashes_received":    current.sampleHashesReceived,
-					"sample_hashes_queued":      current.sampleHashesQueued,
-					"metadata_events_sent":      current.metadataEventsSent,
-					"metadata_events_dropped":   current.metadataEventsDropped,
-					"metadata_events_deduped":   current.metadataEventsDeduped,
-					"metadata_events_filtered":  current.metadataEventsFiltered,
-					"dht_packets_received":      current.dhtPacketsReceived,
-					"dht_packets_enqueued":      current.dhtPacketsEnqueued,
-					"dht_packets_dropped":       current.dhtPacketsDropped,
-					"dht_packets_handled":       current.dhtPacketsHandled,
-					"dht_packet_decode_errors":  current.dhtPacketDecodeErrors,
-					"dht_bytes_received":        current.dhtBytesReceived,
-					"dht_bytes_sent":            current.dhtBytesSent,
-					"dht_followups_sent":        current.dhtFollowupsSent,
-					"dht_routing_nodes":         current.dhtRoutingNodes,
-					"dht_nodes_inserted":        current.dhtNodesInserted,
-					"dht_nodes_removed":         current.dhtNodesRemoved,
-					"dht_refresh_queries":       current.dhtRefreshQueries,
-					"wire_queue_dropped":        uint64(current.wireQueueDropped),
-					"wire_dial_attempts":        uint64(current.wireDialAttempts),
-					"wire_dial_ok":              uint64(current.wireDialOK),
-					"wire_dial_failed":          uint64(current.wireDialFailed),
-					"wire_handshake_ok":         uint64(current.wireHandshakeOK),
-					"wire_handshake_failed":     uint64(current.wireHandshakeFailed),
-					"wire_download_ok":          uint64(current.wireDownloadOK),
-					"wire_download_failed":      uint64(current.wireDownloadFailed),
-					"wire_blacklisted":          uint64(current.wireBlacklisted),
-				},
+				Stats:      workerStats,
 			}, func(delta uint64) uint64 { return delta }, func(delta uint64) uint64 { return delta })
 		}
 	}
@@ -1266,8 +1274,9 @@ func (a *Application) logRuntimeDelta(current, previous statsSnapshot) {
 	const interval = 30
 	netInKBps := (current.dhtBytesReceived - previous.dhtBytesReceived) / 1024 / interval
 	netOutKBps := (current.dhtBytesSent - previous.dhtBytesSent) / 1024 / interval
+	localeDelta := current.metadataLocale.subtract(previous.metadataLocale)
 	a.logger.Printf(
-		"runtime 30s: dht_recv=%d handled=%d dropped=%d decode_err=%d net_in=%dKB/s net_out=%dKB/s nodes=%d node_add=%d node_rm=%d refresh_q=%d lookup_queue=%d lookup_drop=%d lookup_sent=%d follow_sent=%d sample_q=%d sample_resp=%d sample_hash=%d sample_unique=%d peer_sent=%d peer_drop=%d peer_dedup=%d meta_req=%d meta_req_dedup=%d meta_sent=%d meta_drop=%d meta_dedup=%d meta_filtered=%d check_drop=%d paused=%v wire_q_drop=%d wire_dial=%d wire_conn=%d wire_dial_fail=%d wire_hs=%d wire_hs_fail=%d wire_ok=%d wire_dl_fail=%d wire_bl=%d",
+		"runtime 30s: dht_recv=%d handled=%d dropped=%d decode_err=%d net_in=%dKB/s net_out=%dKB/s nodes=%d node_add=%d node_rm=%d refresh_q=%d lookup_queue=%d lookup_drop=%d lookup_sent=%d follow_sent=%d sample_q=%d sample_resp=%d sample_hash=%d sample_unique=%d peer_sent=%d peer_drop=%d peer_dedup=%d meta_req=%d meta_req_dedup=%d meta_sent=%d meta_drop=%d meta_dedup=%d meta_filtered=%d meta_locale_n=%d meta_han=%d meta_kana=%d meta_hangul=%d meta_zh_proxy=%d check_drop=%d paused=%v wire_q_drop=%d wire_dial=%d wire_conn=%d wire_dial_fail=%d wire_hs=%d wire_hs_fail=%d wire_ok=%d wire_dl_fail=%d wire_bl=%d",
 		current.dhtPacketsReceived-previous.dhtPacketsReceived,
 		current.dhtPacketsHandled-previous.dhtPacketsHandled,
 		current.dhtPacketsDropped-previous.dhtPacketsDropped,
@@ -1295,6 +1304,11 @@ func (a *Application) logRuntimeDelta(current, previous statsSnapshot) {
 		current.metadataEventsDropped-previous.metadataEventsDropped,
 		current.metadataEventsDeduped-previous.metadataEventsDeduped,
 		current.metadataEventsFiltered-previous.metadataEventsFiltered,
+		localeDelta.classified,
+		localeDelta.han,
+		localeDelta.kana,
+		localeDelta.hangul,
+		localeDelta.chineseProxy,
 		current.checkBatchesDropped-previous.checkBatchesDropped,
 		a.metaPaused.Load(),
 		current.wireQueueDropped-previous.wireQueueDropped,

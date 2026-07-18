@@ -61,13 +61,44 @@ type batchRequest struct {
 	Events []crawlerEvent `json:"events"`
 }
 
+type stringListFlag []string
+
+func (values *stringListFlag) String() string { return strings.Join(*values, ",") }
+func (values *stringListFlag) Set(value string) error {
+	*values = append(*values, value)
+	return nil
+}
+
+type mergeStats struct {
+	MetadataAdded int
+	RejectedAdded int
+}
+
 func main() {
 	listen := flag.String("listen", "127.0.0.1:5070", "HTTP listen address")
 	data := flag.String("data", "benchmark-hashes.bin", "append-only 21-byte record file")
 	baseline := flag.String("baseline", "", "optional read-only oracle baseline; -data becomes this run's overlay")
+	finalizeProduction := flag.String("finalize-production", "", "atomically merge overlays into this production oracle and exit")
+	var mergeOverlays stringListFlag
+	flag.Var(&mergeOverlays, "merge-overlay", "overlay to merge during -finalize-production; repeatable")
 	flag.Parse()
 
 	logger := log.New(os.Stdout, "benchmark-sink ", log.LstdFlags|log.Lmicroseconds)
+	if *finalizeProduction != "" {
+		if len(mergeOverlays) == 0 {
+			logger.Fatal("-finalize-production requires at least one -merge-overlay")
+		}
+		stats, err := mergeStoresAtomically(*finalizeProduction, mergeOverlays)
+		if err != nil {
+			logger.Fatal(err)
+		}
+		logger.Printf("finalized: production=%s overlays=%d metadata_added=%d rejected_added=%d",
+			*finalizeProduction, len(mergeOverlays), stats.MetadataAdded, stats.RejectedAdded)
+		return
+	}
+	if len(mergeOverlays) != 0 {
+		logger.Fatal("-merge-overlay is valid only with -finalize-production")
+	}
 	s, err := openStoreWithBaseline(*data, *baseline)
 	if err != nil {
 		logger.Fatal(err)
@@ -108,6 +139,185 @@ func main() {
 	}
 }
 
+// mergeStoresAtomically produces a fully validated replacement next to the
+// production file, fsyncs it, and only then replaces production. Metadata is
+// merged before rejections across every overlay, so a successful fetch wins
+// over a block-local rejection for a hash that production has not classified.
+// The source overlays are immutable inputs and are never removed here.
+func mergeStoresAtomically(productionPath string, overlayPaths []string) (mergeStats, error) {
+	var stats mergeStats
+	if len(overlayPaths) == 0 {
+		return stats, errors.New("no oracle overlays supplied")
+	}
+	productionAbs, err := canonicalOraclePath(productionPath)
+	if err != nil {
+		return stats, fmt.Errorf("resolve production oracle: %w", err)
+	}
+	seenPaths := map[string]struct{}{productionAbs: {}}
+	for _, path := range overlayPaths {
+		overlayAbs, err := canonicalOraclePath(path)
+		if err != nil {
+			return stats, fmt.Errorf("resolve overlay %q: %w", path, err)
+		}
+		if _, exists := seenPaths[overlayAbs]; exists {
+			return stats, fmt.Errorf("oracle paths must be distinct: %s", overlayAbs)
+		}
+		seenPaths[overlayAbs] = struct{}{}
+	}
+
+	dir := filepath.Dir(productionAbs)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return stats, fmt.Errorf("create oracle directory: %w", err)
+	}
+	temp, err := os.CreateTemp(dir, ".oracle-finalize-*.bin")
+	if err != nil {
+		return stats, fmt.Errorf("create finalize file: %w", err)
+	}
+	tempPath := temp.Name()
+	keepTemp := false
+	defer func() {
+		_ = temp.Close()
+		if !keepTemp {
+			_ = os.Remove(tempPath)
+		}
+	}()
+	if source, err := os.Open(productionAbs); err == nil {
+		if _, err := io.Copy(temp, source); err != nil {
+			source.Close()
+			return stats, fmt.Errorf("copy production oracle: %w", err)
+		}
+		if err := source.Close(); err != nil {
+			return stats, fmt.Errorf("close production oracle: %w", err)
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return stats, fmt.Errorf("open production oracle: %w", err)
+	}
+	if err := temp.Close(); err != nil {
+		return stats, fmt.Errorf("close finalize seed: %w", err)
+	}
+
+	merged, err := openStore(tempPath)
+	if err != nil {
+		return stats, fmt.Errorf("validate production oracle: %w", err)
+	}
+	closeMerged := true
+	defer func() {
+		if closeMerged {
+			_ = merged.close()
+		}
+	}()
+	for _, kind := range []byte{recordMetadata, recordRejected} {
+		for _, overlay := range overlayPaths {
+			added, err := mergeRecordsOfKind(merged, overlay, kind)
+			if err != nil {
+				return mergeStats{}, fmt.Errorf("merge overlay %s: %w", overlay, err)
+			}
+			if kind == recordMetadata {
+				stats.MetadataAdded += added
+			} else {
+				stats.RejectedAdded += added
+			}
+		}
+	}
+	if err := merged.close(); err != nil {
+		return mergeStats{}, fmt.Errorf("sync finalized oracle: %w", err)
+	}
+	closeMerged = false
+	if err := replaceFile(tempPath, productionAbs); err != nil {
+		return mergeStats{}, fmt.Errorf("replace production oracle: %w", err)
+	}
+	keepTemp = true // replaceFile moved the temporary path.
+	if directory, err := os.Open(dir); err == nil {
+		_ = directory.Sync()
+		_ = directory.Close()
+	}
+	return stats, nil
+}
+
+func canonicalOraclePath(path string) (string, error) {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	resolved, err := filepath.EvalSymlinks(abs)
+	if err == nil {
+		return resolved, nil
+	}
+	if errors.Is(err, os.ErrNotExist) {
+		return abs, nil
+	}
+	return "", err
+}
+
+func mergeRecordsOfKind(target *store, path string, wanted byte) (int, error) {
+	source, err := os.Open(path)
+	if err != nil {
+		return 0, err
+	}
+	defer source.Close()
+	reader := bufio.NewReaderSize(source, 1<<20)
+	record := make([]byte, recordSize)
+	batch := make([]hashKey, 0, 4096)
+	added := 0
+	flush := func() error {
+		if len(batch) == 0 {
+			return nil
+		}
+		accepted, _, err := target.add(wanted, batch)
+		added += accepted
+		batch = batch[:0]
+		return err
+	}
+	for {
+		_, err := io.ReadFull(reader, record)
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if errors.Is(err, io.ErrUnexpectedEOF) {
+			return 0, errors.New("corrupt store: trailing partial record")
+		}
+		if err != nil {
+			return 0, err
+		}
+		if record[0] != recordMetadata && record[0] != recordRejected {
+			return 0, fmt.Errorf("corrupt store: record type %q", record[0])
+		}
+		if record[0] != wanted {
+			continue
+		}
+		var key hashKey
+		copy(key[:], record[1:])
+		batch = append(batch, key)
+		if len(batch) == cap(batch) {
+			if err := flush(); err != nil {
+				return 0, err
+			}
+		}
+	}
+	if err := flush(); err != nil {
+		return 0, err
+	}
+	return added, nil
+}
+
+func replaceFile(source, target string) error {
+	if err := os.Rename(source, target); err == nil {
+		return nil
+	}
+	// Windows cannot replace an existing destination with Rename. This backup
+	// path keeps the old oracle recoverable; Linux takes the atomic branch above.
+	backup := target + ".finalize-backup"
+	_ = os.Remove(backup)
+	if err := os.Rename(target, backup); err != nil {
+		return err
+	}
+	if err := os.Rename(source, target); err != nil {
+		_ = os.Rename(backup, target)
+		return err
+	}
+	return os.Remove(backup)
+}
+
 func openStore(path string) (*store, error) {
 	return openStoreWithBaseline(path, "")
 }
@@ -126,6 +336,11 @@ func openStoreWithBaseline(path, baselinePath string) (*store, error) {
 		}
 		if dataAbs == baselineAbs {
 			return nil, errors.New("writable overlay and read-only baseline must be different files")
+		}
+		if dataInfo, dataErr := os.Stat(path); dataErr == nil {
+			if baselineInfo, baselineErr := os.Stat(baselinePath); baselineErr == nil && os.SameFile(dataInfo, baselineInfo) {
+				return nil, errors.New("writable overlay and read-only baseline resolve to the same file")
+			}
 		}
 	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil && filepath.Dir(path) != "." {
@@ -363,8 +578,10 @@ func (s *store) add(kind byte, candidates []hashKey) (int, int, error) {
 		buf = append(buf, kind)
 		buf = append(buf, key[:]...)
 	}
-	if _, err := s.file.Write(buf); err != nil {
+	if written, err := s.file.Write(buf); err != nil {
 		return 0, duplicates, err
+	} else if written != len(buf) {
+		return 0, duplicates, io.ErrShortWrite
 	}
 	for key := range pending {
 		target[key] = struct{}{}

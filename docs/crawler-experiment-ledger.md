@@ -104,10 +104,13 @@ block a private append-only overlay. This keeps normal within-run deduplication
 while making the pre-existing known set identical for every arm. The overlays
 are merged into the production oracle only after all blocks finish.
 
-The benchmark sink now implements the read-only baseline plus writable overlay
-storage primitive with backward-compatible single-file behavior. Controller
-lifecycle, overlay artifact hashing, and post-experiment merge remain pending;
-the feature has not been deployed to the paused benchmark host.
+The benchmark sink and paired controller now implement the read-only baseline
+plus per-block writable overlays with backward-compatible shared-file behavior.
+The isolated controller owns the sink lifecycle, records baseline/overlay and
+manifest hashes, and preserves overlays without merging by default. An explicit
+`--finalize-oracle` performs validated temporary-file merge and refuses to run
+if production changed after the freeze. Deployment to a benchmark host and the
+first isolated calibration are still pending.
 
 Protocol review also changes one priority: BEP 51 explicitly supports surveying
 the DHT with `sample_infohashes` and an advertised sampling interval. The current

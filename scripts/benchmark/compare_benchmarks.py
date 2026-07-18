@@ -136,6 +136,23 @@ def validate_pair(first: dict, second: dict) -> tuple[list[str], list[str]]:
     for field in COMPATIBILITY_FIELDS:
         if str(left.get(field, "")) != str(right.get(field, "")):
             errors.append(f"incompatible {field}: {left.get(field)!r} != {right.get(field)!r}")
+    left_oracle_mode = str(left.get("oracle_mode", "shared"))
+    right_oracle_mode = str(right.get("oracle_mode", "shared"))
+    if left_oracle_mode != right_oracle_mode:
+        errors.append(f"incompatible oracle_mode: {left_oracle_mode!r} != {right_oracle_mode!r}")
+    elif left_oracle_mode == "isolated":
+        left_baseline = str(left.get("oracle_baseline_sha", ""))
+        right_baseline = str(right.get("oracle_baseline_sha", ""))
+        if not left_baseline or not right_baseline:
+            errors.append("isolated pair lacks oracle_baseline_sha")
+        elif left_baseline != right_baseline:
+            errors.append("isolated pair used different oracle baselines")
+        left_overlay = str(left.get("oracle_overlay", ""))
+        right_overlay = str(right.get("oracle_overlay", ""))
+        if not left_overlay or not right_overlay:
+            errors.append("isolated pair lacks writable overlay paths")
+        elif left_overlay == right_overlay:
+            errors.append("isolated pair reused the same writable overlay")
     a, b = left.get("template_config_sha"), right.get("template_config_sha")
     if not a or not b:
         warnings.append("legacy manifest lacks template_config_sha")
