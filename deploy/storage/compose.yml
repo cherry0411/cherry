@@ -143,9 +143,14 @@ services:
       start_period: 30s
     security_opt:
       - no-new-privileges:true
-    networks: [storage]
+    # Keep database/search traffic on the internal network. Docker 29 does not
+    # materialize a published host port for a container attached only to an
+    # internal network, so this API-only bridge supplies the host gateway while
+    # the explicit 127.0.0.1 binding remains the exposure boundary.
+    networks: [storage, api-publish]
     logging: *bounded-logging
 
 networks:
   storage:
     internal: true
+  api-publish:

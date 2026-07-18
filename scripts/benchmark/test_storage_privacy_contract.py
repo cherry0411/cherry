@@ -171,6 +171,8 @@ def test_unbacked_authority_requires_exact_audited_opt_out() -> None:
     assert 'UNBACKED_MARKER="/var/lib/cherry-backup/UNBACKED_AUTHORITY"' in setup
     assert "systemctl disable --now cherry-storage-backup.timer" in setup
     assert "archive_mode=${CHERRY_PG_ARCHIVE_MODE:-on}" in compose
+    assert "desired_archive_mode" in setup and "printf off || printf on" in setup
+    assert "postgres-and-heat-are-single-copy-authorities" in setup
 
 
 def test_storage_bootstrap_owns_postgres_bind_mount_before_first_start() -> None:
@@ -180,5 +182,14 @@ def test_storage_bootstrap_owns_postgres_bind_mount_before_first_start() -> None
     assert ownership in setup.replace("\\\n", " ")
     assert setup.index("--entrypoint chown postgres") < setup.index(start)
     assert "exec -T -u root postgres" not in setup
-    assert "desired_archive_mode" in setup and "printf off || printf on" in setup
-    assert "postgres-and-heat-are-single-copy-authorities" in setup
+
+
+def test_api_publish_gateway_does_not_expose_database_or_search() -> None:
+    compose = (ROOT / "deploy" / "storage" / "compose.yml").read_text(encoding="utf-8")
+    assert 'networks: [storage, api-publish]' in compose
+    assert '"127.0.0.1:${CHERRY_API_PORT:-5070}:5070"' in compose
+    assert "storage:\n    internal: true\n  api-publish:" in compose
+    postgres = compose.split("  postgres:", 1)[1].split("  meilisearch:", 1)[0]
+    meili = compose.split("  meilisearch:", 1)[1].split("  api:", 1)[0]
+    assert "ports:" not in postgres
+    assert "ports:" not in meili
