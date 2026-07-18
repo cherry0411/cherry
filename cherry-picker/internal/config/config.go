@@ -1,8 +1,10 @@
 package config
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"runtime"
 	"strconv"
@@ -255,8 +257,17 @@ func loadFromFile(path string) (Config, error) {
 	}
 
 	var raw fileConfig
-	if err := json.Unmarshal(data, &raw); err != nil {
-		return Config{}, err
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&raw); err != nil {
+		return Config{}, fmt.Errorf("decode config: %w", err)
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		if err == nil {
+			return Config{}, fmt.Errorf("decode config: expected exactly one JSON value")
+		}
+		return Config{}, fmt.Errorf("decode trailing config data: %w", err)
 	}
 
 	// auto_tune 未在 JSON 中出现时默认开启

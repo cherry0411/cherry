@@ -51,6 +51,7 @@ Match User cherry-tunnel
     X11Forwarding no
     AllowAgentForwarding no
     PermitTTY no
+    PermitUserRC no
 EOF
 sshd -t
 systemctl reload ssh

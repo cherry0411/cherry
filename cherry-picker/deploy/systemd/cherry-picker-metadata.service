@@ -14,6 +14,21 @@ ExecStart=/opt/cherry-picker/cherry-picker
 Restart=always
 RestartSec=5
 LimitNOFILE=1048576
+UMask=0077
+StateDirectory=cherry-picker
+StateDirectoryMode=0700
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectControlGroups=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadWritePaths=/var/lib/cherry-picker
 
 [Install]
 WantedBy=multi-user.target

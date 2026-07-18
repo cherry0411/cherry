@@ -3,9 +3,48 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
+
+func TestLoadFromFileRejectsUnknownField(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "crawler.json")
+	if err := os.WriteFile(path, []byte(`{
+  "role": "metadata",
+  "exporter": {
+    "kind": "http",
+    "spool_dri": "/var/lib/cherry-picker/metadata-spool"
+  }
+}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CHERRY_PICKER_CONFIG", path)
+
+	_, err := Load()
+	if err == nil {
+		t.Fatal("Load() accepted an unknown JSON field")
+	}
+	if !strings.Contains(err.Error(), `unknown field "spool_dri"`) {
+		t.Fatalf("Load() error = %q, want unknown field name", err)
+	}
+}
+
+func TestLoadFromFileRejectsTrailingJSONValue(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "crawler.json")
+	if err := os.WriteFile(path, []byte(`{"role":"metadata"} {"role":"combined"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CHERRY_PICKER_CONFIG", path)
+
+	_, err := Load()
+	if err == nil {
+		t.Fatal("Load() accepted a trailing JSON value")
+	}
+	if !strings.Contains(err.Error(), "expected exactly one JSON value") {
+		t.Fatalf("Load() error = %q, want trailing-value error", err)
+	}
+}
 
 func TestLoadFromFileAppliesRoleDefaults(t *testing.T) {
 	t.Setenv("CHERRY_PICKER_CONFIG", filepath.Join("..", "..", "configs", "metadata.json"))
