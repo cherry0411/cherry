@@ -5,19 +5,16 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Cherry - DHT Torrent Search</title>
     <meta name="description" content="Cherry is a DHT torrent search engine. Search millions of torrents discovered in real-time from the BitTorrent DHT network. Find movies, TV shows, music, software and more.">
-    <meta name="robots" content="index, follow">
-    <link rel="canonical" href="https://cherry.example.com">
+    <meta name="robots" content="noindex, nofollow">
     <meta property="og:title" content="Cherry - DHT Torrent Search">
     <meta property="og:description" content="Search millions of torrents from the DHT network">
     <meta property="og:type" content="website">
     <link rel="stylesheet" href="/style.css">
-    <!-- Local dev: set API to http://localhost:5070 for dev, leave empty for Docker -->
-    <!-- <script>window.CHERRY_API = 'http://localhost:5070';</script> -->
 </head>
 <body>
     <div id="app"></div>
-    <script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
-    <script src="https://unpkg.com/vue-router@4/dist/vue-router.global.prod.js"></script>
-    <script src="/app.js"></script>
+    <script defer src="/vendor/vue-3.5.40.global.prod.js"></script>
+    <script defer src="/vendor/vue-router-4.6.4.global.prod.js"></script>
+    <script defer src="/app.js"></script>
 </body>
 </html>

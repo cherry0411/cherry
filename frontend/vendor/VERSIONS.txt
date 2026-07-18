@@ -1,0 +1,13 @@
+Vendored browser distributions (official npm registry packages):
+
+vue 3.5.40
+  file: vue-3.5.40.global.prod.js
+  sha256: 9e0039a3f6ed0e85308e24d737447f1af6af83d229d69e1267a32b29bc2a1337
+  npm integrity: sha512-+8PJ4SJXdn/cHGImF4CKdxlWHIN5Dkt7DoufRREM6h6uVCx2m7QxgcEQmmzyOK8A9mcafg7sFbJFYsdFVubTig==
+
+vue-router 4.6.4
+  file: vue-router-4.6.4.global.prod.js
+  sha256: 71505f07492774a24202b07d1409652791845594d9846513d22310ac38fa0619
+  npm integrity: sha512-Hz9q5sa33Yhduglwz6g9skT8OBPii+4bFn88w6J+J4MfEo4KRRpmiNG/hHHkdbRFlLBOqxN8y8gf2Fb0MTUgVg==
+
+The complete MIT license text for each package is kept beside these files.
