@@ -27,7 +27,7 @@ ProtectKernelTunables=true
 RestrictSUIDSGID=true
 LockPersonality=true
 CapabilityBoundingSet=
-RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 ReadWritePaths=/var/lib/cherry-picker
 
 [Install]

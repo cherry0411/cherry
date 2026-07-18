@@ -2,6 +2,7 @@
 Description=Cherry storage SSH tunnel (%i)
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -18,7 +19,6 @@ ExecStart=/usr/bin/ssh -NT \
   cherry-tunnel@${STORAGE_HOST}
 Restart=always
 RestartSec=5
-StartLimitIntervalSec=0
 
 # The private key and known_hosts remain readable only by root. The service has
 # no shell session and the storage authorized_key restricts its destination.
