@@ -61,6 +61,32 @@ func TestSubmitInfohashEventDeduplicates(t *testing.T) {
 	}
 }
 
+func TestQueueActiveLookupDropRemainsRetryable(t *testing.T) {
+	cfg := defaultTestConfig()
+	cfg.Metadata.Enabled = true
+	cfg.Discovery.ActiveLookup = true
+	application := New(cfg, testLogger())
+	queue := make(chan string, 1)
+	stats := &runtimeStats{}
+
+	if !application.queueActiveLookup(queue, "first", "live|", stats) {
+		t.Fatal("first lookup was not admitted")
+	}
+	if application.queueActiveLookup(queue, "retry", "live|", stats) {
+		t.Fatal("lookup was admitted into a full queue")
+	}
+	if application.infohashSeen.Contains("live|retry") {
+		t.Fatal("dropped lookup poisoned the seen cache")
+	}
+	<-queue
+	if !application.queueActiveLookup(queue, "retry", "live|", stats) {
+		t.Fatal("dropped lookup was not retryable after capacity returned")
+	}
+	if got := stats.activeLookupsDropped.Load(); got != 1 {
+		t.Fatalf("activeLookupsDropped = %d, want 1", got)
+	}
+}
+
 func TestNormalizeMetadataPrefersUTF8AndAggregatesFiles(t *testing.T) {
 	data := []byte(dht.Encode(map[string]interface{}{
 		"name":         "fallback-name",

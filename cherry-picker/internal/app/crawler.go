@@ -386,6 +386,10 @@ func (a *Application) queueActiveLookup(queue chan<- string, infoHash, dedupePre
 		stats.activeLookupsQueued.Add(1)
 		return true
 	default:
+		// Admission failed, so this hash has not actually been processed. Undo
+		// the seen reservation; otherwise a transient full queue suppresses all
+		// later observations until unrelated LRU churn eventually evicts it.
+		a.infohashSeen.Delete(dedupePrefix + infoHash)
 		stats.activeLookupsDropped.Add(1)
 		return false
 	}
