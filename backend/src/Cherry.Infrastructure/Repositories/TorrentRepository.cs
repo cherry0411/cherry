@@ -3,6 +3,7 @@ using Cherry.Domain.Entities;
 using Cherry.Domain.Interfaces;
 using Cherry.Infrastructure.Data;
 using Cherry.Infrastructure.Search;
+using Cherry.Infrastructure.Storage;
 using Microsoft.EntityFrameworkCore;
 using Npgsql;
 using NpgsqlTypes;
@@ -50,7 +51,7 @@ public class TorrentRepository : ITorrentRepository
         if (conn.State != System.Data.ConnectionState.Open)
             await conn.OpenAsync(ct);
 
-        // Use a transaction so torrents and their files are inserted atomically.
+        // Use a transaction so catalog rows and compact detail are inserted atomically.
         await using var tx = await conn.BeginTransactionAsync(ct);
         Dictionary<string, long> insertedTorrents;
         try
@@ -69,20 +70,20 @@ public class TorrentRepository : ITorrentRepository
                 tx,
                 ct);
 
-            // Step 2: INSERT files for successfully inserted torrents.
-            var files = new List<TorrentFile>();
+            // Step 2: one versioned detail payload for each inserted torrent.
+            var details = new List<TorrentDetail>(insertedTorrents.Count);
             foreach (var t in unique)
             {
                 if (!insertedTorrents.TryGetValue(t.InfoHash, out var torrentId)) continue;
-                foreach (var f in t.Files)
+                details.Add(new TorrentDetail
                 {
-                    f.TorrentId = torrentId;
-                    files.Add(f);
-                }
+                    TorrentId = torrentId,
+                    Payload = TorrentDetailCodec.Encode(t.Files, t.ExtensionSummaries)
+                });
             }
 
-            if (files.Count > 0)
-                await CopyFilesAsync(files, conn, tx, ct);
+            if (details.Count > 0)
+                await CopyDetailsAsync(details, conn, ct);
 
             // The marker commits atomically with authoritative metadata. The
             // crawler/API response never waits for Meilisearch itself.
@@ -183,20 +184,20 @@ public class TorrentRepository : ITorrentRepository
         return result;
     }
 
-    private static async Task CopyFilesAsync(
-        List<TorrentFile> files, NpgsqlConnection conn, NpgsqlTransaction tx, CancellationToken ct)
+    private static async Task CopyDetailsAsync(
+        List<TorrentDetail> details,
+        NpgsqlConnection conn,
+        CancellationToken ct)
     {
         await using var writer = await conn.BeginBinaryImportAsync(
-            "COPY torrent_files (torrent_id, path_text, length) FROM STDIN (FORMAT BINARY)",
+            "COPY torrent_details (torrent_id, payload) FROM STDIN (FORMAT BINARY)",
             ct);
-        // Npgsql binary COPY is implicitly part of the current transaction on this connection.
 
-        foreach (var f in files)
+        foreach (var detail in details)
         {
             await writer.StartRowAsync(ct);
-            await writer.WriteAsync(f.TorrentId, NpgsqlDbType.Bigint, ct);
-            await writer.WriteAsync(f.PathText, ct);
-            await writer.WriteAsync(f.Length, ct);
+            await writer.WriteAsync(detail.TorrentId, NpgsqlDbType.Bigint, ct);
+            await writer.WriteAsync(detail.Payload, NpgsqlDbType.Bytea, ct);
         }
 
         await writer.CompleteAsync(ct);
@@ -209,10 +210,29 @@ public class TorrentRepository : ITorrentRepository
             .FirstOrDefaultAsync(t => t.InfoHash == infoHash, ct);
 
         if (torrent != null)
-            torrent.Files = await _db.TorrentFiles
+        {
+            var payload = await _db.TorrentDetails
                 .AsNoTracking()
-                .Where(f => f.TorrentId == torrent.Id)
-                .ToListAsync(ct);
+                .Where(detail => detail.TorrentId == torrent.Id)
+                .Select(detail => detail.Payload)
+                .SingleOrDefaultAsync(ct);
+            if (payload is not null)
+            {
+                var detail = TorrentDetailCodec.Decode(payload);
+                foreach (var file in detail.Files)
+                {
+                    file.TorrentId = torrent.Id;
+                    file.InfoHash = torrent.InfoHash;
+                }
+                foreach (var extension in detail.ExtensionSummaries)
+                {
+                    extension.TorrentId = torrent.Id;
+                    extension.InfoHash = torrent.InfoHash;
+                }
+                torrent.Files = detail.Files;
+                torrent.ExtensionSummaries = detail.ExtensionSummaries;
+            }
+        }
 
         return torrent;
     }

@@ -4,6 +4,7 @@ using Cherry.Domain.Entities;
 using Cherry.Domain.Interfaces;
 using Cherry.Infrastructure.Data;
 using Cherry.Infrastructure.Search;
+using Cherry.Infrastructure.Storage;
 using Microsoft.EntityFrameworkCore;
 using Npgsql;
 using NpgsqlTypes;
@@ -137,31 +138,18 @@ public sealed class DurableIngestService
                 connection,
                 transaction,
                 cancellationToken);
-            if (insertedTorrents.Count > 0)
-            {
-                foreach (var torrent in uniqueTorrents)
+            var details = uniqueTorrents
+                .Where(torrent => insertedTorrents.ContainsKey(torrent.InfoHash))
+                .Select(torrent => new TorrentDetail
                 {
-                    if (!insertedTorrents.TryGetValue(torrent.InfoHash, out var torrentId))
-                        continue;
-                    foreach (var file in torrent.Files)
-                        file.TorrentId = torrentId;
-                    foreach (var extension in torrent.ExtensionSummaries)
-                        extension.TorrentId = torrentId;
-                }
-            }
-
-            var files = uniqueTorrents
-                .Where(torrent => insertedTorrents.ContainsKey(torrent.InfoHash))
-                .SelectMany(torrent => torrent.Files)
+                    TorrentId = insertedTorrents[torrent.InfoHash],
+                    Payload = TorrentDetailCodec.Encode(
+                        torrent.Files,
+                        torrent.ExtensionSummaries)
+                })
                 .ToList();
-            if (files.Count > 0)
-                await CopyFilesAsync(files, connection, cancellationToken);
-            var extensions = uniqueTorrents
-                .Where(torrent => insertedTorrents.ContainsKey(torrent.InfoHash))
-                .SelectMany(torrent => torrent.ExtensionSummaries)
-                .ToList();
-            if (extensions.Count > 0)
-                await CopyExtensionSummariesAsync(extensions, connection, cancellationToken);
+            if (details.Count > 0)
+                await CopyDetailsAsync(details, connection, cancellationToken);
 
             var changedDecisionHashes = await InsertDecisionsAsync(
                 uniqueDecisions,
@@ -354,39 +342,19 @@ public sealed class DurableIngestService
         return changed;
     }
 
-    private static async Task CopyFilesAsync(
-        List<TorrentFile> files,
+    private static async Task CopyDetailsAsync(
+        List<TorrentDetail> details,
         NpgsqlConnection connection,
         CancellationToken cancellationToken)
     {
         await using var writer = await connection.BeginBinaryImportAsync(
-            "COPY torrent_files (torrent_id, path_text, length) FROM STDIN (FORMAT BINARY)",
+            "COPY torrent_details (torrent_id, payload) FROM STDIN (FORMAT BINARY)",
             cancellationToken);
-        foreach (var file in files)
+        foreach (var detail in details)
         {
             await writer.StartRowAsync(cancellationToken);
-            await writer.WriteAsync(file.TorrentId, NpgsqlDbType.Bigint, cancellationToken);
-            await writer.WriteAsync(file.PathText, NpgsqlDbType.Text, cancellationToken);
-            await writer.WriteAsync(file.Length, NpgsqlDbType.Bigint, cancellationToken);
-        }
-        await writer.CompleteAsync(cancellationToken);
-    }
-
-    private static async Task CopyExtensionSummariesAsync(
-        List<TorrentExtensionSummary> extensions,
-        NpgsqlConnection connection,
-        CancellationToken cancellationToken)
-    {
-        await using var writer = await connection.BeginBinaryImportAsync(
-            "COPY torrent_extension_summaries (torrent_id, extension, file_count, total_length) FROM STDIN (FORMAT BINARY)",
-            cancellationToken);
-        foreach (var extension in extensions)
-        {
-            await writer.StartRowAsync(cancellationToken);
-            await writer.WriteAsync(extension.TorrentId, NpgsqlDbType.Bigint, cancellationToken);
-            await writer.WriteAsync(extension.Extension, NpgsqlDbType.Varchar, cancellationToken);
-            await writer.WriteAsync(extension.FileCount, NpgsqlDbType.Integer, cancellationToken);
-            await writer.WriteAsync(extension.TotalLength, NpgsqlDbType.Bigint, cancellationToken);
+            await writer.WriteAsync(detail.TorrentId, NpgsqlDbType.Bigint, cancellationToken);
+            await writer.WriteAsync(detail.Payload, NpgsqlDbType.Bytea, cancellationToken);
         }
         await writer.CompleteAsync(cancellationToken);
     }

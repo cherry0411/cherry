@@ -517,3 +517,169 @@ consistent with the rule-order mechanism, but only the final deployment-image
 run is used for the reported checkpoint. The large absolute throughput spread
 is itself evidence that a single short local run cannot size a storage server
 or promote a batch setting.
+
+## Iteration S-004: approved compact-v1 implementation
+
+This is an implementation checkpoint, not a final schema declaration or a
+stability winner. The product owner explicitly fixed these irreversible v1
+trade-offs before a storage host is purchased:
+
+- permanently delete `piece_length`, `is_private`, `source`, `region`,
+  `policy_id`, `retained_level`, `needs_refetch`, metadata `updated_at`, and the
+  old cumulative `peer_count/peer_updated_at` authority;
+- do not store bounded aliases, filenames, pinyin or initials in Meilisearch;
+  filename-only recall is an explicit zero-cost/zero-recall trade-off;
+- do not preserve raw bencode, raw info dictionaries, `pieces`, piece hashes,
+  or any representation intended to reconstruct a torrent;
+- keep a configurable edge filter, but persist only a closed numeric decision
+  code for hash-only/reject. There is no policy-change refetch or
+  summary-to-full upgrade state.
+
+### Compact-key evidence
+
+K-001 used real PostgreSQL 17.10 with 100k catalog rows, 1M file rows and 500k
+actor rows. `bigint` catalog IDs plus a unique `bytea(20)` authority hash used
+165.75 MB versus 247.29 MB for repeated `varchar(40)` keys, a 33.0% reduction.
+File and actor insertion wall times fell 42.7% and 33.6% in that fixed tmpfs
+shape. This is migration-direction evidence, not a capacity projection.
+
+K-002 held 500k actor rows constant. A 64-bit fingerprint relation measured
+54.48 MB and 3.182 s insertion, versus UUID at 64.84 MB/6.718 s and bytea(16)
+at 68.87 MB/6.032 s. Because the key domain also includes `torrent_id`, a
+collision only conservatively merges two actors for one torrent. With an ideal
+keyed 64-bit hash and an extreme one million actors in one torrent, the birthday
+collision probability is approximately 2.7e-8. A shared-secret HMAC64 is the
+v1 candidate; 128-bit deterministic shadow samples remain the falsification
+gate.
+
+### Heat-design correction
+
+Full 30-day actor last-seen was rejected after a reverse audit and another PG17
+measurement: the compact shape still costs about 107.8 bytes per live
+actor-hash pair before WAL/dead tuples. At a hypothetical 50M new pairs/day,
+the 30-day worst case is about 162 GB while still measuring an imperfect NAT/IP
+proxy.
+
+Production v1 instead uses exact unique **network actor-days**. One public IPv4
+(IPv6 /64) contributes once per torrent per UTC day across ports, node IDs,
+regions, crawler restarts and batch replays; it may contribute again on a later
+day to represent sustained activity. Only current-day exact rows and 30 sparse
+daily aggregates are retained. Strict cross-day unique last-seen is limited to
+a deterministic 1% oracle. UI/API must call this network activity/heat, never a
+peer, user or seeder count.
+
+Primary v1 evidence is inbound `get_peers` only. Active lookup responses,
+metadata fetches and crawler-generated traffic are excluded. `announce_peer`
+remains a separate shadow signal until the existing fixed token is replaced by
+a rolling source-IP-bound HMAC token.
+
+### Target search document and query contract
+
+```text
+id, name, firstSeen, heat1d, heat7d, heat15d, heat30d
+```
+
+`heatWindow=1d|7d|15d|30d` is independent from an optional discovery-age
+filter. Non-empty queries run the complete relevance rules before `sort`, then
+the selected heat and first-seen fields break ties. Empty queries become a hot
+list for the selected window. Four indexes are not created.
+
+Rollback is schema-versioned: the compact migration must copy and reconcile
+existing rows before dropping legacy columns/tables; a fresh storage host may
+start directly on the compact shape. Search activation remains a feature flag
+until a real privacy-safe query judgment set passes the quality gates.
+
+## Iteration S-006: one-row compact torrent detail
+
+### Decision and format
+
+The long-term `torrent_files` and `torrent_extension_summaries` relations are
+replaced by exactly one `torrent_details(torrent_id primary key, payload bytea)`
+row per catalog row. PostgreSQL 17 stores `payload` with column compression
+`lz4`; the real schema test reads `pg_attribute.attcompression = 'l'` rather
+than assuming the model annotation took effect. Meilisearch still receives no
+path or extension fields.
+
+Payload v1 is deterministic and contains only a version byte, an unsigned
+varint file-entry count, sorted UTF-8 paths encoded as previous-path prefix
+length plus suffix and unsigned length, then sorted extension aggregates with
+unsigned counts/bytes. It contains no normalized/summary marker. Therefore a
+summary's representative entries are naturally visible when retained entries
+are fewer than catalog `file_count`, without preserving retention policy.
+Exact duplicate path/length rows remain legal so a legacy upgrade is lossless;
+same-path lengths must otherwise be non-decreasing.
+
+Both the C# and migration decoders fail closed on unsupported versions,
+non-minimal/overflowing varints, invalid UTF-8/NUL or empty text, bounds and
+prefix violations, non-canonical ordering, excessive entry counts, negative or
+overflowing lengths, trailing bytes, and payloads above 64 MiB. The 64 MiB cap
+matches the durable HTTP request cap; a bounded writer checks before buffer
+growth, and the database check constraint is `octet_length(payload) BETWEEN 3
+AND 67108864`. This replaces the earlier 192 MiB draft, which allowed an
+unnecessarily large single-row allocation on a 2C4G host.
+
+Migration `20260718141000_CompactTorrentDetails` leaves the committed compact
+catalog migration untouched. Under an access-exclusive maintenance lock it
+first validates every legacy per-torrent count, path/extension UTF-8 byte
+bound, non-empty text, and non-negative aggregate; invalid legacy data aborts
+the transaction. A temporary PostgreSQL v1 encoder creates and size-checks the
+backfill before either legacy table is dropped. `Down` uses a bounded v1
+decoder to recreate both row tables, so rollback does not require keeping a
+shadow copy.
+
+### Real PostgreSQL 17 migration gate
+
+`CompactDetailMigrationPostgresTests` creates an isolated real database,
+migrates through compact catalog, seeds Unicode paths, summary aggregates, an
+empty-detail torrent and an exact duplicate path/length, and verifies:
+
+- an injected empty legacy path makes `Up` fail closed with no
+  `torrent_details` table/history advancement;
+- after removing that invalid row, `Up` drops both row tables, creates three
+  decodable payloads and reports LZ4 in the catalog;
+- `Down` recreates file and extension rows byte-for-byte/order-for-order,
+  including the duplicate; the second `Up` recreates identical payload bytes.
+
+This test passed against PostgreSQL 17.10. The remaining migration limitation
+is operational: encoding is deliberately offline and lock-taking. A large
+existing catalog needs a disk-headroom estimate and maintenance window; the
+planned fresh storage host avoids that cost.
+
+### S-006 resource benchmark
+
+Reproduction:
+
+```powershell
+python -m py_compile scripts/benchmark/compact_detail_s006.py
+python -m unittest scripts.benchmark.test_compact_detail_s006 -v
+python scripts/benchmark/compact_detail_s006.py --torrents 10000 --read-seconds 10 --output scripts/benchmark/testdata/compact_detail_s006_20260718.json
+```
+
+The final run used the pinned PostgreSQL 17.10 image digest
+`742f40ea20b9ff2ff31db5458d127452988a2164df9e17441e191f3b72252193`,
+2 CPUs, 2 GiB and a 1.4 GiB tmpfs. Harness SHA-256 was
+`7a291524f544a6aa92d114f74f3db3dab790cd4533f07633046c6a6168cd2737`;
+the deterministic logical corpus SHA-256 was
+`7e1897b4c87c42ef7cc4f1257be1aba0182543ff84ec4f707ee54ddb8c31d781`.
+It contained 10,000 torrents, 188,200 retained file entries, 1,600 extension
+aggregates and 200 summary torrents. Writes and reads ran in ABBA order.
+
+| Measure | Legacy rows | Compact bytea | Delta |
+|---|---:|---:|---:|
+| Total relation bytes | 19,267,584 | 5,275,648 | -72.62% |
+| Median COPY wall time | 1.078 s | 0.557 s | -48.36% |
+| Median random-read TPS | 3,947.2 | 7,931.7 | +100.94% |
+| Random-read p95 runs | 1.148 / 1.273 ms | 0.623 / 0.634 ms | directional improvement |
+
+Fetching all 10,000 payloads took 0.554 s; the pure Python reference decoder
+then processed 2,654.9 torrents/s and 49,964 file entries/s. This proves the
+codec is not a likely detail-page bottleneck, but it is not a .NET allocation
+measurement.
+
+The 72.62% result is not a capacity projection. Paths are synthetic and
+prefix-friendly, tmpfs excludes disk/WAL/checkpoint and long-run TOAST churn,
+the read test excludes .NET/JSON work and concurrent ingest/search, and one
+short process cannot capture production cache residency. It is sufficient to
+accept the structural replacement because all measured resource directions
+are large, consistent across both ABBA repetitions, and backed by a lossless
+rollback test. Rollback is migration `Down`; there is no dual-write mode.

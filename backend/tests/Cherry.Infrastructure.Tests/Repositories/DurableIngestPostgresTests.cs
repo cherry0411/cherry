@@ -5,6 +5,7 @@ using Cherry.Domain.Entities;
 using Cherry.Domain.Interfaces;
 using Cherry.Infrastructure.Data;
 using Cherry.Infrastructure.Repositories;
+using Cherry.Infrastructure.Storage;
 using Microsoft.EntityFrameworkCore;
 using Xunit;
 
@@ -101,7 +102,11 @@ public sealed class DurableIngestPostgresTests
             .Where(torrent => torrent.InfoHash == firstHash)
             .Select(torrent => torrent.Id)
             .SingleAsync();
-        Assert.Equal(1, await db.TorrentFiles.CountAsync(f => f.TorrentId == firstTorrentId));
+        var firstPayload = await db.TorrentDetails
+            .Where(detail => detail.TorrentId == firstTorrentId)
+            .Select(detail => detail.Payload)
+            .SingleAsync();
+        Assert.Single(TorrentDetailCodec.Decode(firstPayload).Files);
         Assert.Equal(1, await db.SearchOutbox.CountAsync(item => item.TorrentId == firstTorrentId));
 
         var gapHash = HashFor(Guid.NewGuid());
@@ -161,13 +166,19 @@ public sealed class DurableIngestPostgresTests
             .Where(torrent => torrent.InfoHash == firstHash || torrent.InfoHash == summaryHash)
             .Select(torrent => torrent.Id)
             .ToListAsync();
-        Assert.Equal(2, await db.TorrentFiles.CountAsync(file => torrentIds.Contains(file.TorrentId)));
+        Assert.Equal(2, await db.TorrentDetails.CountAsync(
+            detail => torrentIds.Contains(detail.TorrentId)));
         Assert.Equal(2, await db.SearchOutbox.CountAsync(item => torrentIds.Contains(item.TorrentId)));
 
         var summary = await db.Torrents.SingleAsync(torrent => torrent.InfoHash == summaryHash);
         Assert.Equal(100, summary.FileCount);
-        Assert.Equal(1, await db.TorrentExtensionSummaries.CountAsync(
-            extension => extension.TorrentId == summary.Id));
+        var summaryPayload = await db.TorrentDetails
+            .Where(detail => detail.TorrentId == summary.Id)
+            .Select(detail => detail.Payload)
+            .SingleAsync();
+        var summaryDetail = TorrentDetailCodec.Decode(summaryPayload);
+        Assert.Single(summaryDetail.Files);
+        Assert.Single(summaryDetail.ExtensionSummaries);
 
         var hashOnly = await db.MetadataDecisions.SingleAsync(
             decision => decision.InfoHash == Convert.FromHexString(hashOnlyHash));

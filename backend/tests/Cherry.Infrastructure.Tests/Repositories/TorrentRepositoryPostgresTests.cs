@@ -50,6 +50,11 @@ public sealed class TorrentRepositoryPostgresTests
         Assert.Empty(duplicateReject);
         Assert.Contains(torrentHash, filter.Recorded);
         Assert.Contains(rejectedHash, filter.Recorded);
+        var loaded = await repository.GetByInfoHashAsync(torrentHash);
+        Assert.NotNull(loaded);
+        var loadedFile = Assert.Single(loaded.Files);
+        Assert.Equal("test.bin", loadedFile.PathText);
+        Assert.Equal(100, loadedFile.Length);
         var torrentId = await db.Torrents
             .Where(item => item.InfoHash == torrentHash)
             .Select(item => item.Id)

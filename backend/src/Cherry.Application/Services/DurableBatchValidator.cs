@@ -17,6 +17,7 @@ public static class DurableBatchValidator
     public const int MaxFilesPerEvent = 10_000;
     public const int MaxRepresentativeFiles = 64;
     public const int MaxExtensionSummaries = 128;
+    private static readonly UTF8Encoding StrictUtf8 = new(false, true);
 
     public static ValidatedDurableBatch ValidateAndMap(DurableBatchRequest request)
     {
@@ -275,8 +276,15 @@ public static class DurableBatchValidator
             throw Invalid($"{field} is required");
         if (value.Contains('\0'))
             throw Invalid($"{field} must not contain NUL");
-        if (Encoding.UTF8.GetByteCount(value) > maxUtf8Bytes)
-            throw Invalid($"{field} exceeds {maxUtf8Bytes} UTF-8 bytes");
+        try
+        {
+            if (StrictUtf8.GetByteCount(value) > maxUtf8Bytes)
+                throw Invalid($"{field} exceeds {maxUtf8Bytes} UTF-8 bytes");
+        }
+        catch (EncoderFallbackException)
+        {
+            throw Invalid($"{field} is not valid Unicode");
+        }
     }
 
     private static bool IsLowerHex(string? value, int expectedLength) =>

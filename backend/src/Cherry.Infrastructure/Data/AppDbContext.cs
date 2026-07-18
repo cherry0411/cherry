@@ -9,8 +9,7 @@ public class AppDbContext : DbContext
     public DbSet<MetadataDecision> MetadataDecisions => Set<MetadataDecision>();
     public DbSet<SearchOutboxItem> SearchOutbox => Set<SearchOutboxItem>();
     public DbSet<Torrent> Torrents => Set<Torrent>();
-    public DbSet<TorrentExtensionSummary> TorrentExtensionSummaries => Set<TorrentExtensionSummary>();
-    public DbSet<TorrentFile> TorrentFiles => Set<TorrentFile>();
+    public DbSet<TorrentDetail> TorrentDetails => Set<TorrentDetail>();
     public DbSet<TorrentRequest> TorrentRequests => Set<TorrentRequest>();
 
     public AppDbContext(DbContextOptions<AppDbContext> options) : base(options) { }

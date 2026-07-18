@@ -31,20 +31,31 @@ public sealed class StorageSchemaPostgresTests
             SELECT indexname
               FROM pg_indexes
              WHERE schemaname = 'public'
-               AND tablename IN ('torrents', 'torrent_files')
+               AND tablename IN ('torrents', 'torrent_details')
             """,
             connection);
         var indexes = new HashSet<string>(StringComparer.Ordinal);
         await using var reader = await command.ExecuteReaderAsync();
         while (await reader.ReadAsync())
             indexes.Add(reader.GetString(0));
+        await reader.DisposeAsync();
 
         Assert.Contains("PK_torrents", indexes);
         Assert.Contains("ux_torrents_info_hash", indexes);
-        Assert.Contains("idx_torrent_files_torrent_id", indexes);
+        Assert.Contains("PK_torrent_details", indexes);
         Assert.DoesNotContain("idx_torrent_files_info_hash", indexes);
         Assert.DoesNotContain("idx_torrents_peer_count", indexes);
         Assert.DoesNotContain("idx_torrents_name_trgm", indexes);
         Assert.DoesNotContain("idx_torrent_files_path", indexes);
+
+        await using var compressionCommand = new NpgsqlCommand(
+            """
+            SELECT attcompression::text
+              FROM pg_attribute
+             WHERE attrelid = 'torrent_details'::regclass
+               AND attname = 'payload'
+            """,
+            connection);
+        Assert.Equal("l", await compressionCommand.ExecuteScalarAsync());
     }
 }

@@ -1,0 +1,108 @@
+{
+  "client_decode": {
+    "decode_seconds": 3.76668110024184,
+    "files_per_second": 49964.41031015782,
+    "payload_fetch_seconds": 0.5535996998660266,
+    "torrents_per_second": 2654.8570834302777
+  },
+  "corpus": {
+    "encoded_payload_bytes": 4523775,
+    "extension_rows": 1600,
+    "logical_sha256": "7e1897b4c87c42ef7cc4f1257be1aba0182543ff84ec4f707ee54ddb8c31d781",
+    "retained_file_rows": 188200,
+    "seed": 20260718,
+    "summary_torrents": 200,
+    "torrents": 10000
+  },
+  "harness_sha256": "7a291524f544a6aa92d114f74f3db3dab790cd4533f07633046c6a6168cd2737",
+  "harness_version": "s006-compact-detail-v1",
+  "limitations": [
+    "synthetic prefix-friendly retained paths, not a measured production corpus",
+    "tmpfs excludes physical disk and long-run WAL/checkpoint/TOAST churn",
+    "pgbench measures PostgreSQL retrieval; .NET API allocation and JSON serialization are excluded",
+    "single short process with ABBA order is directional, not a storage-host sizing run"
+  ],
+  "limits": {
+    "cpus": 2,
+    "data_tmpfs": "1400m",
+    "memory": "2g"
+  },
+  "postgres_image": "postgres@sha256:742f40ea20b9ff2ff31db5458d127452988a2164df9e17441e191f3b72252193",
+  "postgres_version": "17.10",
+  "random_read_median_tps": {
+    "compact": 7931.7012225,
+    "legacy": 3947.159237
+  },
+  "random_read_runs_abba": {
+    "compact": [
+      {
+        "latency_ms": {
+          "p50": 0.306,
+          "p95": 0.623,
+          "p99": 0.9556600000000035
+        },
+        "tps": 7813.016254,
+        "transactions": 78035
+      },
+      {
+        "latency_ms": {
+          "p50": 0.296,
+          "p95": 0.634,
+          "p99": 1.119
+        },
+        "tps": 8050.386191,
+        "transactions": 80586
+      }
+    ],
+    "legacy": [
+      {
+        "latency_ms": {
+          "p50": 0.671,
+          "p95": 1.148,
+          "p99": 29.632160000000177
+        },
+        "tps": 3770.017432,
+        "transactions": 37685
+      },
+      {
+        "latency_ms": {
+          "p50": 0.688,
+          "p95": 1.273,
+          "p99": 8.55305999999999
+        },
+        "tps": 4124.301042,
+        "transactions": 41199
+      }
+    ]
+  },
+  "relation_bytes_median": {
+    "compact": 5275648,
+    "legacy": 19267584
+  },
+  "relation_bytes_runs": {
+    "compact": [
+      5275648,
+      5275648
+    ],
+    "legacy": [
+      19267584,
+      19267584
+    ]
+  },
+  "result_sha256_without_self": "2d989d79d93ee28e7be322a3915ab63c30792effefe83970f64463ec3841d2a4",
+  "storage_reduction_fraction": 0.7261904761904762,
+  "write_seconds_abba": {
+    "compact": [
+      0.5177052998915315,
+      0.5954415998421609
+    ],
+    "legacy": [
+      1.1337817995809019,
+      1.021858099848032
+    ]
+  },
+  "write_seconds_median": {
+    "compact": 0.5565734498668462,
+    "legacy": 1.077819949714467
+  }
+}
