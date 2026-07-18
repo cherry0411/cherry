@@ -74,4 +74,10 @@ func TestBatchAndCheckEndpoints(t *testing.T) {
 	if !strings.Contains(recorder.Body.String(), testHash) {
 		t.Fatalf("check response=%s", recorder.Body.String())
 	}
+	if got := s.checkHashes.Load(); got != 1 {
+		t.Fatalf("check hashes=%d", got)
+	}
+	if got := s.checkFound.Load(); got != 1 {
+		t.Fatalf("check found=%d", got)
+	}
 }

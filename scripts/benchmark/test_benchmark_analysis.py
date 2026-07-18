@@ -51,6 +51,10 @@ def record(arm: str, run: str, unique_rate: float, *, udp: int = 0, cohort: str 
 
 
 class AnalyzerTests(unittest.TestCase):
+    def test_json_counter_delta_supports_new_sink_counters(self):
+        self.assertEqual(analyze.json_counter_delta({"check_found": 10}, {"check_found": 17}, "check_found"), 7)
+        self.assertIsNone(analyze.json_counter_delta({}, {"check_found": 17}, "check_found"))
+
     def test_oracle_gap_is_averaged_not_spiked(self):
         metrics = [
             {"elapsed_s": 300.0, "oracle_unique": 1000.0},

@@ -42,6 +42,8 @@ type store struct {
 
 	batchRequests  atomic.Uint64
 	checkRequests  atomic.Uint64
+	checkHashes    atomic.Uint64
+	checkFound     atomic.Uint64
 	rejectRequests atomic.Uint64
 	duplicates     atomic.Uint64
 	invalid        atomic.Uint64
@@ -238,12 +240,14 @@ func (s *store) handleCheck(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	found := make([]string, 0, len(hashes))
+	valid := 0
 	s.mu.RLock()
 	for _, value := range hashes {
 		key, ok := parseHash(value)
 		if !ok {
 			continue
 		}
+		valid++
 		if _, ok := s.metadata[key]; ok {
 			found = append(found, strings.ToLower(value))
 			continue
@@ -253,6 +257,8 @@ func (s *store) handleCheck(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	s.mu.RUnlock()
+	s.checkHashes.Add(uint64(valid))
+	s.checkFound.Add(uint64(len(found)))
 	writeJSON(w, http.StatusOK, found)
 }
 
@@ -329,6 +335,8 @@ func (s *store) handleStats(w http.ResponseWriter, _ *http.Request) {
 		"rejected_unique":     rejected,
 		"batch_requests":      s.batchRequests.Load(),
 		"check_requests":      s.checkRequests.Load(),
+		"check_hashes":        s.checkHashes.Load(),
+		"check_found":         s.checkFound.Load(),
 		"reject_requests":     s.rejectRequests.Load(),
 		"metadata_duplicates": s.duplicates.Load(),
 		"invalid_hashes":      s.invalid.Load(),

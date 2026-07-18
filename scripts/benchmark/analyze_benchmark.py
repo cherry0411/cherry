@@ -97,6 +97,13 @@ def counter_delta(rows: list[dict[str, float]], key: str) -> int | None:
     return max(0, int(values[-1] - values[0]))
 
 
+def json_counter_delta(before: dict, after: dict, key: str) -> int | None:
+    a, b = before.get(key), after.get(key)
+    if not isinstance(a, (int, float)) or not isinstance(b, (int, float)):
+        return None
+    return max(0, int(b - a))
+
+
 def slope(points: list[tuple[float, float]]) -> float | None:
     if len(points) < 3:
         return None
@@ -191,6 +198,12 @@ def main() -> None:
         0,
         int(after.get("metadata_duplicates", 0)) - int(before.get("metadata_duplicates", 0)),
     )
+    check_hash_delta = json_counter_delta(before, after, "check_hashes")
+    check_found_delta = json_counter_delta(before, after, "check_found")
+    check_found_ratio = (
+        check_found_delta / check_hash_delta
+        if check_hash_delta and check_found_delta is not None else None
+    )
 
     local_windows = [row.get("meta_sent", row.get("wire_ok", 0)) for row in runtime_rows]
     nodes = [row.get("nodes", math.nan) for row in runtime_rows]
@@ -216,6 +229,9 @@ def main() -> None:
             "global_unique_per_second": unique_delta / args.measure_seconds,
             "global_unique_per_hour": unique_delta * 3600 / args.measure_seconds,
             "oracle_duplicate_metadata": duplicate_delta,
+            "oracle_check_hashes": check_hash_delta,
+            "oracle_check_found": check_found_delta,
+            "oracle_check_found_ratio": check_found_ratio,
             # Compatibility alias; short runs measure a post-start transient,
             # not a proven long-run decay process.
             "decay_slope_unique_per_hour_per_uptime_hour": transient_slope,

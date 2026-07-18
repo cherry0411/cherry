@@ -16,6 +16,8 @@ Every run has an immutable directory under `bench/runs/` containing:
 - complete crawler log and 30-second CPU/RSS/network/oracle samples;
 - per-run kernel UDP receive/send buffer error deltas;
 - uniqueness-oracle snapshots at the exact measurement boundaries;
+- oracle check-hash/found deltas, exposing how much of each arm's discovery
+  stream was already consumed by prior sequential runs;
 - a normalized `result.json` and an append-only `bench/index.jsonl` record.
 
 The controller re-executes an immutable temporary snapshot of itself. Updating
