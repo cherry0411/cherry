@@ -74,45 +74,122 @@ public sealed class HeatRollingProjectionWorker : BackgroundService
 
     private async Task<bool> ProcessOnceCoreAsync(CancellationToken cancellationToken)
     {
-        // Only complete UTC buckets are eligible. Projecting the current hour
-        // a few seconds after the boundary would freeze a misleading partial
-        // hour until the next pass.
-        var targetHour = HeatRollingStore.UnixHour(DateTime.UtcNow) - 1;
         // The recovery lease must cover the snapshot itself. Otherwise a
         // worker can read pre-reset state, wait behind destructive recovery,
         // then commit that stale snapshot into the freshly recreated index.
         await using var projection = await _recovery.EnterProjectionAsync(cancellationToken);
-        var snapshot = await _store.ReadChangesAsync(targetHour, cancellationToken);
-        if (snapshot.ProjectedHour is not null && snapshot.ProjectedHour >= targetHour &&
-            snapshot.Changes.All(change => change.CurrentCount == change.ProjectedCount))
-            return false;
-
-        await using var scope = _scopes.CreateAsyncScope();
-        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
-        var connection = (NpgsqlConnection)db.Database.GetDbConnection();
-        if (connection.State != System.Data.ConnectionState.Open)
-            await connection.OpenAsync(cancellationToken);
-
-        var mapped = await MapAsync(connection, snapshot.Changes, cancellationToken);
-        foreach (var batch in mapped
-                     .Where(row => row.Count != row.ProjectedCount)
-                     .OrderBy(row => row.Id)
-                     .Chunk(_options.ProjectionBatchSize))
+        while (true)
         {
-            var task = await _meili.SubmitHourlyHeatDocumentsAsync(
-                batch.Select(row => new HourlyHeatProjectionDocument(row.Id, row.Count)).ToArray(),
-                _options.IndexUid,
-                cancellationToken);
-            await WaitForTaskAsync(task, cancellationToken);
-            _metrics.Projected(batch.Length);
+            // Only complete UTC buckets are eligible. A large backlog can span
+            // an hour boundary; abandon its old cursor immediately because the
+            // per-actor top-two hours cannot reconstruct target+2 exactly.
+            var targetHour = ClosedTargetHour();
+            await _store.PrepareForProjectionAsync(targetHour, cancellationToken);
+            if (ClosedTargetHour() != targetHour) continue;
+            var page = await _store.ReadChangesPageAsync(
+                targetHour,
+                afterHashId: 0,
+                pageSize: _options.ProjectionBatchSize,
+                cancellationToken: cancellationToken);
+            if (ClosedTargetHour() != targetHour) continue;
+            if (page.Changes.Count == 0)
+            {
+                if (page.ProjectedHour is not null && page.ProjectedHour >= targetHour)
+                    return false;
+                await _store.FinalizeProjectionAsync(targetHour, cancellationToken);
+                if (ClosedTargetHour() != targetHour) continue;
+                return true;
+            }
+
+            await using var scope = _scopes.CreateAsyncScope();
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            var connection = (NpgsqlConnection)db.Database.GetDbConnection();
+            if (connection.State != System.Data.ConnectionState.Open)
+                await connection.OpenAsync(cancellationToken);
+
+            var restartAtNewTarget = false;
+            while (true)
+            {
+                if (ClosedTargetHour() != targetHour)
+                {
+                    restartAtNewTarget = true;
+                    break;
+                }
+                var mapped = await MapAsync(connection, page.Changes, cancellationToken);
+                if (ClosedTargetHour() != targetHour)
+                {
+                    restartAtNewTarget = true;
+                    break;
+                }
+                var documents = mapped
+                    .Where(row => row.Count != row.ProjectedCount)
+                    .OrderBy(row => row.Id)
+                    .Select(row => new HourlyHeatProjectionDocument(row.Id, row.Count))
+                    .ToArray();
+                if (documents.Length != 0)
+                {
+                    var task = await _meili.SubmitHourlyHeatDocumentsAsync(
+                        documents, _options.IndexUid, cancellationToken);
+                    await WaitForTaskAsync(task, cancellationToken);
+                    _metrics.Projected(documents.Length);
+                    // The old document may have landed, but without the SQLite
+                    // ACK its dirty revision is replayed immediately at the new
+                    // target and corrects the idempotent Meili document.
+                    if (ClosedTargetHour() != targetHour)
+                    {
+                        restartAtNewTarget = true;
+                        break;
+                    }
+                }
+
+                await _store.CommitProjectionPageAsync(
+                    targetHour,
+                    mapped.Select(row => (row.InfoHash, row.Count, row.Revision)).ToArray(),
+                    Unmapped(page.Changes, mapped),
+                    cancellationToken);
+                if (ClosedTargetHour() != targetHour)
+                {
+                    restartAtNewTarget = true;
+                    break;
+                }
+                if (!page.HasMore)
+                {
+                    await _store.FinalizeProjectionAsync(targetHour, cancellationToken);
+                    if (ClosedTargetHour() != targetHour)
+                    {
+                        restartAtNewTarget = true;
+                        break;
+                    }
+                    return true;
+                }
+
+                page = await _store.ReadChangesPageAsync(
+                    targetHour,
+                    page.NextHashId,
+                    _options.ProjectionBatchSize,
+                    cancellationToken);
+                if (ClosedTargetHour() != targetHour)
+                {
+                    restartAtNewTarget = true;
+                    break;
+                }
+                if (page.Changes.Count == 0)
+                {
+                    await _store.FinalizeProjectionAsync(targetHour, cancellationToken);
+                    if (ClosedTargetHour() != targetHour)
+                    {
+                        restartAtNewTarget = true;
+                        break;
+                    }
+                    return true;
+                }
+            }
+            if (restartAtNewTarget) continue;
         }
-        await _store.CommitProjectionAsync(
-            targetHour,
-            mapped.Select(row => (row.InfoHash, row.Count, row.Revision)).ToArray(),
-            Unmapped(snapshot.Changes, mapped),
-            cancellationToken);
-        return true;
     }
+
+    private static long ClosedTargetHour() =>
+        HeatRollingStore.UnixHour(DateTime.UtcNow) - 1;
 
     private static async Task<IReadOnlyList<MappedChange>> MapAsync(
         NpgsqlConnection connection,

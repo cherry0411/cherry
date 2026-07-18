@@ -7,7 +7,9 @@ using Cherry.Infrastructure.Heat;
 var hashCount = args.Length > 0 ? int.Parse(args[0]) : 10_000;
 var actorsPerHash = args.Length > 1 ? int.Parse(args[1]) : 10;
 var smallReplayIterations = args.Length > 2 ? int.Parse(args[2]) : 200;
-if (hashCount <= 0 || actorsPerHash <= 0 || smallReplayIterations <= 0)
+var projectionPageSize = args.Length > 3 ? int.Parse(args[3]) : 500;
+if (hashCount <= 0 || actorsPerHash <= 0 || smallReplayIterations <= 0 ||
+    projectionPageSize <= 0)
     throw new ArgumentOutOfRangeException(nameof(args));
 
 var directory = Path.Combine(Path.GetTempPath(), $"cherry-heat-bench-{Guid.NewGuid():N}");
@@ -36,20 +38,11 @@ try
     timer.Stop();
     var replayApplyMilliseconds = timer.Elapsed.TotalMilliseconds;
 
-    timer.Restart();
-    var initial = await store.ReadChangesAsync(targetHour, CancellationToken.None);
-    timer.Stop();
-    var fullProjectionMilliseconds = timer.Elapsed.TotalMilliseconds;
-    if (initial.Changes.Count != hashCount ||
-        initial.Changes.Any(change => change.CurrentCount != actorsPerHash))
+    Collect();
+    var initial = await ProjectAllPagesAsync(
+        store, targetHour, projectionPageSize, actorsPerHash, CancellationToken.None);
+    if (initial.ChangeCount != hashCount)
         throw new InvalidDataException("benchmark correctness gate failed");
-
-    await store.CommitProjectionAsync(
-        targetHour,
-        initial.Changes.Select(change =>
-            (change.InfoHash, change.CurrentCount, change.Revision)).ToArray(),
-        [],
-        CancellationToken.None);
 
     var dirtyGroups = Enumerable.Range(0, hashCount)
         .Where(index => index % 10 == 0)
@@ -62,12 +55,10 @@ try
     timer.Stop();
     var dirtyApplyMilliseconds = timer.Elapsed.TotalMilliseconds;
 
-    timer.Restart();
-    var incremental = await store.ReadChangesAsync(targetHour, CancellationToken.None);
-    timer.Stop();
-    var dirtyProjectionMilliseconds = timer.Elapsed.TotalMilliseconds;
-    if (incremental.Changes.Count != dirtyGroups.Length ||
-        incremental.Changes.Any(change => change.CurrentCount != actorsPerHash))
+    var incremental = await ProjectAllPagesAsync(
+        store, targetHour, projectionPageSize, actorsPerHash, CancellationToken.None);
+    var dirtyProjectionMilliseconds = incremental.ElapsedMilliseconds;
+    if (incremental.ChangeCount != dirtyGroups.Length)
         throw new InvalidDataException("current-hour exclusion gate failed");
 
     const int smallReplayRecords = 32;
@@ -111,17 +102,31 @@ try
     var smallReplayAllocationGatePassed =
         smallReplayAllocatedBytesPerBatch <= smallReplayMaximumAllocatedBytesPerBatch &&
         smallReplayGen2Collections == 0;
+    const long pagedProjectionMaximumManagedGrowthBytes = 32L * 1024 * 1024;
+    const double pagedProjectionMaximumPageCommitMilliseconds = 250;
+    var pagedProjectionMemoryGatePassed =
+        initial.PeakManagedGrowthBytes <= pagedProjectionMaximumManagedGrowthBytes;
+    var pagedProjectionCommitGatePassed =
+        initial.MaxPageCommitMilliseconds <= pagedProjectionMaximumPageCommitMilliseconds;
     Console.WriteLine(JsonSerializer.Serialize(new
     {
         hashCount,
         actorPairs,
+        projectionPageSize,
         applyMilliseconds,
         applyActorPairsPerSecond,
         largeApplyMinimumPairsPerSecond,
         largeApplyGatePassed,
         replayApplyMilliseconds,
         replayActorPairsPerSecond = hashCount * actorsPerHash / (replayApplyMilliseconds / 1000),
-        fullProjectionMilliseconds,
+        pagedProjectionMilliseconds = initial.ElapsedMilliseconds,
+        pagedProjectionAllocatedBytes = initial.AllocatedBytes,
+        pagedProjectionPeakManagedGrowthBytes = initial.PeakManagedGrowthBytes,
+        pagedProjectionMaximumManagedGrowthBytes,
+        pagedProjectionMemoryGatePassed,
+        initial.MaxPageCommitMilliseconds,
+        pagedProjectionMaximumPageCommitMilliseconds,
+        pagedProjectionCommitGatePassed,
         dirtyHashes = dirtyGroups.Length,
         dirtyApplyMilliseconds,
         dirtyProjectionMilliseconds,
@@ -141,10 +146,77 @@ try
         throw new InvalidDataException("large rolling apply throughput gate failed");
     if (!smallReplayAllocationGatePassed)
         throw new InvalidDataException("small rolling replay allocation/Gen2 gate failed");
+    if (!pagedProjectionMemoryGatePassed)
+        throw new InvalidDataException("paged rolling projection memory gate failed");
+    if (!pagedProjectionCommitGatePassed)
+        throw new InvalidDataException("paged rolling projection commit-latency gate failed");
 }
 finally
 {
     if (Directory.Exists(directory)) Directory.Delete(directory, true);
+}
+
+static async Task<(
+    int ChangeCount,
+    double ElapsedMilliseconds,
+    long AllocatedBytes,
+    long PeakManagedGrowthBytes,
+    double MaxPageCommitMilliseconds)> ProjectAllPagesAsync(
+    HeatRollingStore store,
+    long targetHour,
+    int pageSize,
+    long expectedCount,
+    CancellationToken cancellationToken)
+{
+    await store.PrepareForProjectionAsync(targetHour, cancellationToken);
+    var baselineManaged = GC.GetTotalMemory(forceFullCollection: false);
+    var allocatedBefore = GC.GetTotalAllocatedBytes(precise: true);
+    var peakManaged = baselineManaged;
+    var maxPageCommitMilliseconds = 0d;
+    var changeCount = 0;
+    long cursor = 0;
+    var timer = Stopwatch.StartNew();
+    while (true)
+    {
+        var page = await store.ReadChangesPageAsync(
+            targetHour, cursor, pageSize, cancellationToken);
+        peakManaged = Math.Max(peakManaged, GC.GetTotalMemory(forceFullCollection: false));
+        if (page.Changes.Count > pageSize ||
+            page.Changes.Any(change => change.CurrentCount != expectedCount))
+            throw new InvalidDataException("paged projection correctness gate failed");
+        changeCount = checked(changeCount + page.Changes.Count);
+        var commitTimer = Stopwatch.StartNew();
+        await store.CommitProjectionPageAsync(
+            targetHour,
+            page.Changes.Select(change =>
+                (change.InfoHash, change.CurrentCount, change.Revision)).ToArray(),
+            [],
+            cancellationToken);
+        commitTimer.Stop();
+        maxPageCommitMilliseconds = Math.Max(
+            maxPageCommitMilliseconds, commitTimer.Elapsed.TotalMilliseconds);
+        peakManaged = Math.Max(peakManaged, GC.GetTotalMemory(forceFullCollection: false));
+        if (!page.HasMore)
+        {
+            await store.FinalizeProjectionAsync(targetHour, cancellationToken);
+            break;
+        }
+        cursor = page.NextHashId;
+    }
+    timer.Stop();
+    return (
+        changeCount,
+        timer.Elapsed.TotalMilliseconds,
+        GC.GetTotalAllocatedBytes(precise: true) - allocatedBefore,
+        Math.Max(0, peakManaged - baselineManaged),
+        maxPageCommitMilliseconds);
+}
+
+static void Collect()
+{
+    GC.Collect(2, GCCollectionMode.Forced, blocking: true, compacting: true);
+    GC.WaitForPendingFinalizers();
+    GC.Collect(2, GCCollectionMode.Forced, blocking: true, compacting: true);
 }
 
 static byte[] Hash(int value)

@@ -732,6 +732,256 @@ public sealed class HeatProtocolAndCodecTests
     }
 
     [Fact]
+    public async Task RollingProjectionPagesBoundMemoryAndAdvanceStateOnlyOnFinalPage()
+    {
+        var directory = Path.Combine(Path.GetTempPath(), $"cherry-rolling-{Guid.NewGuid():N}");
+        var store = new HeatRollingStore(Options(directory));
+        var target = HeatRollingStore.UnixHour(DateTime.UtcNow) - 1;
+        var hashes = Enumerable.Range(1, 137)
+            .Select(value =>
+            {
+                var hash = new byte[20];
+                BinaryPrimitives.WriteInt32BigEndian(hash.AsSpan(16), value);
+                return hash;
+            })
+            .ToArray();
+        var instant = DateTimeOffset.FromUnixTimeSeconds(target * 3600);
+        var batch = new ChhtBatch(
+            "sg-1", DateOnly.FromDateTime(instant.UtcDateTime), (byte)instant.Hour,
+            1, 1, 1,
+            hashes.Select((hash, index) =>
+                new ChhtHashGroup(hash, [checked((long)index + 1)])).ToArray(),
+            SHA256.HashData([1]));
+        try
+        {
+            await store.ApplyAsync([batch], CancellationToken.None);
+            await store.PrepareForProjectionAsync(target, CancellationToken.None);
+
+            const int pageSize = 17;
+            var seen = new HashSet<string>(StringComparer.Ordinal);
+            long cursor = 0;
+            while (true)
+            {
+                var page = await store.ReadChangesPageAsync(
+                    target, cursor, pageSize, CancellationToken.None);
+                Assert.InRange(page.Changes.Count, 1, pageSize);
+                Assert.All(page.Changes, change =>
+                {
+                    Assert.Equal(1, change.CurrentCount);
+                    Assert.True(seen.Add(Convert.ToHexString(change.InfoHash)));
+                });
+
+                await store.CommitProjectionPageAsync(
+                    target,
+                    page.Changes.Select(change =>
+                        (change.InfoHash, change.CurrentCount, change.Revision)).ToArray(),
+                    [],
+                    CancellationToken.None);
+                if (!page.HasMore)
+                {
+                    await store.FinalizeProjectionAsync(target, CancellationToken.None);
+                    break;
+                }
+                Assert.Null(await store.GetProjectedHourAsync(CancellationToken.None));
+                Assert.True(page.NextHashId > cursor);
+                cursor = page.NextHashId;
+            }
+
+            Assert.Equal(hashes.Length, seen.Count);
+            Assert.Equal(target, await store.GetProjectedHourAsync(CancellationToken.None));
+            Assert.Empty((await store.ReadChangesPageAsync(
+                target, 0, pageSize, CancellationToken.None)).Changes);
+        }
+        finally
+        {
+            if (Directory.Exists(directory)) Directory.Delete(directory, true);
+        }
+    }
+
+    [Fact]
+    public async Task RollingProjectionPagePlanStopsAtDirtyKeysetAndProbesActivePrimaryKey()
+    {
+        var directory = Path.Combine(Path.GetTempPath(), $"cherry-rolling-{Guid.NewGuid():N}");
+        var store = new HeatRollingStore(Options(directory));
+        var target = HeatRollingStore.UnixHour(DateTime.UtcNow) - 1;
+        try
+        {
+            await store.ApplyAsync(
+                [BatchAt(target, new byte[20], [1], 1)], CancellationToken.None);
+            await using var sqlite = await OpenSqliteAsync(store.Path);
+            await using var explain = sqlite.CreateCommand();
+            // Mirrors ReadChangesPageAsync. LIMIT must be applied to the dirty
+            // PK keyset before actor aggregation, not after a global GROUP BY.
+            explain.CommandText =
+                """
+                EXPLAIN QUERY PLAN
+                WITH candidates AS MATERIALIZED (
+                    SELECT dirty.hash_id,dirty.revision
+                      FROM dirty_hashes dirty
+                      LEFT JOIN deferred_hashes deferred USING(hash_id)
+                     WHERE dirty.hash_id>$after
+                       AND (deferred.retry_after_hour IS NULL OR
+                            deferred.retry_after_hour <= $target)
+                     ORDER BY dirty.hash_id
+                     LIMIT $limit
+                )
+                SELECT candidate.hash_id,h.info_hash,
+                       (SELECT COUNT(*) FROM active
+                         WHERE active.hash_id=candidate.hash_id
+                           AND (active.last_seen_hour BETWEEN $cutoff AND $target
+                                OR (active.last_seen_hour>$target AND
+                                    active.previous_seen_hour BETWEEN $cutoff AND $target))),
+                       COALESCE(projected.actor_count,0),candidate.revision
+                  FROM candidates candidate
+                  JOIN hashes h USING(hash_id)
+                  LEFT JOIN projected_counts projected USING(hash_id)
+                """;
+            explain.Parameters.AddWithValue("$after", 0);
+            explain.Parameters.AddWithValue("$target", target);
+            explain.Parameters.AddWithValue("$cutoff", target - 23);
+            explain.Parameters.AddWithValue("$limit", 501);
+            var plan = new List<string>();
+            await using var reader = await explain.ExecuteReaderAsync();
+            while (await reader.ReadAsync()) plan.Add(reader.GetString(3));
+
+            Assert.Contains(plan, row => row.Contains(
+                "SEARCH dirty USING PRIMARY KEY (hash_id>?)", StringComparison.Ordinal));
+            Assert.Contains(plan, row => row.Contains(
+                "SEARCH active USING PRIMARY KEY (hash_id=?)", StringComparison.Ordinal));
+            Assert.DoesNotContain(plan, row => row.Contains(
+                "USE TEMP B-TREE", StringComparison.Ordinal));
+        }
+        finally
+        {
+            if (Directory.Exists(directory)) Directory.Delete(directory, true);
+        }
+    }
+
+    [Fact]
+    public async Task RollingPagedReplayAndStaleCasPreserveMutationBehindCursor()
+    {
+        var directory = Path.Combine(Path.GetTempPath(), $"cherry-rolling-{Guid.NewGuid():N}");
+        var store = new HeatRollingStore(Options(directory));
+        var target = HeatRollingStore.UnixHour(DateTime.UtcNow) - 1;
+        var hashes = Enumerable.Range(1, 3)
+            .Select(value =>
+            {
+                var hash = new byte[20];
+                hash[19] = (byte)value;
+                return hash;
+            })
+            .ToArray();
+        try
+        {
+            await store.ApplyAsync(
+                hashes.Select((hash, index) =>
+                    BatchAt(target, hash, [1], checked((ulong)index + 1))).ToArray(),
+                CancellationToken.None);
+            await store.PrepareForProjectionAsync(target, CancellationToken.None);
+
+            var stalePage = await store.ReadChangesPageAsync(
+                target, 0, 1, CancellationToken.None);
+            Assert.True(stalePage.HasMore);
+            var stale = Assert.Single(stalePage.Changes);
+
+            // Simulate a crash after the page was read/Meili was ACKed but
+            // before SQLite acknowledgement: the exact page is replayable.
+            var replay = Assert.Single((await store.ReadChangesPageAsync(
+                target, 0, 1, CancellationToken.None)).Changes);
+            Assert.Equal(stale.InfoHash, replay.InfoHash);
+            Assert.Equal(stale.Revision, replay.Revision);
+
+            // A late mutation lands below the scan cursor. Committing the stale
+            // ACK may update projected_count, but revision CAS must retain dirty.
+            await store.ApplyAsync(
+                [BatchAt(target, stale.InfoHash, [2], 10)], CancellationToken.None);
+            await store.CommitProjectionPageAsync(
+                target,
+                [(stale.InfoHash, stale.CurrentCount, stale.Revision)],
+                [],
+                CancellationToken.None);
+
+            var cursor = stalePage.NextHashId;
+            while (true)
+            {
+                var page = await store.ReadChangesPageAsync(
+                    target, cursor, 1, CancellationToken.None);
+                await store.CommitProjectionPageAsync(
+                    target,
+                    page.Changes.Select(change =>
+                        (change.InfoHash, change.CurrentCount, change.Revision)).ToArray(),
+                    [],
+                    CancellationToken.None);
+                if (!page.HasMore)
+                {
+                    await store.FinalizeProjectionAsync(target, CancellationToken.None);
+                    break;
+                }
+                cursor = page.NextHashId;
+            }
+
+            var retry = Assert.Single((await store.ReadChangesPageAsync(
+                target, 0, 10, CancellationToken.None)).Changes);
+            Assert.Equal(stale.InfoHash, retry.InfoHash);
+            Assert.Equal(2, retry.CurrentCount);
+            Assert.Equal(1, retry.ProjectedCount);
+            Assert.True(retry.Revision > stale.Revision);
+        }
+        finally
+        {
+            if (Directory.Exists(directory)) Directory.Delete(directory, true);
+        }
+    }
+
+    [Fact]
+    public async Task RollingConcurrentApplyAndProjectionCommitsDoNotCompeteForWriterLock()
+    {
+        var directory = Path.Combine(Path.GetTempPath(), $"cherry-rolling-{Guid.NewGuid():N}");
+        var store = new HeatRollingStore(Options(directory));
+        var target = HeatRollingStore.UnixHour(DateTime.UtcNow) - 1;
+        var hash = new byte[20];
+        hash[0] = 77;
+        try
+        {
+            await store.ApplyAsync([BatchAt(target, hash, [1], 1)], CancellationToken.None);
+            var stale = Assert.Single((await store.ReadChangesPageAsync(
+                target, 0, 1, CancellationToken.None)).Changes);
+
+            var operations = Enumerable.Range(2, 24).SelectMany(actor => new Task[]
+            {
+                store.ApplyAsync(
+                    [BatchAt(target, hash, [actor], checked((ulong)actor))],
+                    CancellationToken.None),
+                store.CommitProjectionPageAsync(
+                    target,
+                    [(stale.InfoHash, stale.CurrentCount, stale.Revision)],
+                    [],
+                    CancellationToken.None)
+            });
+            await Task.WhenAll(operations);
+
+            using (var canceled = new CancellationTokenSource())
+            {
+                canceled.Cancel();
+                await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+                    store.CommitProjectionPageAsync(
+                        target, [], [], canceled.Token));
+            }
+            // A canceled waiter must not leak/over-release the writer gate.
+            await store.ApplyAsync([BatchAt(target, hash, [99], 99)], CancellationToken.None);
+
+            var current = Assert.Single((await store.ReadChangesPageAsync(
+                target, 0, 1, CancellationToken.None)).Changes);
+            Assert.Equal(26, current.CurrentCount);
+            Assert.True(current.Revision > stale.Revision);
+        }
+        finally
+        {
+            if (Directory.Exists(directory)) Directory.Delete(directory, true);
+        }
+    }
+
+    [Fact]
     public async Task RollingCoverageStaysUnknownWithoutAuthenticatedCrawlerHourClosures()
     {
         var directory = Path.Combine(Path.GetTempPath(), $"cherry-rolling-{Guid.NewGuid():N}");

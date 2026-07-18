@@ -9,6 +9,11 @@ public sealed record RollingHeatChange(
     long CurrentCount,
     long ProjectedCount,
     long Revision);
+public sealed record RollingHeatPage(
+    long? ProjectedHour,
+    long NextHashId,
+    bool HasMore,
+    IReadOnlyList<RollingHeatChange> Changes);
 public sealed record RollingPrivacyStatus(
     bool SecureDelete,
     long PageCount,
@@ -46,6 +51,10 @@ public sealed class HeatRollingStore
     private readonly long _minFreeBytes;
     private readonly SemaphoreSlim _initializeGate = new(1, 1);
     private readonly SemaphoreSlim _capacityGate = new(1, 1);
+    // SQLite WAL still permits only one writer. Keep the process-local writers
+    // out of busy_timeout races, but never hold this gate while PostgreSQL or
+    // Meilisearch is being awaited.
+    private readonly SemaphoreSlim _writeGate = new(1, 1);
     private int _initialized;
     private long _preparedHour = long.MinValue;
 
@@ -67,6 +76,22 @@ public sealed class HeatRollingStore
         CancellationToken cancellationToken)
     {
         var targetHour = UnixHour(DateTime.UtcNow) - 1;
+        await PrepareHourAsync(targetHour, cancellationToken);
+
+        var status = await GetCapacityStatusAsync(cancellationToken);
+        ThrowIfCapacityExceeded(status);
+        return status;
+    }
+
+    /// <summary>
+    /// Establishes the same expired-actor boundary used by ingest before a
+    /// rolling projection starts. The work is idempotent per closed UTC hour.
+    /// </summary>
+    public Task PrepareForProjectionAsync(long targetHour, CancellationToken cancellationToken) =>
+        PrepareHourAsync(targetHour, cancellationToken);
+
+    private async Task PrepareHourAsync(long targetHour, CancellationToken cancellationToken)
+    {
         if (Volatile.Read(ref _preparedHour) < targetHour)
         {
             await _capacityGate.WaitAsync(cancellationToken);
@@ -74,20 +99,28 @@ public sealed class HeatRollingStore
             {
                 if (_preparedHour < targetHour)
                 {
-                    await using var connection = await OpenAsync(cancellationToken);
-                    await using (var transaction =
-                        (SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken))
+                    await _writeGate.WaitAsync(cancellationToken);
+                    try
                     {
-                        await using var expire = connection.CreateCommand();
-                        expire.Transaction = transaction;
-                        expire.CommandText = "DELETE FROM active WHERE last_seen_hour < $cutoff";
-                        expire.Parameters.AddWithValue("$cutoff", targetHour - 23);
-                        await expire.ExecuteNonQueryAsync(cancellationToken);
-                        await transaction.CommitAsync(cancellationToken);
+                        await using var connection = await OpenAsync(cancellationToken);
+                        await using (var transaction =
+                            (SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken))
+                        {
+                            await using var expire = connection.CreateCommand();
+                            expire.Transaction = transaction;
+                            expire.CommandText = "DELETE FROM active WHERE last_seen_hour < $cutoff";
+                            expire.Parameters.AddWithValue("$cutoff", targetHour - 23);
+                            await expire.ExecuteNonQueryAsync(cancellationToken);
+                            await transaction.CommitAsync(cancellationToken);
+                        }
+                        await RunPrivacyMaintenanceAsync(
+                            targetHour, force: false, connection, cancellationToken);
+                        Volatile.Write(ref _preparedHour, targetHour);
                     }
-                    await RunPrivacyMaintenanceAsync(
-                        targetHour, force: false, connection, cancellationToken);
-                    Volatile.Write(ref _preparedHour, targetHour);
+                    finally
+                    {
+                        _writeGate.Release();
+                    }
                 }
             }
             finally
@@ -95,10 +128,6 @@ public sealed class HeatRollingStore
                 _capacityGate.Release();
             }
         }
-
-        var status = await GetCapacityStatusAsync(cancellationToken);
-        ThrowIfCapacityExceeded(status);
-        return status;
     }
 
     public async Task<RollingCapacityStatus> GetCapacityStatusAsync(
@@ -141,31 +170,47 @@ public sealed class HeatRollingStore
 
     public async Task MarkRuntimeStartAsync(long firstCompleteHour, CancellationToken cancellationToken)
     {
-        await using var connection = await OpenAsync(cancellationToken);
-        await using var command = connection.CreateCommand();
-        command.CommandText =
-            "INSERT INTO coverage_state(singleton,complete_from_hour) VALUES(1,$hour) " +
-            "ON CONFLICT(singleton) DO UPDATE SET complete_from_hour=" +
-            "MAX(coverage_state.complete_from_hour,excluded.complete_from_hour)";
-        command.Parameters.AddWithValue("$hour", firstCompleteHour);
-        await command.ExecuteNonQueryAsync(cancellationToken);
+        await _writeGate.WaitAsync(cancellationToken);
+        try
+        {
+            await using var connection = await OpenAsync(cancellationToken);
+            await using var command = connection.CreateCommand();
+            command.CommandText =
+                "INSERT INTO coverage_state(singleton,complete_from_hour) VALUES(1,$hour) " +
+                "ON CONFLICT(singleton) DO UPDATE SET complete_from_hour=" +
+                "MAX(coverage_state.complete_from_hour,excluded.complete_from_hour)";
+            command.Parameters.AddWithValue("$hour", firstCompleteHour);
+            await command.ExecuteNonQueryAsync(cancellationToken);
+        }
+        finally
+        {
+            _writeGate.Release();
+        }
     }
 
     public async Task ResetProjectionAsync(CancellationToken cancellationToken)
     {
-        await using var connection = await OpenAsync(cancellationToken);
-        await using var transaction =
-            (SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken);
-        await using var command = connection.CreateCommand();
-        command.Transaction = transaction;
-        command.CommandText =
-            "DELETE FROM projected_counts; DELETE FROM projection_state; " +
-            "DELETE FROM deferred_hashes; " +
-            "INSERT INTO dirty_hashes(hash_id,revision) " +
-            "SELECT DISTINCT hash_id,1 FROM active " +
-            "ON CONFLICT(hash_id) DO UPDATE SET revision=dirty_hashes.revision+1;";
-        await command.ExecuteNonQueryAsync(cancellationToken);
-        await transaction.CommitAsync(cancellationToken);
+        await _writeGate.WaitAsync(cancellationToken);
+        try
+        {
+            await using var connection = await OpenAsync(cancellationToken);
+            await using var transaction =
+                (SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken);
+            await using var command = connection.CreateCommand();
+            command.Transaction = transaction;
+            command.CommandText =
+                "DELETE FROM projected_counts; DELETE FROM projection_state; " +
+                "DELETE FROM deferred_hashes; " +
+                "INSERT INTO dirty_hashes(hash_id,revision) " +
+                "SELECT DISTINCT hash_id,1 FROM active " +
+                "ON CONFLICT(hash_id) DO UPDATE SET revision=dirty_hashes.revision+1;";
+            await command.ExecuteNonQueryAsync(cancellationToken);
+            await transaction.CommitAsync(cancellationToken);
+        }
+        finally
+        {
+            _writeGate.Release();
+        }
     }
 
     public async Task ApplyAsync(
@@ -173,6 +218,21 @@ public sealed class HeatRollingStore
         CancellationToken cancellationToken)
     {
         if (batches.Count == 0) return;
+        await _writeGate.WaitAsync(cancellationToken);
+        try
+        {
+            await ApplyCoreAsync(batches, cancellationToken);
+        }
+        finally
+        {
+            _writeGate.Release();
+        }
+    }
+
+    private async Task ApplyCoreAsync(
+        IReadOnlyList<ChhtBatch> batches,
+        CancellationToken cancellationToken)
+    {
         await using var connection = await OpenAsync(cancellationToken);
         await using (var createStaging = connection.CreateCommand())
         {
@@ -449,60 +509,120 @@ public sealed class HeatRollingStore
         long targetHour,
         CancellationToken cancellationToken)
     {
-        await using var connection = await OpenAsync(cancellationToken);
-        await using var transaction =
-            (SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken);
-        // Expiration is indexed and dirties only affected hashes. Counting is
-        // restricted to dirty hash PK ranges, never a full active-table scan.
-        await using (var expire = connection.CreateCommand())
+        // Compatibility helper for tests and diagnostics. Production uses the
+        // bounded page API below and therefore never materializes this list.
+        await PrepareForProjectionAsync(targetHour, cancellationToken);
+        const int pageSize = 4_096;
+        var result = new List<RollingHeatChange>();
+        long afterHashId = 0;
+        long? projected = null;
+        while (true)
         {
-            expire.Transaction = transaction;
-            expire.CommandText = "DELETE FROM active WHERE last_seen_hour < $cutoff";
-            expire.Parameters.AddWithValue("$cutoff", targetHour - 23);
-            await expire.ExecuteNonQueryAsync(cancellationToken);
+            var page = await ReadChangesPageAsync(
+                targetHour, afterHashId, pageSize, cancellationToken);
+            projected ??= page.ProjectedHour;
+            result.AddRange(page.Changes);
+            if (!page.HasMore) return (projected, result);
+            afterHashId = page.NextHashId;
         }
+    }
+
+    /// <summary>
+    /// Reads one stable, read-only dirty-hash page. New mutations below the
+    /// cursor remain dirty and are picked up by the next pass; revision CAS in
+    /// the commit path prevents an older page from acknowledging them.
+    /// </summary>
+    public async Task<RollingHeatPage> ReadChangesPageAsync(
+        long targetHour,
+        long afterHashId,
+        int pageSize,
+        CancellationToken cancellationToken)
+    {
+        if (afterHashId < 0) throw new ArgumentOutOfRangeException(nameof(afterHashId));
+        if (pageSize is < 1 or > 50_000) throw new ArgumentOutOfRangeException(nameof(pageSize));
+
+        await using var connection = await OpenAsync(cancellationToken);
         long? projected = null;
         await using (var state = connection.CreateCommand())
         {
-            state.Transaction = transaction;
             state.CommandText = "SELECT projected_hour FROM projection_state WHERE singleton=1";
             var value = await state.ExecuteScalarAsync(cancellationToken);
             if (value is not null and not DBNull) projected = Convert.ToInt64(value);
         }
-        var result = new List<RollingHeatChange>();
+
+        var rows = new List<(long HashId, RollingHeatChange Change)>(checked(pageSize + 1));
         await using var command = connection.CreateCommand();
-        command.Transaction = transaction;
         command.CommandText =
             """
-            SELECT h.info_hash,
-                   COALESCE(SUM(CASE
-                       WHEN active.last_seen_hour BETWEEN $cutoff AND $target THEN 1
-                       WHEN active.last_seen_hour > $target AND
-                            active.previous_seen_hour BETWEEN $cutoff AND $target THEN 1
-                       ELSE 0 END),0),
+            WITH candidates AS MATERIALIZED (
+                SELECT dirty.hash_id,dirty.revision
+                  FROM dirty_hashes dirty
+                  LEFT JOIN deferred_hashes deferred USING(hash_id)
+                 WHERE dirty.hash_id>$after
+                   AND (deferred.retry_after_hour IS NULL OR
+                        deferred.retry_after_hour <= $target)
+                 ORDER BY dirty.hash_id
+                 LIMIT $limit
+            )
+            SELECT candidate.hash_id,h.info_hash,
+                   (SELECT COUNT(*) FROM active
+                     WHERE active.hash_id=candidate.hash_id
+                       AND (active.last_seen_hour BETWEEN $cutoff AND $target
+                            OR (active.last_seen_hour>$target AND
+                                active.previous_seen_hour BETWEEN $cutoff AND $target))),
                    COALESCE(projected.actor_count,0),
-                   dirty.revision
-              FROM dirty_hashes dirty
+                   candidate.revision
+              FROM candidates candidate
               JOIN hashes h USING(hash_id)
-              LEFT JOIN active USING(hash_id)
               LEFT JOIN projected_counts projected USING(hash_id)
-              LEFT JOIN deferred_hashes deferred USING(hash_id)
-             WHERE deferred.retry_after_hour IS NULL OR deferred.retry_after_hour <= $target
-             GROUP BY dirty.hash_id,h.info_hash,projected.actor_count,dirty.revision
-             ORDER BY dirty.hash_id
             """;
         command.Parameters.AddWithValue("$cutoff", targetHour - 23);
         command.Parameters.AddWithValue("$target", targetHour);
-        await using (var reader = await command.ExecuteReaderAsync(cancellationToken))
-            while (await reader.ReadAsync(cancellationToken))
-                result.Add(new RollingHeatChange(
-                    (byte[])reader[0], reader.GetInt64(1), reader.GetInt64(2), reader.GetInt64(3)));
-        await transaction.CommitAsync(cancellationToken);
-        await RunPrivacyMaintenanceAsync(targetHour, force: false, connection, cancellationToken);
-        return (projected, result);
+        command.Parameters.AddWithValue("$after", afterHashId);
+        command.Parameters.AddWithValue("$limit", checked(pageSize + 1));
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        while (await reader.ReadAsync(cancellationToken))
+            rows.Add((
+                reader.GetInt64(0),
+                new RollingHeatChange(
+                    (byte[])reader[1], reader.GetInt64(2), reader.GetInt64(3), reader.GetInt64(4))));
+        rows.Sort(static (left, right) => left.HashId.CompareTo(right.HashId));
+        var hasMore = rows.Count > pageSize;
+        if (hasMore) rows.RemoveAt(pageSize);
+        var nextHashId = rows.Count == 0 ? afterHashId : rows[^1].HashId;
+        var result = rows.Select(static row => row.Change).ToArray();
+        return new RollingHeatPage(projected, nextHashId, hasMore, result);
     }
 
     public async Task CommitProjectionAsync(
+        long targetHour,
+        IReadOnlyList<(byte[] InfoHash, long Count, long Revision)> mapped,
+        IReadOnlyList<(byte[] InfoHash, long Revision)> unmapped,
+        CancellationToken cancellationToken)
+    {
+        await CommitProjectionPageAsync(targetHour, mapped, unmapped, cancellationToken);
+        await FinalizeProjectionAsync(targetHour, cancellationToken);
+    }
+
+    public async Task CommitProjectionPageAsync(
+        long targetHour,
+        IReadOnlyList<(byte[] InfoHash, long Count, long Revision)> mapped,
+        IReadOnlyList<(byte[] InfoHash, long Revision)> unmapped,
+        CancellationToken cancellationToken)
+    {
+        await _writeGate.WaitAsync(cancellationToken);
+        try
+        {
+            await CommitProjectionCoreAsync(
+                targetHour, mapped, unmapped, cancellationToken);
+        }
+        finally
+        {
+            _writeGate.Release();
+        }
+    }
+
+    private async Task CommitProjectionCoreAsync(
         long targetHour,
         IReadOnlyList<(byte[] InfoHash, long Count, long Revision)> mapped,
         IReadOnlyList<(byte[] InfoHash, long Revision)> unmapped,
@@ -552,6 +672,22 @@ public sealed class HeatRollingStore
         var deferMappedHash = deferMapped.Parameters.Add("$hash_id", SqliteType.Integer);
         var deferMappedRevision = deferMapped.Parameters.Add("$revision", SqliteType.Integer);
         deferMapped.Parameters.AddWithValue("$retry", checked(targetHour + 1));
+        await using var cleanupAcknowledged = connection.CreateCommand();
+        cleanupAcknowledged.Transaction = transaction;
+        cleanupAcknowledged.CommandText =
+            "DELETE FROM deferred_hashes WHERE hash_id=$hash_id AND NOT EXISTS(" +
+            "SELECT 1 FROM dirty_hashes WHERE dirty_hashes.hash_id=$hash_id) " +
+            "AND NOT EXISTS(SELECT 1 FROM active WHERE active.hash_id=$hash_id) " +
+            "AND NOT EXISTS(SELECT 1 FROM projected_counts " +
+            "WHERE projected_counts.hash_id=$hash_id);" +
+            "DELETE FROM hashes WHERE hash_id=$hash_id AND NOT EXISTS(" +
+            "SELECT 1 FROM active WHERE active.hash_id=$hash_id) AND NOT EXISTS(" +
+            "SELECT 1 FROM projected_counts WHERE projected_counts.hash_id=$hash_id) " +
+            "AND NOT EXISTS(SELECT 1 FROM dirty_hashes " +
+            "WHERE dirty_hashes.hash_id=$hash_id) AND NOT EXISTS(" +
+            "SELECT 1 FROM deferred_hashes WHERE deferred_hashes.hash_id=$hash_id)";
+        var cleanupAcknowledgedHash =
+            cleanupAcknowledged.Parameters.Add("$hash_id", SqliteType.Integer);
         foreach (var row in mapped)
         {
             hashValue.Value = row.InfoHash;
@@ -581,6 +717,8 @@ public sealed class HeatRollingStore
             deferMappedHash.Value = (long)hashId;
             deferMappedRevision.Value = row.Revision;
             await deferMapped.ExecuteNonQueryAsync(cancellationToken);
+            cleanupAcknowledgedHash.Value = (long)hashId;
+            await cleanupAcknowledged.ExecuteNonQueryAsync(cancellationToken);
         }
         await using var defer = connection.CreateCommand();
         defer.Transaction = transaction;
@@ -592,48 +730,67 @@ public sealed class HeatRollingStore
         var deferHash = defer.Parameters.Add("$hash_id", SqliteType.Integer);
         var deferRevision = defer.Parameters.Add("$revision", SqliteType.Integer);
         defer.Parameters.AddWithValue("$retry", checked(targetHour + 1));
+        await using var cleanUnmappedOrphan = connection.CreateCommand();
+        cleanUnmappedOrphan.Transaction = transaction;
+        // An unmapped hash can be forgotten only when this exact revision has
+        // no remaining rolling data. This replaces the old global prune,
+        // which could erase a lower-id mutation created after the cursor.
+        cleanUnmappedOrphan.CommandText =
+            "DELETE FROM dirty_hashes WHERE hash_id=$hash_id AND revision=$revision " +
+            "AND NOT EXISTS(SELECT 1 FROM active WHERE active.hash_id=$hash_id) " +
+            "AND NOT EXISTS(SELECT 1 FROM projected_counts " +
+            "WHERE projected_counts.hash_id=$hash_id)";
+        var cleanUnmappedHash =
+            cleanUnmappedOrphan.Parameters.Add("$hash_id", SqliteType.Integer);
+        var cleanUnmappedRevision =
+            cleanUnmappedOrphan.Parameters.Add("$revision", SqliteType.Integer);
         foreach (var row in unmapped)
         {
             hashValue.Value = row.InfoHash;
             var hashId = await findHash.ExecuteScalarAsync(cancellationToken);
             if (hashId is null) continue;
+            cleanUnmappedHash.Value = (long)hashId;
+            cleanUnmappedRevision.Value = row.Revision;
+            await cleanUnmappedOrphan.ExecuteNonQueryAsync(cancellationToken);
             deferHash.Value = (long)hashId;
             deferRevision.Value = row.Revision;
             await defer.ExecuteNonQueryAsync(cancellationToken);
-        }
-        await using (var state = connection.CreateCommand())
-        {
-            state.Transaction = transaction;
-            state.CommandText =
-                "INSERT INTO projection_state(singleton,projected_hour) VALUES(1,$hour) " +
-                "ON CONFLICT(singleton) DO UPDATE SET projected_hour=excluded.projected_hour";
-            state.Parameters.AddWithValue("$hour", targetHour);
-            await state.ExecuteNonQueryAsync(cancellationToken);
-        }
-        await using (var prune = connection.CreateCommand())
-        {
-            prune.Transaction = transaction;
-            prune.CommandText =
-                "DELETE FROM deferred_hashes WHERE NOT EXISTS(" +
-                "SELECT 1 FROM active WHERE active.hash_id=deferred_hashes.hash_id) " +
-                "AND NOT EXISTS(SELECT 1 FROM projected_counts " +
-                "WHERE projected_counts.hash_id=deferred_hashes.hash_id);" +
-                "DELETE FROM dirty_hashes WHERE NOT EXISTS(" +
-                "SELECT 1 FROM active WHERE active.hash_id=dirty_hashes.hash_id) " +
-                "AND NOT EXISTS(SELECT 1 FROM projected_counts " +
-                "WHERE projected_counts.hash_id=dirty_hashes.hash_id);" +
-                "DELETE FROM hashes WHERE NOT EXISTS(" +
-                "SELECT 1 FROM active WHERE active.hash_id=hashes.hash_id) AND NOT EXISTS(" +
-                "SELECT 1 FROM projected_counts WHERE projected_counts.hash_id=hashes.hash_id) " +
-                "AND NOT EXISTS(SELECT 1 FROM dirty_hashes " +
-                "WHERE dirty_hashes.hash_id=hashes.hash_id)";
-            await prune.ExecuteNonQueryAsync(cancellationToken);
+            cleanupAcknowledgedHash.Value = (long)hashId;
+            await cleanupAcknowledged.ExecuteNonQueryAsync(cancellationToken);
         }
         await transaction.CommitAsync(cancellationToken);
-        // Projection rows contain no raw address, but they share a WAL with the
-        // disposable actor table. Do not leave a successful projection commit
-        // as an excuse for expired actor frames to remain for another cycle.
-        await CheckpointAndTruncateWalAsync(connection, cancellationToken);
+    }
+
+    /// <summary>
+    /// Records completion only after the caller has traversed every page for
+    /// this target. Page commits never perform global work or advance state.
+    /// </summary>
+    public async Task FinalizeProjectionAsync(
+        long targetHour,
+        CancellationToken cancellationToken)
+    {
+        await _writeGate.WaitAsync(cancellationToken);
+        try
+        {
+            await using var connection = await OpenAsync(cancellationToken);
+            // Checkpoint before advancing state. If truncation is busy/fails,
+            // projected_hour stays old and the next pass retries finalization.
+            // The following state write may leave only its non-actor WAL frame.
+            await CheckpointAndTruncateWalAsync(connection, cancellationToken);
+            await using (var state = connection.CreateCommand())
+            {
+                state.CommandText =
+                    "INSERT INTO projection_state(singleton,projected_hour) VALUES(1,$hour) " +
+                    "ON CONFLICT(singleton) DO UPDATE SET projected_hour=" +
+                    "MAX(projection_state.projected_hour,excluded.projected_hour)";
+                state.Parameters.AddWithValue("$hour", targetHour);
+                await state.ExecuteNonQueryAsync(cancellationToken);
+            }
+        }
+        finally
+        {
+            _writeGate.Release();
+        }
     }
 
     /// <summary>
@@ -647,8 +804,16 @@ public sealed class HeatRollingStore
         bool force,
         CancellationToken cancellationToken)
     {
-        await using var connection = await OpenAsync(cancellationToken);
-        await RunPrivacyMaintenanceAsync(targetHour, force, connection, cancellationToken);
+        await _writeGate.WaitAsync(cancellationToken);
+        try
+        {
+            await using var connection = await OpenAsync(cancellationToken);
+            await RunPrivacyMaintenanceAsync(targetHour, force, connection, cancellationToken);
+        }
+        finally
+        {
+            _writeGate.Release();
+        }
     }
 
     public async Task<RollingPrivacyStatus> GetPrivacyStatusAsync(
