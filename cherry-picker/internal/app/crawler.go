@@ -252,6 +252,26 @@ type statsSnapshot struct {
 	heatSpoolBytes               int64
 	heatSpoolMaxBytes            int64
 	heatSpoolRecords             uint64
+	heatShadow                   heatShadowStatsSnapshot
+}
+
+type heatShadowStatsSnapshot struct {
+	enabled              bool
+	checks               uint64
+	new                  uint64
+	probableDuplicates   uint64
+	bypassed             uint64
+	rotations            uint64
+	currentHour          uint64
+	currentBitsSet       uint64
+	currentBitFillPPM    uint64
+	capacity             uint64
+	bytes                uint64
+	sampleCapacity       uint64
+	sampleEntries        uint64
+	sampledTruePositive  uint64
+	sampledFalsePositive uint64
+	sampledBypassed      uint64
 }
 
 const (
@@ -405,6 +425,10 @@ func (a *Application) Run(ctx context.Context) error {
 			BatchSize: a.cfg.Heat.BatchSize, FlushDelay: a.cfg.Heat.FlushInterval,
 			HTTPTimeout: a.cfg.Heat.HTTPTimeout, RetryBackoff: a.cfg.Heat.RetryBackoff,
 			MasterSecretFile: a.cfg.Heat.MasterSecretFile, HMACSecretFile: a.cfg.Heat.HMACSecretFile,
+			ShadowBloomEnabled:        a.cfg.Heat.ShadowBloomEnabled,
+			ShadowBloomCapacity:       a.cfg.Heat.ShadowBloomCapacity,
+			ShadowBloomFalsePositive:  a.cfg.Heat.ShadowBloomFalsePositive,
+			ShadowBloomSampleCapacity: a.cfg.Heat.ShadowBloomSampleCapacity,
 		})
 		if err != nil {
 			return fmt.Errorf("start inbound get_peers heat collector: %w", err)
@@ -420,9 +444,11 @@ func (a *Application) Run(ctx context.Context) error {
 				}
 			}
 		}()
-		a.logger.Printf("inbound get_peers heat enabled: endpoint=%s spool=%s queue=%d batch=%d max_bytes=%d wire=CHHT/2",
+		a.logger.Printf("inbound get_peers heat enabled: endpoint=%s spool=%s queue=%d batch=%d max_bytes=%d wire=CHHT/2 shadow_bloom=%t shadow_capacity=%d shadow_fp_ppm=%d shadow_sample_capacity=%d",
 			a.cfg.Heat.Endpoint, a.cfg.Heat.SpoolDir, a.cfg.Heat.QueueCapacity,
-			a.cfg.Heat.BatchSize, a.cfg.Heat.SpoolMaxBytes)
+			a.cfg.Heat.BatchSize, a.cfg.Heat.SpoolMaxBytes, a.cfg.Heat.ShadowBloomEnabled,
+			a.cfg.Heat.ShadowBloomCapacity, a.cfg.Heat.ShadowBloomFalsePositive,
+			a.cfg.Heat.ShadowBloomSampleCapacity)
 	}
 
 	// Durable pre-send spool path: enabled for http export with a spool_dir.
@@ -1666,6 +1692,24 @@ func (a *Application) emitStats(ctx context.Context, events chan<- pipeline.Even
 				heatSpoolBytes:                heatStats.SpoolBytes,
 				heatSpoolMaxBytes:             heatStats.SpoolMaxBytes,
 				heatSpoolRecords:              heatStats.SpoolRecords,
+				heatShadow: heatShadowStatsSnapshot{
+					enabled:              heatStats.ShadowBloomEnabled,
+					checks:               heatStats.ShadowBloomChecks,
+					new:                  heatStats.ShadowBloomNew,
+					probableDuplicates:   heatStats.ShadowBloomProbableDuplicates,
+					bypassed:             heatStats.ShadowBloomBypassed,
+					rotations:            heatStats.ShadowBloomRotations,
+					currentHour:          heatStats.ShadowBloomCurrentHour,
+					currentBitsSet:       heatStats.ShadowBloomCurrentBitsSet,
+					currentBitFillPPM:    heatStats.ShadowBloomCurrentBitFillPPM,
+					capacity:             heatStats.ShadowBloomCapacity,
+					bytes:                heatStats.ShadowBloomBytes,
+					sampleCapacity:       heatStats.ShadowBloomSampleCapacity,
+					sampleEntries:        heatStats.ShadowBloomSampleEntries,
+					sampledTruePositive:  heatStats.ShadowBloomSampledTruePositive,
+					sampledFalsePositive: heatStats.ShadowBloomSampledFalsePositive,
+					sampledBypassed:      heatStats.ShadowBloomSampledBypassed,
+				},
 			}
 			funnel := downloader.FunnelBySource()
 			announce := funnel[dht.PeerSourceAnnounce]
@@ -1749,44 +1793,60 @@ func (a *Application) emitStats(ctx context.Context, events chan<- pipeline.Even
 				"wire_getpeers_dial_ok":     uint64(current.wireGetPeersDialOK),
 				"wire_getpeers_download":    uint64(current.wireGetPeersDownload),
 				// 黑名单诊断为当前瞬时值（gauge），非窗口增量。
-				"wire_blacklist_size":               uint64(current.wireBlacklistSize),
-				"wire_blacklist_max":                uint64(current.wireBlacklistMax),
-				"wire_blacklist_rejected":           uint64(current.wireBlacklistRejected),
-				"wire_blacklist_expired":            uint64(current.wireBlacklistExpired),
-				"wire_request_depth":                uint64(current.wireRequestDepth),
-				"wire_request_capacity":             uint64(current.wireRequestCap),
-				"wire_response_depth":               uint64(current.wireResponseDepth),
-				"wire_response_capacity":            uint64(current.wireResponseCap),
-				"dht_blacklist_size":                uint64(current.dhtBlacklistSize),
-				"dht_blacklist_max":                 uint64(current.dhtBlacklistMax),
-				"dht_blacklist_rejected":            uint64(current.dhtBlacklistRejected),
-				"dht_blacklist_expired":             uint64(current.dhtBlacklistExpired),
-				"oracle_observations_queued":        current.oracleObservationsQueued,
-				"oracle_observations_sent":          current.oracleObservationsSent,
-				"oracle_observations_dropped":       current.oracleObservationsDropped,
-				"oracle_observation_http_failures":  current.oracleObservationHTTPFailures,
-				"oracle_observation_queue_depth":    uint64(current.oracleObservationDepth),
-				"oracle_observation_queue_capacity": uint64(current.oracleObservationCapacity),
-				"heat_observed":                     current.heatObserved,
-				"heat_filtered":                     current.heatFiltered,
-				"heat_queued":                       current.heatQueued,
-				"heat_queue_dropped":                current.heatQueueDropped,
-				"heat_batch_duplicates":             current.heatBatchDuplicates,
-				"heat_durable":                      current.heatDurable,
-				"heat_lost_before_durable":          current.heatLostBeforeDurable,
-				"heat_spool_retries":                current.heatSpoolRetries,
-				"heat_spool_fatal_errors":           current.heatSpoolFatalErrors,
-				"heat_exported":                     current.heatExported,
-				"heat_export_batches":               current.heatExportBatches,
-				"heat_export_retries":               current.heatExportRetries,
-				"heat_export_permanent_failures":    current.heatExportPermanentFailures,
-				"heat_closed_day_rejected_records":  current.heatClosedDayRejectedRecords,
-				"heat_closed_day_rejected_batches":  current.heatClosedDayRejectedBatches,
-				"heat_queue_depth":                  uint64(current.heatQueueDepth),
-				"heat_queue_capacity":               uint64(current.heatQueueCapacity),
-				"heat_spool_bytes":                  uint64(current.heatSpoolBytes),
-				"heat_spool_max_bytes":              uint64(current.heatSpoolMaxBytes),
-				"heat_spool_records":                current.heatSpoolRecords,
+				"wire_blacklist_size":                uint64(current.wireBlacklistSize),
+				"wire_blacklist_max":                 uint64(current.wireBlacklistMax),
+				"wire_blacklist_rejected":            uint64(current.wireBlacklistRejected),
+				"wire_blacklist_expired":             uint64(current.wireBlacklistExpired),
+				"wire_request_depth":                 uint64(current.wireRequestDepth),
+				"wire_request_capacity":              uint64(current.wireRequestCap),
+				"wire_response_depth":                uint64(current.wireResponseDepth),
+				"wire_response_capacity":             uint64(current.wireResponseCap),
+				"dht_blacklist_size":                 uint64(current.dhtBlacklistSize),
+				"dht_blacklist_max":                  uint64(current.dhtBlacklistMax),
+				"dht_blacklist_rejected":             uint64(current.dhtBlacklistRejected),
+				"dht_blacklist_expired":              uint64(current.dhtBlacklistExpired),
+				"oracle_observations_queued":         current.oracleObservationsQueued,
+				"oracle_observations_sent":           current.oracleObservationsSent,
+				"oracle_observations_dropped":        current.oracleObservationsDropped,
+				"oracle_observation_http_failures":   current.oracleObservationHTTPFailures,
+				"oracle_observation_queue_depth":     uint64(current.oracleObservationDepth),
+				"oracle_observation_queue_capacity":  uint64(current.oracleObservationCapacity),
+				"heat_observed":                      current.heatObserved,
+				"heat_filtered":                      current.heatFiltered,
+				"heat_queued":                        current.heatQueued,
+				"heat_queue_dropped":                 current.heatQueueDropped,
+				"heat_batch_duplicates":              current.heatBatchDuplicates,
+				"heat_durable":                       current.heatDurable,
+				"heat_lost_before_durable":           current.heatLostBeforeDurable,
+				"heat_spool_retries":                 current.heatSpoolRetries,
+				"heat_spool_fatal_errors":            current.heatSpoolFatalErrors,
+				"heat_exported":                      current.heatExported,
+				"heat_export_batches":                current.heatExportBatches,
+				"heat_export_retries":                current.heatExportRetries,
+				"heat_export_permanent_failures":     current.heatExportPermanentFailures,
+				"heat_closed_day_rejected_records":   current.heatClosedDayRejectedRecords,
+				"heat_closed_day_rejected_batches":   current.heatClosedDayRejectedBatches,
+				"heat_queue_depth":                   uint64(current.heatQueueDepth),
+				"heat_queue_capacity":                uint64(current.heatQueueCapacity),
+				"heat_spool_bytes":                   uint64(current.heatSpoolBytes),
+				"heat_spool_max_bytes":               uint64(current.heatSpoolMaxBytes),
+				"heat_spool_records":                 current.heatSpoolRecords,
+				"heat_shadow_bloom_enabled":          boolUint64(current.heatShadow.enabled),
+				"heat_shadow_bloom_checks":           current.heatShadow.checks,
+				"heat_shadow_bloom_new":              current.heatShadow.new,
+				"heat_shadow_bloom_probable_dup":     current.heatShadow.probableDuplicates,
+				"heat_shadow_bloom_bypassed":         current.heatShadow.bypassed,
+				"heat_shadow_bloom_rotations":        current.heatShadow.rotations,
+				"heat_shadow_bloom_current_hour":     current.heatShadow.currentHour,
+				"heat_shadow_bloom_bits_set":         current.heatShadow.currentBitsSet,
+				"heat_shadow_bloom_bit_fill_ppm":     current.heatShadow.currentBitFillPPM,
+				"heat_shadow_bloom_capacity":         current.heatShadow.capacity,
+				"heat_shadow_bloom_bytes":            current.heatShadow.bytes,
+				"heat_shadow_sample_capacity":        current.heatShadow.sampleCapacity,
+				"heat_shadow_sample_entries":         current.heatShadow.sampleEntries,
+				"heat_shadow_sampled_true_positive":  current.heatShadow.sampledTruePositive,
+				"heat_shadow_sampled_false_positive": current.heatShadow.sampledFalsePositive,
+				"heat_shadow_sampled_bypassed":       current.heatShadow.sampledBypassed,
 			}
 			addWireWorkerStats(workerStats, current)
 			addLRUWorkerStats(workerStats, "infohash", current.infohashLRU)
@@ -1917,6 +1977,25 @@ func formatRuntimeGauges(current, previous statsSnapshot) string {
 		current.heatSpoolBytes,
 		current.heatSpoolMaxBytes,
 		current.heatSpoolRecords,
+	)
+	fmt.Fprintf(&b,
+		" heat_shadow=%t heat_shadow_check=%d heat_shadow_new=%d heat_shadow_prob_dup=%d heat_shadow_bypass=%d heat_shadow_rotate=%d heat_shadow_hour=%d heat_shadow_bits=%d heat_shadow_fill_ppm=%d heat_shadow_cap=%d heat_shadow_bytes=%d heat_shadow_sample_cap=%d heat_shadow_sample_entries=%d heat_shadow_sample_tp=%d heat_shadow_sample_fp=%d heat_shadow_sample_bypass=%d",
+		current.heatShadow.enabled,
+		current.heatShadow.checks-previous.heatShadow.checks,
+		current.heatShadow.new-previous.heatShadow.new,
+		current.heatShadow.probableDuplicates-previous.heatShadow.probableDuplicates,
+		current.heatShadow.bypassed-previous.heatShadow.bypassed,
+		current.heatShadow.rotations-previous.heatShadow.rotations,
+		current.heatShadow.currentHour,
+		current.heatShadow.currentBitsSet,
+		current.heatShadow.currentBitFillPPM,
+		current.heatShadow.capacity,
+		current.heatShadow.bytes,
+		current.heatShadow.sampleCapacity,
+		current.heatShadow.sampleEntries,
+		current.heatShadow.sampledTruePositive-previous.heatShadow.sampledTruePositive,
+		current.heatShadow.sampledFalsePositive-previous.heatShadow.sampledFalsePositive,
+		current.heatShadow.sampledBypassed-previous.heatShadow.sampledBypassed,
 	)
 	appendLRURuntimeFields(&b, "ih", current.infohashLRU, previous.infohashLRU)
 	appendLRURuntimeFields(&b, "peer", current.peerLRU, previous.peerLRU)

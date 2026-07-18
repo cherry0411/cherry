@@ -27,6 +27,41 @@ type capturedDelivery struct {
 	header http.Header
 }
 
+func TestCollectorShadowBloomNeverChangesAdmission(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		writeAcceptedACK(t, w, r, body)
+	}))
+	defer server.Close()
+	now := time.Date(2026, 7, 18, 6, 0, 0, 0, time.UTC)
+	collector, err := New(Options{
+		Endpoint: server.URL, CrawlerID: "jp-shadow-01", SpoolDir: t.TempDir(),
+		SpoolMaxBytes: 1 << 20, QueueCapacity: 8, BatchSize: 8,
+		FlushDelay: time.Hour, MasterSecret: testMasterSecret, HMACSecret: testHMACSecret,
+		LocalAddresses: []netip.Addr{}, Now: func() time.Time { return now },
+		ShadowBloomEnabled: true, ShadowBloomCapacity: 8,
+		ShadowBloomFalsePositive: 1, ShadowBloomSampleCapacity: 8,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	hash := string(bytes.Repeat([]byte{0x72}, 20))
+	if !collector.Observe(hash, "8.8.8.8", now) || !collector.Observe(hash, "8.8.8.8", now) {
+		t.Fatal("shadow instrumentation changed queue admission")
+	}
+	snapshot := collector.Snapshot()
+	if snapshot.Queued != 2 || snapshot.Filtered != 0 || snapshot.QueueDropped != 0 ||
+		snapshot.ShadowBloomChecks != 2 || snapshot.ShadowBloomNew != 1 ||
+		snapshot.ShadowBloomProbableDuplicates != 1 {
+		t.Fatalf("snapshot=%+v", snapshot)
+	}
+	closeCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := collector.Close(closeCtx); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestCollectorResponseLossReplaysIdenticalBodyAndReceipt(t *testing.T) {
 	var mu sync.Mutex
 	var deliveries []capturedDelivery

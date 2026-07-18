@@ -35,50 +35,71 @@ const (
 )
 
 type Options struct {
-	Endpoint         string
-	CrawlerID        string
-	SpoolDir         string
-	SpoolMaxBytes    int64
-	KnownCrawlers    string
-	QueueCapacity    int
-	BatchSize        int
-	FlushDelay       time.Duration
-	RetryBackoff     time.Duration
-	HTTPTimeout      time.Duration
-	MasterSecret     []byte
-	MasterSecretFile string
-	HMACSecret       []byte
-	HMACSecretFile   string
-	LocalAddresses   []netip.Addr
-	HTTPClient       *http.Client
-	Now              func() time.Time
+	Endpoint                  string
+	CrawlerID                 string
+	SpoolDir                  string
+	SpoolMaxBytes             int64
+	KnownCrawlers             string
+	QueueCapacity             int
+	BatchSize                 int
+	FlushDelay                time.Duration
+	RetryBackoff              time.Duration
+	HTTPTimeout               time.Duration
+	MasterSecret              []byte
+	MasterSecretFile          string
+	HMACSecret                []byte
+	HMACSecretFile            string
+	LocalAddresses            []netip.Addr
+	HTTPClient                *http.Client
+	Now                       func() time.Time
+	ShadowBloomEnabled        bool
+	ShadowBloomCapacity       int
+	ShadowBloomFalsePositive  int
+	ShadowBloomSampleCapacity int
 }
 
 type Snapshot struct {
-	Observed                 uint64
-	Filtered                 uint64
-	Queued                   uint64
-	QueueDropped             uint64
-	BatchDuplicates          uint64
-	Durable                  uint64
-	LostBeforeDurable        uint64
-	SpoolRetries             uint64
-	SpoolFatalErrors         uint64
-	Exported                 uint64
-	ExportBatches            uint64
-	ExportRetries            uint64
-	ExportPermanentFailures  uint64
-	ClosedDayRejectedRecords uint64
-	ClosedDayRejectedBatches uint64
-	QueueDepth               int
-	QueueCapacity            int
-	SpoolBytes               int64
-	SpoolMaxBytes            int64
-	SpoolRecords             uint64
+	Observed                        uint64
+	Filtered                        uint64
+	Queued                          uint64
+	QueueDropped                    uint64
+	BatchDuplicates                 uint64
+	Durable                         uint64
+	LostBeforeDurable               uint64
+	SpoolRetries                    uint64
+	SpoolFatalErrors                uint64
+	Exported                        uint64
+	ExportBatches                   uint64
+	ExportRetries                   uint64
+	ExportPermanentFailures         uint64
+	ClosedDayRejectedRecords        uint64
+	ClosedDayRejectedBatches        uint64
+	QueueDepth                      int
+	QueueCapacity                   int
+	SpoolBytes                      int64
+	SpoolMaxBytes                   int64
+	SpoolRecords                    uint64
+	ShadowBloomEnabled              bool
+	ShadowBloomChecks               uint64
+	ShadowBloomNew                  uint64
+	ShadowBloomProbableDuplicates   uint64
+	ShadowBloomBypassed             uint64
+	ShadowBloomRotations            uint64
+	ShadowBloomCurrentHour          uint64
+	ShadowBloomCurrentBitsSet       uint64
+	ShadowBloomCurrentBitFillPPM    uint64
+	ShadowBloomCapacity             uint64
+	ShadowBloomBytes                uint64
+	ShadowBloomSampleCapacity       uint64
+	ShadowBloomSampleEntries        uint64
+	ShadowBloomSampledTruePositive  uint64
+	ShadowBloomSampledFalsePositive uint64
+	ShadowBloomSampledBypassed      uint64
 }
 
 type Collector struct {
 	identity           *actorIdentity
+	shadow             *hourBloomShadow
 	spool              *heatSpool
 	completion         *completionTracker
 	endpoint           string
@@ -181,6 +202,13 @@ func New(opts Options) (*Collector, error) {
 	if err != nil {
 		return nil, err
 	}
+	shadow, err := newHourBloomShadow(shadowBloomOptions{
+		Enabled: opts.ShadowBloomEnabled, Capacity: opts.ShadowBloomCapacity,
+		FalsePositive: opts.ShadowBloomFalsePositive, SampleCapacity: opts.ShadowBloomSampleCapacity,
+	})
+	if err != nil {
+		return nil, err
+	}
 	sp, err := openHeatSpool(spoolOptions{dir: opts.SpoolDir, maxBytes: opts.SpoolMaxBytes})
 	if err != nil {
 		return nil, err
@@ -226,7 +254,7 @@ func New(opts Options) (*Collector, error) {
 	client.CheckRedirect = func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }
 	ctx, cancel := context.WithCancel(context.Background())
 	c := &Collector{
-		identity: identity, spool: sp, completion: completion, endpoint: endpoint,
+		identity: identity, shadow: shadow, spool: sp, completion: completion, endpoint: endpoint,
 		completionEndpoint: completionEndpoint, crawlerID: opts.CrawlerID,
 		hmacSecret: string(hmacSecret), client: client, batchSize: opts.BatchSize,
 		flushDelay: opts.FlushDelay, retryDelay: opts.RetryBackoff, now: now,
@@ -251,6 +279,9 @@ func (c *Collector) Observe(rawInfoHash, sourceIP string, now time.Time) bool {
 	if !ok {
 		c.filtered.Add(1)
 		return false
+	}
+	if c.shadow != nil {
+		c.shadow.observe(obs)
 	}
 	for {
 		active := c.activeDay.Load()
@@ -295,6 +326,10 @@ func (c *Collector) Observe(rawInfoHash, sourceIP string, now time.Time) bool {
 
 func (c *Collector) Snapshot() Snapshot {
 	spoolBytes, spoolMax, spoolRecords := c.spool.snapshot()
+	var shadow shadowBloomSnapshot
+	if c.shadow != nil {
+		shadow = c.shadow.snapshot()
+	}
 	return Snapshot{
 		Observed: c.observed.Load(), Filtered: c.filtered.Load(), Queued: c.queued.Load(),
 		QueueDropped: c.queueDropped.Load(), BatchDuplicates: c.batchDuplicates.Load(),
@@ -306,6 +341,16 @@ func (c *Collector) Snapshot() Snapshot {
 		ClosedDayRejectedBatches: c.closedDayRejectedBatches.Load(),
 		QueueDepth:               len(c.queue), QueueCapacity: cap(c.queue), SpoolBytes: spoolBytes,
 		SpoolMaxBytes: spoolMax, SpoolRecords: spoolRecords,
+		ShadowBloomEnabled: shadow.Enabled, ShadowBloomChecks: shadow.Checks,
+		ShadowBloomNew: shadow.New, ShadowBloomProbableDuplicates: shadow.ProbableDuplicates,
+		ShadowBloomBypassed: shadow.Bypassed, ShadowBloomRotations: shadow.Rotations,
+		ShadowBloomCurrentHour: shadow.CurrentHour, ShadowBloomCurrentBitsSet: shadow.CurrentBitsSet,
+		ShadowBloomCurrentBitFillPPM: shadow.CurrentBitFillPPM, ShadowBloomCapacity: shadow.Capacity,
+		ShadowBloomBytes: shadow.Bytes, ShadowBloomSampleCapacity: shadow.SampleCapacity,
+		ShadowBloomSampleEntries:        shadow.SampleEntries,
+		ShadowBloomSampledTruePositive:  shadow.SampledTruePositive,
+		ShadowBloomSampledFalsePositive: shadow.SampledFalsePositive,
+		ShadowBloomSampledBypassed:      shadow.SampledBypassed,
 	}
 }
 

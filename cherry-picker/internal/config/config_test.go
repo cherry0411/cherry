@@ -262,6 +262,10 @@ func TestLoadHeatConfigDefaultsDisabledAndUsesSecretFilePaths(t *testing.T) {
 	t.Setenv("CHERRY_PICKER_HEAT_HMAC_SECRET_FILE", "/run/secrets/heat-hmac")
 	t.Setenv("CHERRY_PICKER_HEAT_SPOOL_DIR", "/var/lib/cherry-picker/heat")
 	t.Setenv("CHERRY_PICKER_HEAT_KNOWN_CRAWLERS", "1.1.1.1,2001:db8::/32")
+	t.Setenv("CHERRY_PICKER_HEAT_SHADOW_BLOOM_ENABLED", "true")
+	t.Setenv("CHERRY_PICKER_HEAT_SHADOW_BLOOM_CAPACITY", "123456")
+	t.Setenv("CHERRY_PICKER_HEAT_SHADOW_BLOOM_FP_PPM", "250")
+	t.Setenv("CHERRY_PICKER_HEAT_SHADOW_SAMPLE_CAPACITY", "321")
 
 	cfg, err := Load()
 	if err != nil {
@@ -270,8 +274,23 @@ func TestLoadHeatConfigDefaultsDisabledAndUsesSecretFilePaths(t *testing.T) {
 	if !cfg.Heat.Enabled || cfg.Heat.CrawlerID != "jp-1" ||
 		cfg.Heat.MasterSecretFile != "/run/secrets/heat-master" ||
 		cfg.Heat.HMACSecretFile != "/run/secrets/heat-hmac" || cfg.Heat.QueueCapacity != 65_536 ||
-		cfg.Heat.BatchSize != 4_096 || cfg.Heat.SpoolMaxBytes != 512<<20 {
+		cfg.Heat.BatchSize != 4_096 || cfg.Heat.SpoolMaxBytes != 512<<20 ||
+		!cfg.Heat.ShadowBloomEnabled || cfg.Heat.ShadowBloomCapacity != 123456 ||
+		cfg.Heat.ShadowBloomFalsePositive != 250 || cfg.Heat.ShadowBloomSampleCapacity != 321 {
 		t.Fatalf("unexpected heat config: %+v", cfg.Heat)
+	}
+}
+
+func TestLoadHeatShadowBloomDefaultsDisabledAndBounded(t *testing.T) {
+	t.Setenv("CHERRY_PICKER_CONFIG", "")
+	t.Setenv("CHERRY_PICKER_HEAT_SHADOW_BLOOM_ENABLED", "")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Heat.ShadowBloomEnabled || cfg.Heat.ShadowBloomCapacity != 1_000_000 ||
+		cfg.Heat.ShadowBloomFalsePositive != 1_000 || cfg.Heat.ShadowBloomSampleCapacity != 4_096 {
+		t.Fatalf("unexpected shadow defaults: %+v", cfg.Heat)
 	}
 }
 
@@ -286,9 +305,13 @@ func TestLoadHeatConfigFromJSONContainsPathsNotSecretValues(t *testing.T) {
     "master_secret_file": "/run/secrets/heat-master",
     "hmac_secret_file": "/run/secrets/heat-hmac",
     "spool_dir": "/var/lib/cherry-picker/heat",
-    "queue_capacity": 100,
-    "batch_size": 200,
-    "flush_interval": "10ms"
+		"queue_capacity": 100,
+		"batch_size": 200,
+		"flush_interval": "10ms",
+		"shadow_bloom_enabled": true,
+		"shadow_bloom_capacity": 654321,
+		"shadow_bloom_fp_ppm": 500,
+		"shadow_bloom_sample_capacity": 432
   }
 }`), 0o600); err != nil {
 		t.Fatal(err)
@@ -300,7 +323,9 @@ func TestLoadHeatConfigFromJSONContainsPathsNotSecretValues(t *testing.T) {
 	}
 	if !cfg.Heat.Enabled || cfg.Heat.HMACSecretFile != "/run/secrets/heat-hmac" ||
 		cfg.Heat.QueueCapacity != 100 || cfg.Heat.BatchSize != 100 ||
-		cfg.Heat.FlushInterval != 10*time.Millisecond {
+		cfg.Heat.FlushInterval != 10*time.Millisecond || !cfg.Heat.ShadowBloomEnabled ||
+		cfg.Heat.ShadowBloomCapacity != 654321 || cfg.Heat.ShadowBloomFalsePositive != 500 ||
+		cfg.Heat.ShadowBloomSampleCapacity != 432 {
 		t.Fatalf("unexpected JSON heat config: %+v", cfg.Heat)
 	}
 }
