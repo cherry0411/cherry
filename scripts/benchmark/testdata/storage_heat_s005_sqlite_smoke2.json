@@ -1,0 +1,149 @@
+{
+  "schema": "cherry.sqlite-heat-s005.v1",
+  "started_at": "2026-07-18T11:43:39.909064+00:00",
+  "runtime": {
+    "python": "3.13.11 (main, Jan 28 2026, 03:37:05) [GCC 14.2.0]",
+    "sqlite": "3.49.2",
+    "python_image": "python:3.13.11-alpine3.22@sha256:4ac787b083ff5fa9d64c6f68440088545e1b941142aed716cf9378ee348a9f1b",
+    "python_multiarch_index_digest": "sha256:2fd93799bfc6381d078a8f656a5f45d6092e5d11d16f55889b3d5cbfdc64f045",
+    "cpu_max": "200000 100000",
+    "memory_max": 2147483648
+  },
+  "formal": {
+    "pragmas": {
+      "journal_mode": "wal",
+      "synchronous": 2,
+      "cache_size_pages": -65536,
+      "page_size": 4096,
+      "mmap_size": 0,
+      "temp_store": 1,
+      "wal_autocheckpoint_pages": 0
+    },
+    "observations": 100000,
+    "logical_unique_pairs": 50000,
+    "configured_hashes": 10000,
+    "synthetic_fanout_actors": 10,
+    "synthetic_distinct_hashes_per_fanout_actor": 100,
+    "active_hashes": 8649,
+    "batch_size": 5000,
+    "input_batch_sorted_by_primary_key": true,
+    "transactions": 20,
+    "explicit_passive_every_transactions": 5,
+    "explicit_passive_checkpoint_calls": 4,
+    "explicit_passive_checkpoint_p50_ms": 2.337321999220876,
+    "explicit_passive_checkpoint_p95_ms": 5.825214899778075,
+    "ack_semantics": "synchronous=FULL commit is the durable ACK boundary; an explicit PASSIVE checkpoint runs after that ACK boundary and before this single-thread driver accepts the next batch.",
+    "ingest_seconds": 0.7215785789994698,
+    "observations_per_second": 138585.0452194112,
+    "transaction_p50_ms": 13.870926500203495,
+    "transaction_p95_ms": 30.076905248733972,
+    "transaction_p99_ms": 36.539219449423385,
+    "group_seconds": 0.015605516999130487,
+    "group_hashes_per_second": 554227.0724181652,
+    "torrent_group_query_plan": [
+      "SCAN seen"
+    ],
+    "integrity_check": "ok",
+    "daily_delta_varint_bytes": 17321,
+    "daily_zlib_delta_varint_bytes": 5258,
+    "pre_checkpoint_sizes": {
+      "db": 856064,
+      "wal": 3221872,
+      "shm": 32768
+    },
+    "post_checkpoint_sizes": {
+      "db": 856064,
+      "wal": 0,
+      "shm": 0
+    },
+    "peak_wal_bytes_sampled_per_transaction": 3221872,
+    "peak_total_bytes_sampled_per_transaction": 4110704,
+    "checkpoint_result": [
+      0,
+      0,
+      0
+    ],
+    "checkpoint_seconds": 0.0007704399995418498,
+    "post_checkpoint_db_bytes_per_unique": 17.12128,
+    "database_exceeded_64mib_cache": false,
+    "fanout_filter_audit": {
+      "enabled_in_production_default": false,
+      "measured": true,
+      "configuration_name": "max_distinct_hashes_per_actor",
+      "diagnostic_threshold_not_a_recommendation": 50,
+      "why_default_is_off": "A public IP/IPv6-/64 is a network actor, not a person; CGNAT, VPN and gateways can legitimately have high fanout. Enable only after trace-labelled precision/recall review.",
+      "synthetic_actors_detected": 10,
+      "unique_pairs_removed": 1000,
+      "retained_unique_pairs": 49000,
+      "retained_hashes": 8649,
+      "torrent_actor_pk": {
+        "fanout_detection_seconds": 0.04599530799896456,
+        "fanout_detection_query_plan": [
+          "SCAN seen",
+          "USE TEMP B-TREE FOR GROUP BY"
+        ],
+        "blocked_temp_table_page_bytes_after_detection": 8192,
+        "filtered_group_seconds": 0.02497560800111387,
+        "filtered_group_query_plan": [
+          "SCAN s",
+          "CORRELATED SCALAR SUBQUERY 1",
+          "SEARCH b USING PRIMARY KEY (actor=?)"
+        ],
+        "benefit": "Final GROUP BY torrent_id streams in primary-key order without a group temp B-tree."
+      },
+      "actor_torrent_pk_counterfactual": {
+        "build_seconds_not_ingest_benchmark": 0.09325218300000415,
+        "database_bytes": 876544,
+        "fanout_detection_seconds": 0.014490859000943601,
+        "fanout_detection_query_plan": [
+          "CO-ROUTINE (subquery-1)",
+          "SCAN actor_order.seen",
+          "SCAN (subquery-1)"
+        ],
+        "filtered_group_seconds": 0.03577947299891093,
+        "filtered_group_query_plan": [
+          "SCAN s",
+          "CORRELATED SCALAR SUBQUERY 1",
+          "SEARCH b USING PRIMARY KEY (actor=?)",
+          "USE TEMP B-TREE FOR GROUP BY"
+        ],
+        "retained_unique_pairs": 49000,
+        "retained_hashes": 8649,
+        "cost": "Final GROUP BY torrent_id requires a temp B-tree in this orientation."
+      },
+      "sampled_resource_shape": {
+        "memory_current_before_bytes": 21282816,
+        "memory_current_after_bytes": 23363584,
+        "container_lifetime_memory_peak_bytes": 24494080,
+        "main_plus_counterfactual_database_and_wal_bytes": 4987248,
+        "warning": "memory.peak is container-lifetime, and ephemeral SQLite sorter files may be unlinked."
+      }
+    }
+  },
+  "crash_replay": {
+    "forced_exit_code": 91,
+    "acknowledged_observations": 20000,
+    "recovered_unique_rows": 20000,
+    "rows_after_full_unacked_batch_replay": 25000,
+    "integrity_after_crash": "ok",
+    "passed": true,
+    "guarantee": "FULL commit precedes fsynced batch ack; replay uses INSERT OR IGNORE"
+  },
+  "day_rotation": {
+    "atomic_same_filesystem_rename": true,
+    "previous_day_rows_after_duplicate_and_new_late_event": 10001,
+    "current_day_rows": 5000,
+    "passed": true,
+    "production_rule": "Rename at UTC day boundary, keep the previous file writable for a bounded grace interval, and only then freeze/group/checkpoint/delete actor rows."
+  },
+  "container_lifetime_memory_peak_bytes": 30269440,
+  "limitations": [
+    "Synthetic known-unique workload is not a production capacity or latency forecast.",
+    "The deterministic u^4 hash distribution is long-tailed but not a fitted DHT trace.",
+    "One local Docker run does not cover noisy neighbours, disk exhaustion, bit rot or host loss.",
+    "The crash proof kills an uncommitted writer process, not the Docker daemon or physical host.",
+    "Cross-host replication and backup are outside this single-file daily accumulator screen."
+  ],
+  "finished_at": "2026-07-18T11:43:41.501263+00:00",
+  "result_sha256_without_self": "d5ad09c4ace34c9b1ec467bbbf9d491e76ecbfc848c748a5bc915796f53785d3"
+}

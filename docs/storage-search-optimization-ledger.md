@@ -683,3 +683,153 @@ short process cannot capture production cache residency. It is sufficient to
 accept the structural replacement because all measured resource directions
 are large, consistent across both ABBA repetitions, and backed by a lossless
 rollback test. Rollback is migration `Down`; there is no dual-write mode.
+
+## Iteration S-005: exact daily heat accumulator selection
+
+S-005 was run in parallel with the compact-detail work and answers a narrower
+question: whether Redis should be introduced to deduplicate daily
+`(info_hash, network_actor)` observations. It is a design checkpoint, not a
+production promotion or a capacity forecast. All formal containers were
+limited to 2 CPUs and 2 GiB, which is stricter than the proposed 2C4G storage
+host. Traffic was deterministic, long-tailed and replayable, but synthetic.
+
+### Retention and identity boundary
+
+Long-lived per-IP/node/hash activity is not retained. The hot accumulator keeps
+only one exact row per authority hash and daily network actor: public IPv4 or
+IPv6 /64, ports and DHT node IDs excluded, transformed to a keyed 64-bit daily
+fingerprint. At UTC rollover the previous day remains writable for a bounded
+late-event grace period. It is then grouped by authority hash, mapped to
+searchable catalog IDs in one batch, durably committed as a daily number, and
+the actor identities and daily accumulator are deleted. Therefore 1/7/15/30-day
+heat is derived from sparse per-hash daily counts, not from an IP history.
+
+The default accumulator is one SQLite file per UTC day:
+
+```sql
+CREATE TABLE hashes (
+    id INTEGER PRIMARY KEY,
+    info_hash BLOB NOT NULL UNIQUE
+);
+CREATE TABLE seen (
+    hash_id INTEGER NOT NULL,
+    actor BLOB NOT NULL,
+    PRIMARY KEY (hash_id, actor)
+) WITHOUT ROWID;
+```
+
+Using only the catalog `bigint` would be smaller and faster, but heat commonly
+arrives before metadata/catalog insertion. A PostgreSQL lookup on the event hot
+path would both lose those observations and add database QPS. The local hash
+dictionary preserves pre-metadata heat; finalization performs one catalog
+mapping and discards heat for hashes that remain unsearchable.
+
+The provisional durability profile is `synchronous=FULL`, a 64 MiB cache,
+`mmap_size=0`, `temp_store=FILE`, input batches of 10,000 sorted by the primary
+key, `wal_autocheckpoint=0`, and `TRUNCATE` checkpoint every ten committed
+batches. A FULL commit is the acknowledgement boundary; replay uses
+`INSERT OR IGNORE`. Checkpointing happens after acknowledgement but currently
+blocks the single writer before it accepts the next batch. UTC rotation uses an
+atomic same-filesystem rename and retains the previous file through the grace
+window. These values must be retuned on the actual storage disk.
+
+### Redis Set, HLL and Bloom screen
+
+Redis used the pinned linux/amd64 Redis 8.8.0 Alpine manifest
+`cd5f3ac681c77791c6a8eaa62de876ad2be043ee5a428afb7c0095aa08246277`,
+AOF `everysec`, no eviction and no automatic rewrite. The formal stream had
+400,000 observations, 209,735 exact pairs, 17,919 active hashes and 47.57%
+duplicates.
+
+| Candidate | Observations/s | Error | Redis used memory | AOF before rewrite |
+|---|---:|---:|---:|---:|
+| 64 sharded exact Sets + count Hash | 36,956 | exact | 11.94 MB | 28.72 MB |
+| one HLL per hash | 43,054 | 231 under / 305 over | 4.22 MB | 10.43 MB |
+| global Bloom 0.1% + count Hash + 1% oracle | 29,123 | 31 under / 0 over | 2.84 MB | 39.23 MB |
+
+The Bloom arm proves the expected conservative error direction, but its small
+state hides approximately 98 bytes of AOF per observation in this run. HLL is
+rejected because per-hash errors occur in both directions and one HLL per
+long-tail hash adds key overhead. Scalable Bloom is also rejected as the
+default: its filter count and cumulative error expand. A deliberately tiny
+NONSCALING capacity failed closed at the first over-capacity insertion; an
+expansion-2 control accepted all 3,000 attempts using two filters.
+
+Redis is therefore not introduced for daily-only heat. If the product later
+requires queryable same-day live heat, the admissible optional profile is a
+NONSCALING Bloom with 0.001 target error and capacity based on measured p99
+daily unique pairs plus headroom, an exact overflow Set/alert on capacity
+failure, a deterministic 1% exact oracle, atomic `BF.ADD` plus conditional
+counter increment in one Redis Function, `WAITAOF` every 10,000 observations,
+and no eviction. The atomic replay proof returned add=1, replay=0, count=1.
+Waiting every 100 observations is specifically rejected: the probe caught a
+hundreds-of-milliseconds fsync-phase tail, while 1,000/5,000-observation waits
+were around 1--1.5 ms in the short local screen.
+
+### SQLite and append-log counterfactuals
+
+The pinned SQLite runtime was Python 3.13.11/SQLite 3.49.2 in linux/amd64 image
+manifest `4ac787b083ff5fa9d64c6f68440088545e1b941142aed716cf9378ee348a9f1b`.
+An 8M-observation/4M-unique lower-bound `bigint+actor` run exceeded the 64 MiB
+cache, stored 18.04 bytes per unique pair and grouped 476,887 hashes at about
+857k hashes/s. Its automatic 1,000-page checkpoints produced 274 ms p95 commit
+latency, so that setting is rejected. The selected 1M-observation WAL screen
+with sorted 10k batches and manual `TRUNCATE` every ten transactions processed
+100,037 observations/s, with 84.4 ms p95 FULL-commit latency and an 81.0 MB
+sampled DB+WAL+SHM peak.
+
+The authority-key screen used 2M observations/1M unique pairs:
+
+| Key shape | Observations/s | Final bytes/pair | Sampled DB+WAL+SHM peak |
+|---|---:|---:|---:|
+| catalog id8 + actor8 | 138,679 | 17.94 | 160.55 MB |
+| raw hash20 + actor8 | 92,624 | 38.00 | 266.36 MB |
+| local hash dictionary + id8/actor8 pair | 62,678 | 29.01 | 188.48 MB |
+
+The dictionary reduced final bytes 23.7% and peak disk 29.2% versus repeated
+hash20, and grouped 33% faster, but its reference Python mapping made ingest
+32.3% slower. It is retained for correctness and storage; a bounded in-process
+hash-to-local-ID cache is the next optimization if real trace throughput needs
+it. The pair primary key remains `(hash_id, actor)`: it streams final GROUP BY
+without a temporary B-tree. An `(actor, hash_id)` orientation made synthetic
+high-fanout detection faster but forced a temporary GROUP BY and is rejected.
+Arbitrary high-fanout actors are not filtered by default because CGNAT/VPN
+addresses can be legitimate; only known crawler addresses are always excluded.
+
+The exact append-log counterfactual stored independent CRC-framed zlib-1 blocks
+of fixed `hash20+actor8` records. At 8M observations it appended 231,908/s and
+external-deduplicated 442,735 input records/s, but consumed 172.65 MB of log,
+220.56 MB of sort runs, 402.97 MB sampled peak disk and 511.07 MB container
+memory peak. It recovered a torn tail and replayed both an unacknowledged batch
+and a response-lost duplicate exactly. This remains a throughput fallback only:
+disk scales with observations rather than unique pairs, no within-day count is
+queryable, and rollover/external merge add custom failure modes.
+
+### Gates, rollback and reproduction
+
+The SQLite choice remains provisional until repeated randomized runs on the
+storage host pass with a privacy-safe real DHT trace, real disk fsync and
+checkpoint tails, host-level crash/restart, late-day clock-skew/rollover,
+filesystem permissions/encryption, grace-window finalization, the PostgreSQL
+catalog mapping/commit, and Meilisearch refresh. If SQLite cannot keep up,
+activate the framed append-log fallback; if same-day live heat becomes a hard
+requirement, activate the bounded Redis profile behind a feature flag. Neither
+fallback changes the persisted daily heat contract. Rollback deletes the
+ephemeral accumulator only after the prior durable daily aggregate is verified;
+replayable source batches remain the recovery authority during the grace window.
+
+Two invalid pilots are retained as negative evidence: the first Redis pilot
+misparsed capability metadata, and a later pilot reserved Bloom capacity by
+observations rather than expected unique pairs, leaving the filter half empty
+and making its false-positive result unusable. Absolute local throughput and
+RSS are not extrapolated to the storage host. AOF rewrite disk polling can miss
+the simultaneous old/new-file peak and is explicitly not an upper bound.
+
+Reproduction and unit checks are in `scripts/benchmark/redis_heat_s005.py`,
+`sqlite_heat_s005.py`, `sqlite_heat_keyshape_s005.py` and
+`append_log_heat_s005.py`, with JSON evidence under
+`scripts/benchmark/testdata/storage_heat_s005_*`. Harness SHA-256 values are,
+respectively, `06c6027193966648b3b49df2bf1faca879821803c1eb498b063ed233fcff4840`,
+`13dc4a83e6afa3dbb49daf3d06bb4d274e5e993438c62e790dce617da22d5baa`,
+`3a5b2dbd60e14d6e89b83a783c8a14c2d65b0d89b75457f81277766dfd348ba7`,
+and `15890658ecc1e7f6f3e16998a5774023f0c07c369a4ef121c7db6f2f454af91d`.

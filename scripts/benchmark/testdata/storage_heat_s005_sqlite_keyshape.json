@@ -1,0 +1,114 @@
+{
+  "schema": "cherry.sqlite-heat-keyshape-s005.v1",
+  "started_at": "2026-07-18T11:58:37.092700+00:00",
+  "runtime": {
+    "python": "3.13.11 (main, Jan 28 2026, 03:37:05) [GCC 14.2.0]",
+    "sqlite": "3.49.2",
+    "python_image": "python:3.13.11-alpine3.22@sha256:4ac787b083ff5fa9d64c6f68440088545e1b941142aed716cf9378ee348a9f1b",
+    "cpu_max": "200000 100000",
+    "memory_max": 2147483648
+  },
+  "arms": [
+    {
+      "key_shape": "id8",
+      "observations": 2000000,
+      "logical_unique_pairs": 1000000,
+      "active_hashes": 175009,
+      "batch_size": 10000,
+      "wal_autocheckpoint_pages": 0,
+      "truncate_checkpoint_every_transactions": 10,
+      "ingest_seconds": 14.421775557999354,
+      "observations_per_second": 138679.1794087141,
+      "ack_p50_ms": 33.70445650034526,
+      "ack_p95_ms": 81.70234545041237,
+      "ack_p99_ms": 89.08174350925034,
+      "checkpoint_p50_ms": 5.3161790001468034,
+      "checkpoint_p95_ms": 54.76496239998598,
+      "group_seconds": 0.21977527500166616,
+      "group_hashes_per_second": 796308.8659480609,
+      "group_query_plan": [
+        "SCAN seen"
+      ],
+      "peak_wal_bytes": 144105272,
+      "peak_db_wal_shm_bytes": 160546616,
+      "final_sizes": {
+        "db": 17936384,
+        "wal": 0,
+        "shm": 0
+      },
+      "final_db_bytes_per_unique": 17.936384,
+      "integrity_check": "ok",
+      "dictionary_hashes": null
+    },
+    {
+      "key_shape": "hash20",
+      "observations": 2000000,
+      "logical_unique_pairs": 1000000,
+      "active_hashes": 175009,
+      "batch_size": 10000,
+      "wal_autocheckpoint_pages": 0,
+      "truncate_checkpoint_every_transactions": 10,
+      "ingest_seconds": 21.592673502000252,
+      "observations_per_second": 92624.00970471436,
+      "ack_p50_ms": 49.069290500483476,
+      "ack_p95_ms": 132.83472704979422,
+      "ack_p99_ms": 152.78598711109217,
+      "checkpoint_p50_ms": 7.577944500553713,
+      "checkpoint_p95_ms": 150.14673665000373,
+      "group_seconds": 0.26534773599996697,
+      "group_hashes_per_second": 659545.8572144056,
+      "group_query_plan": [
+        "SCAN seen"
+      ],
+      "peak_wal_bytes": 231642912,
+      "peak_db_wal_shm_bytes": 266356512,
+      "final_sizes": {
+        "db": 38002688,
+        "wal": 0,
+        "shm": 0
+      },
+      "final_db_bytes_per_unique": 38.002688,
+      "integrity_check": "ok",
+      "dictionary_hashes": null
+    },
+    {
+      "key_shape": "local_dictionary",
+      "observations": 2000000,
+      "logical_unique_pairs": 1000000,
+      "active_hashes": 175009,
+      "batch_size": 10000,
+      "wal_autocheckpoint_pages": 0,
+      "truncate_checkpoint_every_transactions": 10,
+      "ingest_seconds": 31.9091844450013,
+      "observations_per_second": 62677.87894884001,
+      "ack_p50_ms": 101.28181499931088,
+      "ack_p95_ms": 201.75108090043065,
+      "ack_p99_ms": 257.16083148063257,
+      "checkpoint_p50_ms": 9.704603499812947,
+      "checkpoint_p95_ms": 96.24190489912507,
+      "group_seconds": 0.19935380599963537,
+      "group_hashes_per_second": 877881.4084960088,
+      "group_query_plan": [
+        "CO-ROUTINE grouped",
+        "SCAN seen",
+        "SCAN grouped",
+        "SEARCH h USING INTEGER PRIMARY KEY (rowid=?)"
+      ],
+      "peak_wal_bytes": 161289792,
+      "peak_db_wal_shm_bytes": 188479040,
+      "final_sizes": {
+        "db": 29007872,
+        "wal": 0,
+        "shm": 0
+      },
+      "final_db_bytes_per_unique": 29.007872,
+      "integrity_check": "ok",
+      "dictionary_hashes": 175009
+    }
+  ],
+  "correctness_tradeoff": "hash20 accepts heat before catalog insertion and removes per-event PG hash-to-ID lookups; day-end grouping performs one batched mapping and only searchable hashes are retained.",
+  "limitation": "Synthetic short screen; SHA-1 values are derived for key width/distribution only, and absolute throughput is not a production capacity forecast.",
+  "container_lifetime_memory_peak_bytes": 372637696,
+  "finished_at": "2026-07-18T11:59:47.322632+00:00",
+  "result_sha256_without_self": "e8afb974f8b1565fc63463577cc04073c7777d3d0ba1400e3d94aa9a41400a1f"
+}

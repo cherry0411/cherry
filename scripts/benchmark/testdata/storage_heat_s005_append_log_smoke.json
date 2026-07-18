@@ -1,0 +1,175 @@
+{
+  "schema": "cherry.append-log-heat-s005.v1",
+  "started_at": "2026-07-18T11:55:29.728647+00:00",
+  "runtime": {
+    "python": "3.13.11 (main, Jan 28 2026, 03:37:05) [GCC 14.2.0]",
+    "python_image": "python:3.13.11-alpine3.22@sha256:4ac787b083ff5fa9d64c6f68440088545e1b941142aed716cf9378ee348a9f1b",
+    "cpu_max": "200000 100000",
+    "memory_max": 2147483648
+  },
+  "record": {
+    "bytes": 28,
+    "shape": "authority info_hash BLOB20 + daily actor fingerprint BLOB8",
+    "frame_header": "magic/version/count/raw_size/compressed_size/CRC32",
+    "compression": "independent zlib level-1 frames"
+  },
+  "formal": {
+    "label": "formal",
+    "append": {
+      "observations": 100000,
+      "logical_unique_pairs": 50000,
+      "frame_records": 10000,
+      "frames": 10,
+      "append_seconds": 0.3406859810002061,
+      "observations_per_second": 293525.4327354888,
+      "fsync_p50_ms": 2.1013129999118974,
+      "fsync_p95_ms": 4.361058750055235,
+      "fsync_p99_ms": 4.535127750768879,
+      "raw_record_bytes": 2800000,
+      "framed_compressed_log_bytes": 1579597,
+      "compressed_bytes_per_observation": 15.79597
+    },
+    "dedup": {
+      "sort_chunk_records": 20000,
+      "sort_runs": 5,
+      "sort_run_bytes": 2526384,
+      "external_dedup_seconds": 0.1816010450002068,
+      "input_records": 100000,
+      "observations_per_second": 550657.6242437708,
+      "logical_unique_pairs": 50000,
+      "active_hashes": 8649,
+      "error": 0,
+      "daily_hash20_varint_bytes": 181652,
+      "daily_hash20_varint_zlib_bytes": 181309,
+      "sampled_peak_disk_bytes": 4287290,
+      "container_lifetime_memory_peak_bytes": 21819392
+    }
+  },
+  "crash_and_replay": {
+    "acknowledged_records_before_torn_tail": 30000,
+    "torn_tail_bytes_removed": true,
+    "size_after_recovery_equals_last_acknowledged_boundary": true,
+    "unacknowledged_batch_replayed": true,
+    "response_lost_batch_replayed_twice": true,
+    "unique_after_both_replays": 40000,
+    "error": 0,
+    "passed": true
+  },
+  "day_rotation": {
+    "same_filesystem_atomic_rename": true,
+    "previous_file_remained_writable_during_grace": true,
+    "late_duplicate_ignored": true,
+    "late_new_pair_counted": true,
+    "previous_day_unique_pairs": 10001,
+    "passed": true,
+    "production_rule": "Rename at UTC midnight; finalize only after a bounded late-event grace interval."
+  },
+  "limitations": [
+    "Synthetic deterministic workload and Python implementation are not a production capacity forecast.",
+    "CRC32 detects torn/corrupt frames but is not cryptographic authentication; production frames need versioned checksums and host-level backup.",
+    "The crash probe fsyncs a partial tail then reopens; it does not physically power-cycle the host.",
+    "External merge uses bounded record chunks, but Python object overhead differs from a Go fixed-width implementation.",
+    "No within-day queryable counter exists; this candidate is valid only when daily heat convergence is acceptable."
+  ],
+  "repeat_rate_screens": [
+    {
+      "label": "repeat90",
+      "append": {
+        "observations": 500000,
+        "logical_unique_pairs": 50000,
+        "frame_records": 10000,
+        "frames": 50,
+        "append_seconds": 2.034477383000194,
+        "observations_per_second": 245763.36123366593,
+        "fsync_p50_ms": 2.1325144998627366,
+        "fsync_p95_ms": 9.483934149557165,
+        "fsync_p99_ms": 24.268454439534224,
+        "raw_record_bytes": 14000000,
+        "framed_compressed_log_bytes": 9526741,
+        "compressed_bytes_per_observation": 19.053482
+      },
+      "dedup": {
+        "sort_chunk_records": 100000,
+        "sort_runs": 5,
+        "sort_run_bytes": 6237476,
+        "external_dedup_seconds": 0.7247384910006076,
+        "input_records": 500000,
+        "observations_per_second": 689904.0222214177,
+        "logical_unique_pairs": 50000,
+        "active_hashes": 20889,
+        "error": 0,
+        "daily_hash20_varint_bytes": 438681,
+        "daily_hash20_varint_zlib_bytes": 434064,
+        "sampled_peak_disk_bytes": 16198281,
+        "container_lifetime_memory_peak_bytes": 49549312
+      }
+    },
+    {
+      "label": "repeat50",
+      "append": {
+        "observations": 500000,
+        "logical_unique_pairs": 250000,
+        "frame_records": 10000,
+        "frames": 50,
+        "append_seconds": 1.8554884209988813,
+        "observations_per_second": 269470.82737968833,
+        "fsync_p50_ms": 2.122011499523069,
+        "fsync_p95_ms": 10.810588750427996,
+        "fsync_p99_ms": 15.282263139506536,
+        "raw_record_bytes": 14000000,
+        "framed_compressed_log_bytes": 9667779,
+        "compressed_bytes_per_observation": 19.335558
+      },
+      "dedup": {
+        "sort_chunk_records": 100000,
+        "sort_runs": 5,
+        "sort_run_bytes": 12636232,
+        "external_dedup_seconds": 0.8383008599994355,
+        "input_records": 500000,
+        "observations_per_second": 596444.5748037724,
+        "logical_unique_pairs": 250000,
+        "active_hashes": 43845,
+        "error": 0,
+        "daily_hash20_varint_bytes": 920852,
+        "daily_hash20_varint_zlib_bytes": 913941,
+        "sampled_peak_disk_bytes": 23217952,
+        "container_lifetime_memory_peak_bytes": 67338240
+      }
+    },
+    {
+      "label": "repeat10",
+      "append": {
+        "observations": 500000,
+        "logical_unique_pairs": 450000,
+        "frame_records": 10000,
+        "frames": 50,
+        "append_seconds": 1.7716083119994437,
+        "observations_per_second": 282229.42769764847,
+        "fsync_p50_ms": 2.0479075001276215,
+        "fsync_p95_ms": 14.992857350352967,
+        "fsync_p99_ms": 28.693572080392165,
+        "raw_record_bytes": 14000000,
+        "framed_compressed_log_bytes": 9423189,
+        "compressed_bytes_per_observation": 18.846378
+      },
+      "dedup": {
+        "sort_chunk_records": 100000,
+        "sort_runs": 5,
+        "sort_run_bytes": 13780060,
+        "external_dedup_seconds": 0.9943029590012884,
+        "input_records": 500000,
+        "observations_per_second": 502864.841619517,
+        "logical_unique_pairs": 450000,
+        "active_hashes": 48354,
+        "error": 0,
+        "daily_hash20_varint_bytes": 1015667,
+        "daily_hash20_varint_zlib_bytes": 1009497,
+        "sampled_peak_disk_bytes": 24212746,
+        "container_lifetime_memory_peak_bytes": 78749696
+      }
+    }
+  ],
+  "container_lifetime_memory_peak_bytes": 78749696,
+  "finished_at": "2026-07-18T11:55:39.092735+00:00",
+  "result_sha256_without_self": "d4c1ac0681eed6e608e72d940fcb1ab9a9cd46e2f07b86ffc58eea31532ecbc3"
+}

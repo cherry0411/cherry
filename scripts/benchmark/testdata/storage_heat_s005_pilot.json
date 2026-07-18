@@ -1,0 +1,465 @@
+{
+  "schema": "cherry.redis-heat-s005.v1",
+  "started_at": "2026-07-18T11:17:15.560671+00:00",
+  "host": {
+    "platform": "win32",
+    "python": "3.11.5 | packaged by Anaconda, Inc. | (main, Sep 11 2023, 13:26:23) [MSC v.1916 64 bit (AMD64)]",
+    "redis_py": "4.6.0",
+    "logical_cpus": 12
+  },
+  "redis_image": {
+    "reference": "redis:8.8.0-alpine@sha256:cd5f3ac681c77791c6a8eaa62de876ad2be043ee5a428afb7c0095aa08246277",
+    "multiarch_index_digest": "sha256:9d317178eceac8454a2284a9e6df2466b93c745529947f0cd42a0fa9609d7005",
+    "linux_amd64_manifest_digest": "sha256:cd5f3ac681c77791c6a8eaa62de876ad2be043ee5a428afb7c0095aa08246277"
+  },
+  "resource_limit": {
+    "cpus": "2",
+    "memory": "2g"
+  },
+  "workload": {
+    "seed": 20260718,
+    "events": 20000,
+    "configured_hashes": 1000,
+    "active_hashes": 974,
+    "configured_actors": 5000,
+    "logical_unique_pairs": 11548,
+    "duplicate_fraction": 0.4226,
+    "oracle_active_hashes": 6,
+    "oracle_unique_pairs": 88,
+    "oracle_unique_fraction": 0.007620367163145133,
+    "unique_per_active_hash_p50": 4.0,
+    "unique_per_active_hash_p95": 41.0,
+    "unique_per_active_hash_p99": 111.61999999999989,
+    "max_unique_per_hash": 1064,
+    "event_stream_sha256": "32b50fa3e2e067aa243953a04c158cb66885371dabeb0fbbdcc599befcd21d2d"
+  },
+  "arms": [
+    {
+      "arm": "exact",
+      "capabilities": {
+        "redis_version": "8.8.0",
+        "commands": {
+          "BF.ADD": true,
+          "FUNCTION": true,
+          "FCALL": true,
+          "WAITAOF": true,
+          "PFADD": true,
+          "HSCAN": true
+        },
+        "modules": [],
+        "function_atomicity_reference": "https://redis.io/docs/latest/develop/programmability/functions-intro/",
+        "waitaof_reference": "https://redis.io/docs/latest/commands/waitaof/",
+        "bloom_reference": "https://redis.io/docs/latest/develop/data-types/probabilistic/bloom-filter/"
+      },
+      "resource_audit": {
+        "nano_cpus": 2000000000,
+        "memory_limit_bytes": 2147483648,
+        "image": "redis:8.8.0-alpine@sha256:cd5f3ac681c77791c6a8eaa62de876ad2be043ee5a428afb7c0095aa08246277",
+        "docker_image_id": "sha256:55563f45704d59e891b6aa643014bb6b562abf21909a44b3b297502415b68e29"
+      },
+      "function_atomicity_proof": {
+        "first_add": 1,
+        "replay_add": 0,
+        "counter": 1,
+        "passed": true
+      },
+      "before_used_memory_bytes": 1613144,
+      "ingest": {
+        "events": 20000,
+        "seconds": 1.1044597001746297,
+        "events_per_second": 18108.401779474378,
+        "pipeline_batch_size": 500,
+        "pipeline_roundtrip_p50_ms": 10.715399868786335,
+        "pipeline_roundtrip_p95_ms": 17.073954734951258,
+        "pipeline_roundtrip_p99_ms": 18.532197065651417,
+        "pipeline_amortized_p95_us_per_event": 34.147909469902515,
+        "waitaof_every_events": 10000,
+        "waitaof_calls": 2,
+        "waitaof_p50_ms": 284.5748499967158,
+        "waitaof_p95_ms": 534.5262246672064,
+        "waitaof_p99_ms": 556.7441246379167
+      },
+      "error": {
+        "logical_unique": 11548,
+        "estimated_unique": 11548,
+        "net_error": 0,
+        "undercount": 0,
+        "overcount": 0,
+        "undercount_fraction": 0.0,
+        "overcount_fraction": 0.0,
+        "hashes_exact": 974,
+        "hashes_undercounted": 0,
+        "hashes_overcounted": 0,
+        "max_abs_hash_error": 0
+      },
+      "oracle_error": {
+        "logical_unique": 88,
+        "estimated_unique": 88,
+        "net_error": 0,
+        "undercount": 0,
+        "overcount": 0,
+        "undercount_fraction": 0.0,
+        "overcount_fraction": 0.0,
+        "hashes_exact": 6,
+        "hashes_undercounted": 0,
+        "hashes_overcounted": 0,
+        "max_abs_hash_error": 0
+      },
+      "freeze": {
+        "method": "HSCAN heat:counts",
+        "active_hashes": 974,
+        "redis_read_seconds": 0.005470100324600935,
+        "hashes_per_second": 178058.89146485756,
+        "delta_varint_bytes": 1957,
+        "zlib_delta_varint_bytes": 782,
+        "encode_seconds": 0.0034317998215556145,
+        "encode_hashes_per_second": 283816.0879554133
+      },
+      "memory": {
+        "redis_used_memory_bytes": 2242480,
+        "redis_used_memory_rss_bytes": 23670784,
+        "redis_used_memory_dataset_bytes": 808584,
+        "allocator_frag_ratio": 1.12,
+        "primary_keys": 64,
+        "primary_memory_usage_bytes": 572235,
+        "counter_hash_memory_usage_bytes": 41524,
+        "oracle_keys": 3,
+        "oracle_memory_usage_bytes": 1701,
+        "aof_current_size_bytes": 1573982,
+        "aof_base_size_bytes": 0,
+        "aof_disk_bytes": 1578268,
+        "docker_memory_usage": "6.988MiB / 2GiB",
+        "bloom_info": null
+      }
+    },
+    {
+      "arm": "hll",
+      "capabilities": {
+        "redis_version": "8.8.0",
+        "commands": {
+          "BF.ADD": true,
+          "FUNCTION": true,
+          "FCALL": true,
+          "WAITAOF": true,
+          "PFADD": true,
+          "HSCAN": true
+        },
+        "modules": [],
+        "function_atomicity_reference": "https://redis.io/docs/latest/develop/programmability/functions-intro/",
+        "waitaof_reference": "https://redis.io/docs/latest/commands/waitaof/",
+        "bloom_reference": "https://redis.io/docs/latest/develop/data-types/probabilistic/bloom-filter/"
+      },
+      "resource_audit": {
+        "nano_cpus": 2000000000,
+        "memory_limit_bytes": 2147483648,
+        "image": "redis:8.8.0-alpine@sha256:cd5f3ac681c77791c6a8eaa62de876ad2be043ee5a428afb7c0095aa08246277",
+        "docker_image_id": "sha256:55563f45704d59e891b6aa643014bb6b562abf21909a44b3b297502415b68e29"
+      },
+      "function_atomicity_proof": {
+        "first_add": 1,
+        "replay_add": 0,
+        "counter": 1,
+        "passed": true
+      },
+      "before_used_memory_bytes": 1613144,
+      "ingest": {
+        "events": 20000,
+        "seconds": 0.39443380013108253,
+        "events_per_second": 50705.59367212795,
+        "pipeline_batch_size": 500,
+        "pipeline_roundtrip_p50_ms": 7.6540999580174685,
+        "pipeline_roundtrip_p95_ms": 10.730140190571545,
+        "pipeline_roundtrip_p99_ms": 11.47236998192966,
+        "pipeline_amortized_p95_us_per_event": 21.46028038114309,
+        "waitaof_every_events": 10000,
+        "waitaof_calls": 2,
+        "waitaof_p50_ms": 1.2221001088619232,
+        "waitaof_p95_ms": 1.427659997716546,
+        "waitaof_p99_ms": 1.445931987836957
+      },
+      "error": {
+        "logical_unique": 11548,
+        "estimated_unique": 11542,
+        "net_error": -6,
+        "undercount": 11,
+        "overcount": 5,
+        "undercount_fraction": 0.0009525458953931416,
+        "overcount_fraction": 0.0004329754069968826,
+        "hashes_exact": 964,
+        "hashes_undercounted": 6,
+        "hashes_overcounted": 4,
+        "max_abs_hash_error": 5
+      },
+      "oracle_error": {
+        "logical_unique": 88,
+        "estimated_unique": 88,
+        "net_error": 0,
+        "undercount": 0,
+        "overcount": 0,
+        "undercount_fraction": 0.0,
+        "overcount_fraction": 0.0,
+        "hashes_exact": 6,
+        "hashes_undercounted": 0,
+        "hashes_overcounted": 0,
+        "max_abs_hash_error": 0
+      },
+      "freeze": {
+        "method": "SCAN heat:hll:* + pipelined PFCOUNT",
+        "active_hashes": 974,
+        "redis_read_seconds": 0.018139000050723553,
+        "hashes_per_second": 53696.45500172694,
+        "delta_varint_bytes": 1957,
+        "zlib_delta_varint_bytes": 783,
+        "encode_seconds": 0.0008096997626125813,
+        "encode_hashes_per_second": 1202915.0124205134
+      },
+      "memory": {
+        "redis_used_memory_bytes": 1911496,
+        "redis_used_memory_rss_bytes": 23158784,
+        "redis_used_memory_dataset_bytes": 437504,
+        "allocator_frag_ratio": 1.1,
+        "primary_keys": 974,
+        "primary_memory_usage_bytes": 107760,
+        "counter_hash_memory_usage_bytes": 0,
+        "oracle_keys": 3,
+        "oracle_memory_usage_bytes": 1701,
+        "aof_current_size_bytes": 583244,
+        "aof_base_size_bytes": 0,
+        "aof_disk_bytes": 587530,
+        "docker_memory_usage": "6.195MiB / 2GiB",
+        "bloom_info": null
+      }
+    },
+    {
+      "arm": "bloom",
+      "capabilities": {
+        "redis_version": "8.8.0",
+        "commands": {
+          "BF.ADD": true,
+          "FUNCTION": true,
+          "FCALL": true,
+          "WAITAOF": true,
+          "PFADD": true,
+          "HSCAN": true
+        },
+        "modules": [],
+        "function_atomicity_reference": "https://redis.io/docs/latest/develop/programmability/functions-intro/",
+        "waitaof_reference": "https://redis.io/docs/latest/commands/waitaof/",
+        "bloom_reference": "https://redis.io/docs/latest/develop/data-types/probabilistic/bloom-filter/"
+      },
+      "resource_audit": {
+        "nano_cpus": 2000000000,
+        "memory_limit_bytes": 2147483648,
+        "image": "redis:8.8.0-alpine@sha256:cd5f3ac681c77791c6a8eaa62de876ad2be043ee5a428afb7c0095aa08246277",
+        "docker_image_id": "sha256:55563f45704d59e891b6aa643014bb6b562abf21909a44b3b297502415b68e29"
+      },
+      "function_atomicity_proof": {
+        "first_add": 1,
+        "replay_add": 0,
+        "counter": 1,
+        "passed": true
+      },
+      "before_used_memory_bytes": 1669608,
+      "ingest": {
+        "events": 20000,
+        "seconds": 0.41933679999783635,
+        "events_per_second": 47694.359283762344,
+        "pipeline_batch_size": 500,
+        "pipeline_roundtrip_p50_ms": 9.167100070044398,
+        "pipeline_roundtrip_p95_ms": 11.599439987912772,
+        "pipeline_roundtrip_p99_ms": 12.565444014035165,
+        "pipeline_amortized_p95_us_per_event": 23.198879975825545,
+        "waitaof_every_events": 10000,
+        "waitaof_calls": 2,
+        "waitaof_p50_ms": 0.903350068256259,
+        "waitaof_p95_ms": 0.9374151704832911,
+        "waitaof_p99_ms": 0.9404431795701385
+      },
+      "error": {
+        "logical_unique": 11548,
+        "estimated_unique": 11548,
+        "net_error": 0,
+        "undercount": 0,
+        "overcount": 0,
+        "undercount_fraction": 0.0,
+        "overcount_fraction": 0.0,
+        "hashes_exact": 974,
+        "hashes_undercounted": 0,
+        "hashes_overcounted": 0,
+        "max_abs_hash_error": 0
+      },
+      "oracle_error": {
+        "logical_unique": 88,
+        "estimated_unique": 88,
+        "net_error": 0,
+        "undercount": 0,
+        "overcount": 0,
+        "undercount_fraction": 0.0,
+        "overcount_fraction": 0.0,
+        "hashes_exact": 6,
+        "hashes_undercounted": 0,
+        "hashes_overcounted": 0,
+        "max_abs_hash_error": 0
+      },
+      "freeze": {
+        "method": "HSCAN heat:counts",
+        "active_hashes": 974,
+        "redis_read_seconds": 0.004350000061094761,
+        "hashes_per_second": 223908.04283227393,
+        "delta_varint_bytes": 1957,
+        "zlib_delta_varint_bytes": 782,
+        "encode_seconds": 0.0006903000175952911,
+        "encode_hashes_per_second": 1410980.697049665
+      },
+      "memory": {
+        "redis_used_memory_bytes": 1833248,
+        "redis_used_memory_rss_bytes": 23396352,
+        "redis_used_memory_dataset_bytes": 400792,
+        "allocator_frag_ratio": 1.11,
+        "primary_keys": 1,
+        "primary_memory_usage_bytes": 36072,
+        "counter_hash_memory_usage_bytes": 41524,
+        "oracle_keys": 3,
+        "oracle_memory_usage_bytes": 1701,
+        "aof_current_size_bytes": 2039835,
+        "aof_base_size_bytes": 0,
+        "aof_disk_bytes": 2044121,
+        "docker_memory_usage": "6.699MiB / 2GiB",
+        "bloom_info": {
+          "Capacity": 20000,
+          "Size": 36040,
+          "Number of filters": 1,
+          "Number of items inserted": 11548,
+          "Expansion rate": null
+        }
+      }
+    }
+  ],
+  "limitations": [
+    "Synthetic deterministic long-tail traffic is not a production capacity forecast.",
+    "The benchmark truth uses full in-process exact sets; production retains only the 1% oracle.",
+    "Single-node AOF tests do not measure replica acknowledgement, failover, network RTT, or noisy-neighbour effects.",
+    "End-state RSS is not a sampled peak RSS or long-running allocator-fragmentation measurement.",
+    "A single UTC day is screened; expiry, late events, crash/replay recovery and 30-day PG rollups need integration tests."
+  ],
+  "waitaof_probe": {
+    "capabilities": {
+      "redis_version": "8.8.0",
+      "commands": {
+        "BF.ADD": true,
+        "FUNCTION": true,
+        "FCALL": true,
+        "WAITAOF": true,
+        "PFADD": true,
+        "HSCAN": true
+      },
+      "modules": [],
+      "function_atomicity_reference": "https://redis.io/docs/latest/develop/programmability/functions-intro/",
+      "waitaof_reference": "https://redis.io/docs/latest/commands/waitaof/",
+      "bloom_reference": "https://redis.io/docs/latest/develop/data-types/probabilistic/bloom-filter/"
+    },
+    "function_atomicity_proof": {
+      "first_add": 1,
+      "replay_add": 0,
+      "counter": 1,
+      "passed": true
+    },
+    "rows": [
+      {
+        "repeat": 0,
+        "batch_size": 100,
+        "pipeline_ms": 16.6639001108706,
+        "waitaof_ms": 1131.795400287956,
+        "total_ms": 1148.4593003988266,
+        "events_per_second_including_wait": 87.07317705144004
+      },
+      {
+        "repeat": 0,
+        "batch_size": 1000,
+        "pipeline_ms": 23.5509998165071,
+        "waitaof_ms": 0.862200278788805,
+        "total_ms": 24.413200095295906,
+        "events_per_second_including_wait": 40961.446926111355
+      },
+      {
+        "repeat": 0,
+        "batch_size": 5000,
+        "pipeline_ms": 78.7501996383071,
+        "waitaof_ms": 1.145899761468172,
+        "total_ms": 79.89609939977527,
+        "events_per_second_including_wait": 62581.277904213486
+      },
+      {
+        "repeat": 1,
+        "batch_size": 1000,
+        "pipeline_ms": 18.70909985154867,
+        "waitaof_ms": 0.803499948233366,
+        "total_ms": 19.512599799782038,
+        "events_per_second_including_wait": 51248.93711042904
+      },
+      {
+        "repeat": 1,
+        "batch_size": 5000,
+        "pipeline_ms": 79.66729998588562,
+        "waitaof_ms": 0.9675002656877041,
+        "total_ms": 80.63480025157332,
+        "events_per_second_including_wait": 62007.96659011307
+      },
+      {
+        "repeat": 1,
+        "batch_size": 100,
+        "pipeline_ms": 3.926000092178583,
+        "waitaof_ms": 0.8045998401939869,
+        "total_ms": 4.73059993237257,
+        "events_per_second_including_wait": 21138.967875020942
+      }
+    ],
+    "summary": {
+      "100": {
+        "samples": 2,
+        "waitaof_p50_ms": 566.300000064075,
+        "waitaof_p95_ms": 1075.245860265568,
+        "total_p50_ms": 576.5949501655996,
+        "throughput_median_events_per_second": 10613.02052603619
+      },
+      "1000": {
+        "samples": 2,
+        "waitaof_p50_ms": 0.8328501135110855,
+        "waitaof_p95_ms": 0.8592652622610331,
+        "total_p50_ms": 21.962899947538972,
+        "throughput_median_events_per_second": 46105.1920182702
+      },
+      "5000": {
+        "samples": 2,
+        "waitaof_p50_ms": 1.056700013577938,
+        "waitaof_p95_ms": 1.1369797866791487,
+        "total_p50_ms": 80.2654498256743,
+        "throughput_median_events_per_second": 62294.62224716328
+      }
+    },
+    "memory": {
+      "redis_used_memory_bytes": 1900048,
+      "redis_used_memory_rss_bytes": 23154688,
+      "redis_used_memory_dataset_bytes": 470226,
+      "allocator_frag_ratio": 1.11,
+      "primary_keys": 1,
+      "primary_memory_usage_bytes": 22240,
+      "counter_hash_memory_usage_bytes": 311186,
+      "oracle_keys": 0,
+      "oracle_memory_usage_bytes": 0,
+      "aof_current_size_bytes": 1670714,
+      "aof_base_size_bytes": 0,
+      "aof_disk_bytes": 1675000,
+      "docker_memory_usage": "6.281MiB / 2GiB",
+      "bloom_info": {
+        "Capacity": 12300,
+        "Size": 22208,
+        "Number of filters": 1,
+        "Number of items inserted": 12198,
+        "Expansion rate": null
+      }
+    }
+  },
+  "finished_at": "2026-07-18T11:17:29.551427+00:00",
+  "result_sha256_without_self": "9e4129bdab93eebaa047121c41c5dcc70092a4ecd4ead05283752d9e556013bb"
+}
