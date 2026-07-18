@@ -302,7 +302,7 @@ netdev="$(ip route show default 2>/dev/null | awk 'NR == 1 {print $5}')"
 echo "utc,elapsed_s,cpu_pct,rss_kb,threads,rx_bytes,tx_bytes,udp_rcvbuf_errors,udp_sndbuf_errors,tx_qdisc_drops,oracle_unique" > "${metrics_file}"
 start_epoch="$(date +%s)"
 
-env GOMAXPROCS=2 CHERRY_PICKER_MEM_LIMIT_MB=3072 CHERRY_PICKER_CONFIG="${effective_config}" \
+env TZ=UTC GOMAXPROCS=2 CHERRY_PICKER_MEM_LIMIT_MB=3072 CHERRY_PICKER_CONFIG="${effective_config}" \
   "${binary}" >>"${log_file}" 2>&1 &
 crawler_pid=$!
 echo "${crawler_pid}" > "${RUNTIME_ROOT}/run/crawler.pid"
@@ -338,13 +338,52 @@ wait_phase() {
   done
 }
 
+# Wait for an absolute runtime-row target, counting only the crawler's 30-second
+# telemetry events (not arbitrary startup log lines). This gives the controller
+# an explicit synchronization primitive for both measurement boundaries.
+wait_for_runtime_rows() {
+  local expected="$1" phase="$2" deadline observed
+  deadline=$(( $(date +%s) + 35 ))
+  while :; do
+    if ! kill -0 "${crawler_pid}" 2>/dev/null; then
+      echo "crawler exited while waiting for ${phase} runtime boundary" >&2
+      return 1
+    fi
+    observed="$(grep -c 'runtime 30s:' "${log_file}" 2>/dev/null || true)"
+    ((observed >= expected)) && return 0
+    if (( $(date +%s) >= deadline )); then
+      echo "${phase} runtime boundary timeout: expected=${expected} observed=${observed}" >&2
+      return 1
+    fi
+    sleep 0.1
+  done
+}
+
 echo "RUN run_id=${run_id} mode=${mode} warmup=${warmup} measure=${measure} dir=${run_dir}"
 wait_phase "${warmup_seconds}" warmup
+# Begin measurement immediately after the first complete runtime window that
+# closes after the requested warmup. Thus a 45-second warmup aligns at the
+# 60-second boundary instead of admitting a row containing 15 seconds of
+# warmup. The effective warmup may grow by less than one telemetry period.
+warmup_boundary_rows="$(python3 "${SCRIPT_DIR}/benchmark/runtime_boundaries.py" "${warmup_seconds}")"
+if ((warmup_boundary_rows > 0)); then
+  wait_for_runtime_rows "${warmup_boundary_rows}" "warmup"
+fi
 from_line="$(wc -l < "${log_file}")"
+measurement_runtime_rows="$(grep -c 'runtime 30s:' "${log_file}" 2>/dev/null || true)"
 curl -fsS "${sink_base}/stats" > "${run_dir}/sink-before.json"
-date -u +%FT%TZ > "${run_dir}/measurement-start.txt"
+date -u +%FT%T.%NZ > "${run_dir}/measurement-start.txt"
 echo "MEASURE run_id=${run_id} from_line=${from_line}"
 wait_phase "${measure_seconds}" measurement
+# wait_phase and the crawler ticker can wake in either order at an exact
+# 30-second multiple. Do not stamp measure-end until every complete configured
+# measurement window has actually landed in the log.
+complete_measurement_windows=$((measure_seconds / 30))
+if ((complete_measurement_windows > 0)); then
+  wait_for_runtime_rows \
+    "$((measurement_runtime_rows + complete_measurement_windows))" "measurement"
+fi
+date -u +%FT%T.%NZ > "${run_dir}/measurement-end.txt"
 
 stop_child_process "${crawler_pid}" 200
 crawler_pid=""
@@ -353,7 +392,6 @@ wait "${monitor_pid}" 2>/dev/null || true
 monitor_pid=""
 sleep 1
 curl -fsS "${sink_base}/stats" > "${run_dir}/sink-after.json"
-date -u +%FT%TZ > "${run_dir}/measurement-end.txt"
 
 if [[ "${oracle_mode}" == isolated ]]; then
   oracle_stop_managed_sink "${global_sink_pidfile}" "${sink_binary}" "${sink_base}"
@@ -376,6 +414,8 @@ fi
 
 python3 "${SCRIPT_DIR}/benchmark/analyze_benchmark.py" \
   --run-id "${run_id}" --log "${log_file}" --from-line "${from_line}" \
+  --measure-start "${run_dir}/measurement-start.txt" \
+  --measure-end "${run_dir}/measurement-end.txt" \
   --host-metrics "${metrics_file}" --sink-before "${run_dir}/sink-before.json" \
   --sink-after "${run_dir}/sink-after.json" --warmup-seconds "${warmup_seconds}" \
   --measure-seconds "${measure_seconds}" --output "${run_dir}/result.json" | tee "${run_dir}/result.txt"

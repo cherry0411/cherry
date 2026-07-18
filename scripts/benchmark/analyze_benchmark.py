@@ -9,9 +9,15 @@ import json
 import math
 import re
 import statistics
+from datetime import datetime, timezone
 from pathlib import Path
 
 RUNTIME = re.compile(r"runtime 30s:\s+(.*)$")
+RUNTIME_TIMESTAMP = re.compile(
+    r"(?P<timestamp>\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2})"
+    r"(?:\.(?P<fraction>\d+))?"
+)
+RUNTIME_WINDOW_SECONDS = 30.0
 
 
 def read_json(path: Path) -> dict:
@@ -21,7 +27,41 @@ def read_json(path: Path) -> dict:
         return {}
 
 
-def parse_runtime(path: Path, first_line: int) -> list[dict[str, float]]:
+def read_event_time(path: Path) -> float | None:
+    """Read an RFC3339 UTC marker as a Unix timestamp."""
+    try:
+        raw = path.read_text(encoding="utf-8").strip()
+        return datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp()
+    except (OSError, ValueError):
+        return None
+
+
+def runtime_event_time(line: str) -> float | None:
+    """Return the UTC event time from a benchmark crawler log line.
+
+    The benchmark runner launches the crawler with TZ=UTC. Keeping the event
+    timestamp on every runtime row lets the reducer make window ownership
+    independent of the race between ``wc -l`` and the crawler's 30-second
+    ticker.
+    """
+    match = RUNTIME_TIMESTAMP.search(line)
+    if not match:
+        return None
+    try:
+        base = datetime.strptime(match.group("timestamp"), "%Y/%m/%d %H:%M:%S")
+    except ValueError:
+        return None
+    fraction = match.group("fraction") or ""
+    fractional_seconds = float(f"0.{fraction}") if fraction else 0.0
+    return base.replace(tzinfo=timezone.utc).timestamp() + fractional_seconds
+
+
+def parse_runtime(
+    path: Path,
+    first_line: int,
+    measure_start: float | None = None,
+    measure_end: float | None = None,
+) -> list[dict[str, float]]:
     rows: list[dict[str, float]] = []
     with path.open("r", encoding="utf-8", errors="replace") as handle:
         for number, line in enumerate(handle, start=1):
@@ -30,6 +70,19 @@ def parse_runtime(path: Path, first_line: int) -> list[dict[str, float]]:
             match = RUNTIME.search(line)
             if not match:
                 continue
+            if measure_start is not None or measure_end is not None:
+                event_time = runtime_event_time(line)
+                # A row without a trustworthy event timestamp cannot be
+                # assigned to a measurement window safely.
+                if event_time is None:
+                    continue
+                # Windows are right-closed: a row emitted exactly at the
+                # measure-start marker belongs to warmup, while the final row
+                # at measure-end belongs to measurement.
+                if measure_start is not None and event_time <= measure_start:
+                    continue
+                if measure_end is not None and event_time > measure_end:
+                    continue
             row: dict[str, float] = {}
             for token in match.group(1).split():
                 if "=" not in token:
@@ -46,7 +99,22 @@ def parse_runtime(path: Path, first_line: int) -> list[dict[str, float]]:
     return rows
 
 
-def parse_host_metrics(path: Path, warmup: float, total: float) -> list[dict[str, float]]:
+def expected_runtime_windows(measure_seconds: float) -> int:
+    """Count complete 30-second windows in a measurement duration."""
+    return max(1, math.floor(measure_seconds / RUNTIME_WINDOW_SECONDS))
+
+
+def runtime_window_coverage(runtime_rows: list[dict[str, float]], measure_seconds: float) -> float:
+    return len(runtime_rows) / expected_runtime_windows(measure_seconds)
+
+
+def parse_host_metrics(
+    path: Path,
+    warmup: float,
+    total: float,
+    measure_start: float | None = None,
+    measure_end: float | None = None,
+) -> list[dict[str, float]]:
     rows: list[dict[str, float]] = []
     try:
         with path.open("r", encoding="utf-8", errors="replace", newline="") as handle:
@@ -55,7 +123,18 @@ def parse_host_metrics(path: Path, warmup: float, total: float) -> list[dict[str
                     elapsed = float(raw["elapsed_s"])
                 except (KeyError, TypeError, ValueError):
                     continue
-                if elapsed < warmup or elapsed > total + 60:
+                if measure_start is not None or measure_end is not None:
+                    try:
+                        event_time = datetime.fromisoformat(
+                            raw["utc"].replace("Z", "+00:00")
+                        ).timestamp()
+                    except (KeyError, TypeError, ValueError):
+                        continue
+                    if measure_start is not None and event_time <= measure_start:
+                        continue
+                    if measure_end is not None and event_time > measure_end:
+                        continue
+                elif elapsed < warmup or elapsed > total + 60:
                     continue
                 row: dict[str, float] = {"elapsed_s": elapsed}
                 for key in (
@@ -259,6 +338,8 @@ def main() -> None:
     parser.add_argument("--run-id", required=True)
     parser.add_argument("--log", required=True, type=Path)
     parser.add_argument("--from-line", required=True, type=int)
+    parser.add_argument("--measure-start", type=Path)
+    parser.add_argument("--measure-end", type=Path)
     parser.add_argument("--host-metrics", required=True, type=Path)
     parser.add_argument("--sink-before", required=True, type=Path)
     parser.add_argument("--sink-after", required=True, type=Path)
@@ -267,11 +348,26 @@ def main() -> None:
     parser.add_argument("--output", required=True, type=Path)
     args = parser.parse_args()
 
-    runtime_rows = parse_runtime(args.log, args.from_line)
+    measure_start = read_event_time(args.measure_start) if args.measure_start else None
+    measure_end = read_event_time(args.measure_end) if args.measure_end else None
+    if args.measure_start and measure_start is None:
+        parser.error(f"invalid measurement start marker: {args.measure_start}")
+    if args.measure_end and measure_end is None:
+        parser.error(f"invalid measurement end marker: {args.measure_end}")
+    if measure_start is not None and measure_end is not None and measure_end <= measure_start:
+        parser.error("measurement end must be after measurement start")
+    runtime_rows = parse_runtime(
+        args.log,
+        args.from_line,
+        measure_start=measure_start,
+        measure_end=measure_end,
+    )
     metrics = parse_host_metrics(
         args.host_metrics,
         args.warmup_seconds,
         args.warmup_seconds + args.measure_seconds,
+        measure_start=measure_start,
+        measure_end=measure_end,
     )
     before = read_json(args.sink_before)
     after = read_json(args.sink_after)
@@ -292,10 +388,10 @@ def main() -> None:
     first_half_rate, second_half_rate, rejected_oracle_samples = split_oracle_rates(
         metrics, args.warmup_seconds, args.measure_seconds
     )
-    expected_runtime_windows = max(1, round(args.measure_seconds / 30))
+    runtime_windows_expected = expected_runtime_windows(args.measure_seconds)
     oracle_sample_total = len(metrics)
     oracle_samples_valid = oracle_sample_total - rejected_oracle_samples
-    oracle_sample_coverage = min(1.0, oracle_samples_valid / expected_runtime_windows)
+    oracle_sample_coverage = min(1.0, oracle_samples_valid / runtime_windows_expected)
     oracle_sample_missing_rate = max(
         rejected_oracle_samples / oracle_sample_total if oracle_sample_total else 1.0,
         1.0 - oracle_sample_coverage,
@@ -391,8 +487,10 @@ def main() -> None:
             "tx_qdisc_drops": counter_delta(metrics, "tx_qdisc_drops"),
         },
         "health": {
-            "runtime_windows_expected": expected_runtime_windows,
-            "runtime_window_coverage": len(runtime_rows) / expected_runtime_windows,
+            "runtime_windows_expected": runtime_windows_expected,
+            "runtime_window_coverage": runtime_window_coverage(
+                runtime_rows, args.measure_seconds
+            ),
             "monitor_samples": oracle_sample_total,
             "oracle_samples_valid": oracle_samples_valid,
             "oracle_samples_rejected": rejected_oracle_samples,

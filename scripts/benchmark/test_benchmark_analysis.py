@@ -22,6 +22,7 @@ def load_module(name: str, filename: str):
 
 analyze = load_module("analyze_benchmark", "analyze_benchmark.py")
 compare = load_module("compare_benchmarks", "compare_benchmarks.py")
+boundaries = load_module("runtime_boundaries", "runtime_boundaries.py")
 
 
 def record(arm: str, run: str, unique_rate: float, *, udp: int = 0, cohort: str = "test") -> dict:
@@ -52,6 +53,14 @@ def record(arm: str, run: str, unique_rate: float, *, udp: int = 0, cohort: str 
 
 
 class AnalyzerTests(unittest.TestCase):
+    def test_warmup_runtime_target_does_not_advance_exact_boundary(self):
+        self.assertEqual(boundaries.warmup_runtime_rows(0), 0)
+        self.assertEqual(boundaries.warmup_runtime_rows(45), 2)
+        # If both rows have already landed at the 60-second boundary, target=2
+        # returns immediately instead of waiting for a third row at 90 seconds.
+        self.assertEqual(boundaries.warmup_runtime_rows(60), 2)
+        self.assertEqual(boundaries.warmup_runtime_rows(61), 3)
+
     def test_runtime_parser_keeps_locale_proxy_counters(self):
         with tempfile.TemporaryDirectory() as raw:
             log = Path(raw) / "crawler.log"
@@ -63,6 +72,87 @@ class AnalyzerTests(unittest.TestCase):
             rows = analyze.parse_runtime(log, 0)
             self.assertEqual(rows[0]["meta_locale_n"], 20)
             self.assertEqual(rows[0]["meta_zh_proxy"], 6)
+
+    def test_runtime_event_time_excludes_exact_warmup_boundary(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            log = root / "crawler.log"
+            start_marker = root / "measurement-start.txt"
+            end_marker = root / "measurement-end.txt"
+            start_marker.write_text("2026-01-01T00:00:30.000000000Z\n", encoding="utf-8")
+            end_marker.write_text("2026-01-01T00:02:00.000000000Z\n", encoding="utf-8")
+            log.write_text(
+                "cherry-picker 2026/01/01 00:00:30.000000 runtime 30s: meta_sent=999\n"
+                "cherry-picker 2026/01/01 00:01:00.000000 runtime 30s: meta_sent=10\n"
+                "cherry-picker 2026/01/01 00:01:30.000000 runtime 30s: meta_sent=20\n"
+                "cherry-picker 2026/01/01 00:02:00.000000 runtime 30s: meta_sent=30\n"
+                "cherry-picker 2026/01/01 00:02:30.000000 runtime 30s: meta_sent=888\n",
+                encoding="utf-8",
+            )
+            rows = analyze.parse_runtime(
+                log,
+                0,
+                analyze.read_event_time(start_marker),
+                analyze.read_event_time(end_marker),
+            )
+            self.assertEqual([row["meta_sent"] for row in rows], [10, 20, 30])
+            self.assertEqual(analyze.expected_runtime_windows(90), 3)
+            self.assertEqual(analyze.runtime_window_coverage(rows, 90), 1.0)
+
+    def test_runtime_event_time_handles_aligned_non_integral_warmup(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            log = root / "crawler.log"
+            start_marker = root / "measurement-start.txt"
+            end_marker = root / "measurement-end.txt"
+            # A requested 45-second warmup is extended to the next complete
+            # runtime boundary. Measurement then runs for 95 seconds.
+            start_marker.write_text("2026-01-01T00:01:00.000001000Z\n", encoding="utf-8")
+            end_marker.write_text("2026-01-01T00:02:35.000001000Z\n", encoding="utf-8")
+            log.write_text(
+                "cherry-picker 2026/01/01 00:00:30.000000 runtime 30s: meta_sent=999\n"
+                "cherry-picker 2026/01/01 00:01:00.000000 runtime 30s: meta_sent=999\n"
+                "cherry-picker 2026/01/01 00:01:30.000000 runtime 30s: meta_sent=10\n"
+                "cherry-picker 2026/01/01 00:02:00.000000 runtime 30s: meta_sent=20\n"
+                "cherry-picker 2026/01/01 00:02:30.000000 runtime 30s: meta_sent=30\n"
+                "cherry-picker 2026/01/01 00:03:00.000000 runtime 30s: meta_sent=888\n",
+                encoding="utf-8",
+            )
+            rows = analyze.parse_runtime(
+                log,
+                0,
+                analyze.read_event_time(start_marker),
+                analyze.read_event_time(end_marker),
+            )
+            self.assertEqual([row["meta_sent"] for row in rows], [10, 20, 30])
+            self.assertEqual(analyze.expected_runtime_windows(95), 3)
+            self.assertEqual(analyze.runtime_window_coverage(rows, 95), 1.0)
+
+    def test_host_metrics_use_strict_measurement_event_times(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            metrics = root / "host-metrics.csv"
+            start_marker = root / "measurement-start.txt"
+            end_marker = root / "measurement-end.txt"
+            start_marker.write_text("2026-01-01T00:00:45.250000000Z\n", encoding="utf-8")
+            end_marker.write_text("2026-01-01T00:02:20.250000000Z\n", encoding="utf-8")
+            metrics.write_text(
+                "utc,elapsed_s,cpu_pct,rss_kb,threads,rx_bytes,tx_bytes,"
+                "udp_rcvbuf_errors,udp_sndbuf_errors,tx_qdisc_drops,oracle_unique\n"
+                "2026-01-01T00:00:45.250000Z,999,1,1,1,1,1,0,0,0,1\n"
+                "2026-01-01T00:01:00Z,0,2,2,2,2,2,0,0,0,2\n"
+                "2026-01-01T00:02:20.250000Z,0,3,3,3,3,3,0,0,0,3\n"
+                "2026-01-01T00:02:21Z,0,4,4,4,4,4,0,0,0,4\n",
+                encoding="utf-8",
+            )
+            rows = analyze.parse_host_metrics(
+                metrics,
+                warmup=45.25,
+                total=140.25,
+                measure_start=analyze.read_event_time(start_marker),
+                measure_end=analyze.read_event_time(end_marker),
+            )
+            self.assertEqual([row["cpu_pct"] for row in rows], [2, 3])
 
     def test_json_counter_delta_supports_new_sink_counters(self):
         self.assertEqual(analyze.json_counter_delta({"check_found": 10}, {"check_found": 17}, "check_found"), 7)
