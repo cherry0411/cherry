@@ -71,6 +71,17 @@ scripts/run-crawler-abab.sh \
 The first arm is randomized. Both arms share the same identity cohort and
 global oracle, while only one process consumes the host/network at a time.
 
+Summarize completed blocks (and exclude the first cold cohort run) with:
+
+```bash
+scripts/benchmark/compare_benchmarks.py \
+  --index /home/ubuntu/cherry/bench/index.jsonl \
+  --warm-only
+```
+
+The comparator reports arm distributions and chronological A→B pair deltas. It
+refuses to label fewer than three pairs as enough for a durable claim.
+
 ## Iteration policy
 
 Before running, record one causal hypothesis, one primary metric, a minimum
