@@ -140,6 +140,17 @@ and retain both orders, and calibrate the current time-drift/depletion bias with
 same-arm negative-control blocks. A global-unique result that disagrees with
 local mechanical efficiency is treated as a depletion warning, not a win.
 
+Balanced order removes the first-order advantage of running earlier, but it
+does not make a shared oracle non-depleting: `/check` responses also change the
+crawler's work, so later blocks face a different admission stream. Before a
+configuration is promoted to long confirmation, the controller should support
+an immutable experiment-start oracle baseline plus an empty per-block overlay.
+Every arm then sees the same pre-existing hashes, while hashes discovered during
+its own warmup/measurement remain deduplicated normally. Overlays can be merged
+back into the production oracle only after the experiment. Until that isolation
+exists, short shared-oracle screens are evidence about direction and mechanical
+efficiency, not an unbiased estimate of the durable global effect.
+
 Monitor gaps are written as missing values rather than zero. The analyzer
 rejects missing or non-monotonic samples and averages the next delta across the
 full time gap, preventing a failed `/stats` request from becoming a fake rate

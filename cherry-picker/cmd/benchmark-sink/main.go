@@ -34,11 +34,13 @@ const (
 type hashKey [20]byte
 
 type store struct {
-	mu       sync.RWMutex
-	metadata map[hashKey]struct{}
-	rejected map[hashKey]struct{}
-	file     *os.File
-	started  time.Time
+	mu               sync.RWMutex
+	metadata         map[hashKey]struct{}
+	rejected         map[hashKey]struct{}
+	baselineMetadata int
+	baselineRejected int
+	file             *os.File
+	started          time.Time
 
 	batchRequests  atomic.Uint64
 	checkRequests  atomic.Uint64
@@ -62,10 +64,11 @@ type batchRequest struct {
 func main() {
 	listen := flag.String("listen", "127.0.0.1:5070", "HTTP listen address")
 	data := flag.String("data", "benchmark-hashes.bin", "append-only 21-byte record file")
+	baseline := flag.String("baseline", "", "optional read-only oracle baseline; -data becomes this run's overlay")
 	flag.Parse()
 
 	logger := log.New(os.Stdout, "benchmark-sink ", log.LstdFlags|log.Lmicroseconds)
-	s, err := openStore(*data)
+	s, err := openStoreWithBaseline(*data, *baseline)
 	if err != nil {
 		logger.Fatal(err)
 	}
@@ -98,13 +101,33 @@ func main() {
 		_ = server.Shutdown(shutdownCtx)
 	}()
 
-	logger.Printf("started: listen=%s data=%s metadata=%d rejected=%d", *listen, *data, len(s.metadata), len(s.rejected))
+	logger.Printf("started: listen=%s data=%s baseline=%s metadata=%d rejected=%d baseline_metadata=%d baseline_rejected=%d",
+		*listen, *data, *baseline, len(s.metadata), len(s.rejected), s.baselineMetadata, s.baselineRejected)
 	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		logger.Fatal(err)
 	}
 }
 
 func openStore(path string) (*store, error) {
+	return openStoreWithBaseline(path, "")
+}
+
+// openStoreWithBaseline loads an optional immutable experiment baseline before
+// the writable data file. The in-memory maps provide normal global deduplication
+// across both layers, while every newly accepted record is appended only to the
+// overlay. Independent experiment blocks can therefore start from the exact
+// same known set without copying or mutating the production oracle.
+func openStoreWithBaseline(path, baselinePath string) (*store, error) {
+	if baselinePath != "" {
+		dataAbs, dataErr := filepath.Abs(path)
+		baselineAbs, baselineErr := filepath.Abs(baselinePath)
+		if dataErr != nil || baselineErr != nil {
+			return nil, fmt.Errorf("resolve oracle paths: data=%v baseline=%v", dataErr, baselineErr)
+		}
+		if dataAbs == baselineAbs {
+			return nil, errors.New("writable overlay and read-only baseline must be different files")
+		}
+	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil && filepath.Dir(path) != "." {
 		return nil, err
 	}
@@ -118,6 +141,24 @@ func openStore(path string) (*store, error) {
 		file:     f,
 		started:  time.Now().UTC(),
 	}
+	if baselinePath != "" {
+		baseline, err := os.Open(baselinePath)
+		if err != nil {
+			f.Close()
+			return nil, fmt.Errorf("open baseline: %w", err)
+		}
+		if err := s.loadRecords(baseline); err != nil {
+			baseline.Close()
+			f.Close()
+			return nil, fmt.Errorf("load baseline: %w", err)
+		}
+		if err := baseline.Close(); err != nil {
+			f.Close()
+			return nil, fmt.Errorf("close baseline: %w", err)
+		}
+		s.baselineMetadata = len(s.metadata)
+		s.baselineRejected = len(s.rejected)
+	}
 	if err := s.load(); err != nil {
 		f.Close()
 		return nil, err
@@ -129,7 +170,15 @@ func (s *store) load() error {
 	if _, err := s.file.Seek(0, io.SeekStart); err != nil {
 		return err
 	}
-	reader := bufio.NewReaderSize(s.file, 1<<20)
+	if err := s.loadRecords(s.file); err != nil {
+		return err
+	}
+	_, err := s.file.Seek(0, io.SeekEnd)
+	return err
+}
+
+func (s *store) loadRecords(source io.Reader) error {
+	reader := bufio.NewReaderSize(source, 1<<20)
 	record := make([]byte, recordSize)
 	for {
 		_, err := io.ReadFull(reader, record)
@@ -153,8 +202,7 @@ func (s *store) load() error {
 			return fmt.Errorf("corrupt store: record type %q", record[0])
 		}
 	}
-	_, err := s.file.Seek(0, io.SeekEnd)
-	return err
+	return nil
 }
 
 func (s *store) close() error {
@@ -328,18 +376,24 @@ func (s *store) handleStats(w http.ResponseWriter, _ *http.Request) {
 	s.mu.RLock()
 	metadata := len(s.metadata)
 	rejected := len(s.rejected)
+	baselineMetadata := s.baselineMetadata
+	baselineRejected := s.baselineRejected
 	s.mu.RUnlock()
 	writeJSON(w, http.StatusOK, map[string]any{
-		"started_at":          s.started,
-		"metadata_unique":     metadata,
-		"rejected_unique":     rejected,
-		"batch_requests":      s.batchRequests.Load(),
-		"check_requests":      s.checkRequests.Load(),
-		"check_hashes":        s.checkHashes.Load(),
-		"check_found":         s.checkFound.Load(),
-		"reject_requests":     s.rejectRequests.Load(),
-		"metadata_duplicates": s.duplicates.Load(),
-		"invalid_hashes":      s.invalid.Load(),
+		"started_at":               s.started,
+		"metadata_unique":          metadata,
+		"rejected_unique":          rejected,
+		"baseline_metadata_unique": baselineMetadata,
+		"baseline_rejected_unique": baselineRejected,
+		"overlay_metadata_unique":  metadata - baselineMetadata,
+		"overlay_rejected_unique":  rejected - baselineRejected,
+		"batch_requests":           s.batchRequests.Load(),
+		"check_requests":           s.checkRequests.Load(),
+		"check_hashes":             s.checkHashes.Load(),
+		"check_found":              s.checkFound.Load(),
+		"reject_requests":          s.rejectRequests.Load(),
+		"metadata_duplicates":      s.duplicates.Load(),
+		"invalid_hashes":           s.invalid.Load(),
 	})
 }
 
