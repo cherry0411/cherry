@@ -16,6 +16,10 @@ Every run has an immutable directory under `bench/runs/` containing:
 - uniqueness-oracle snapshots at the exact measurement boundaries;
 - a normalized `result.json` and an append-only `bench/index.jsonl` record.
 
+The controller re-executes an immutable temporary snapshot of itself. Updating
+the deployed script while a long run is active therefore cannot alter its
+second half or invalidate its result.
+
 The included `benchmark-sink` persists only 21 bytes per processed infohash. It
 implements the crawler's batch/check/reject endpoints without PostgreSQL or the
 full API, so it is suitable as a global-uniqueness oracle on the 2C4G crawler

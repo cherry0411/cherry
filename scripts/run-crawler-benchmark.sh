@@ -5,7 +5,19 @@ set -euo pipefail
 # directory; steady/cold identity semantics are explicit; only post-warmup
 # windows count toward the result.
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Bash may read a script lazily. Execute an immutable snapshot so deploying a
+# newer controller in place cannot corrupt a run that is already measuring.
+if [[ -z "${CHERRY_BENCH_SCRIPT_SNAPSHOT:-}" ]]; then
+  original_script="$(readlink -f "${BASH_SOURCE[0]}")"
+  snapshot="${TMPDIR:-/tmp}/cherry-benchmark-$$-$(date +%s).sh"
+  cp "${original_script}" "${snapshot}"
+  chmod 700 "${snapshot}"
+  export CHERRY_BENCH_SCRIPT_SNAPSHOT="${snapshot}"
+  export CHERRY_BENCH_SCRIPT_DIR="$(cd "$(dirname "${original_script}")" && pwd)"
+  exec "${snapshot}" "$@"
+fi
+
+SCRIPT_DIR="${CHERRY_BENCH_SCRIPT_DIR}"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 RUNTIME_ROOT="${CHERRY_BENCH_ROOT:-/home/ubuntu/cherry}"
 [[ -d "${RUNTIME_ROOT}" ]] || RUNTIME_ROOT="${REPO_ROOT}/.benchmark"
@@ -204,6 +216,7 @@ monitor & monitor_pid=$!
 cleanup() {
   if kill -0 "${crawler_pid}" 2>/dev/null; then kill -TERM "${crawler_pid}" 2>/dev/null || true; fi
   kill "${monitor_pid}" 2>/dev/null || true
+  rm -f "${CHERRY_BENCH_SCRIPT_SNAPSHOT}" 2>/dev/null || true
 }
 trap cleanup INT TERM EXIT
 
@@ -256,4 +269,5 @@ PY
 
 rm -f "${RUNTIME_ROOT}/run/crawler.pid"
 trap - INT TERM EXIT
+rm -f "${CHERRY_BENCH_SCRIPT_SNAPSHOT}" 2>/dev/null || true
 echo "DONE run_id=${run_id} result=${run_dir}/result.json"
