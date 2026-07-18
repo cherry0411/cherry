@@ -23,6 +23,7 @@ RUNTIME_ROOT="${CHERRY_BENCH_ROOT:-/home/ubuntu/cherry}"
 [[ -d "${RUNTIME_ROOT}" ]] || RUNTIME_ROOT="${REPO_ROOT}/.benchmark"
 
 label=""
+experiment=""
 variant="candidate"
 mode="steady"
 cohort="primary"
@@ -38,6 +39,7 @@ declare -a overrides=()
 usage() {
   cat <<'EOF'
 Usage: run-crawler-benchmark.sh --label NAME [options]
+  --experiment NAME       experiment family used for safe pairing
   --variant NAME          A/B variant label (default: candidate)
   --mode MODE             steady, warm-restart, or cold (default: steady)
   --cohort NAME           stable node-ID cohort (default: primary)
@@ -55,6 +57,7 @@ EOF
 while (($#)); do
   case "$1" in
     --label) label="$2"; shift 2 ;;
+    --experiment) experiment="$2"; shift 2 ;;
     --variant) variant="$2"; shift 2 ;;
     --mode) mode="$2"; shift 2 ;;
     --cohort) cohort="$2"; shift 2 ;;
@@ -72,6 +75,7 @@ while (($#)); do
 done
 
 [[ -n "${label}" ]] || { echo "--label is required" >&2; exit 2; }
+experiment="${experiment:-${label}}"
 [[ "${mode}" =~ ^(steady|warm-restart|cold)$ ]] || { echo "invalid --mode: ${mode}" >&2; exit 2; }
 [[ -x "${binary}" ]] || { echo "crawler binary is not executable: ${binary}" >&2; exit 2; }
 [[ -x "${sink_binary}" ]] || { echo "sink binary is not executable: ${sink_binary}" >&2; exit 2; }
@@ -165,7 +169,7 @@ uname -a > "${run_dir}/environment.txt"
   git -C "${REPO_ROOT}" rev-parse HEAD 2>/dev/null || true
 } >> "${run_dir}/environment.txt"
 
-export RUN_ID="${run_id}" LABEL="${label}" VARIANT="${variant}" MODE="${mode}" COHORT="${cohort}"
+export RUN_ID="${run_id}" LABEL="${label}" EXPERIMENT="${experiment}" VARIANT="${variant}" MODE="${mode}" COHORT="${cohort}"
 export WARMUP_SECONDS="${warmup_seconds}" MEASURE_SECONDS="${measure_seconds}" PORT="${port}"
 export BINARY="${binary}" BINARY_SHA="${binary_sha}" CONFIG="${effective_config}" CONFIG_SHA="${config_sha}"
 export TEMPLATE_CONFIG_SHA="${template_config_sha}" TREATMENT_SHA="${treatment_sha}"
@@ -180,7 +184,7 @@ export OVERRIDES
 export BUILD_JSON="${run_dir}/build.json"
 python3 - "${run_dir}/manifest.json" <<'PY'
 import json, os, sys
-keys = ["RUN_ID", "LABEL", "VARIANT", "MODE", "COHORT", "WARMUP_SECONDS", "MEASURE_SECONDS",
+keys = ["RUN_ID", "LABEL", "EXPERIMENT", "VARIANT", "MODE", "COHORT", "WARMUP_SECONDS", "MEASURE_SECONDS",
         "PORT", "BINARY", "BINARY_SHA", "CONFIG", "CONFIG_SHA", "TEMPLATE_CONFIG_SHA", "TREATMENT_SHA",
         "NODE_DIR", "NODE_IDS_BEFORE", "SINK_URL"]
 manifest = {key.lower(): os.environ[key] for key in keys}
@@ -214,8 +218,8 @@ monitor() {
     threads="$(awk '/Threads:/ {print $2}' "/proc/${crawler_pid}/status" 2>/dev/null || echo 0)"
     read -r rx tx < <(awk -F'[: ]+' '$1 != "lo" && NF > 10 {rx += $3; tx += $11} END {print rx+0, tx+0}' /proc/net/dev)
     read -r udp_rcv udp_snd < <(awk '$1 == "Udp:" { if (++row == 1) { for (i=2; i<=NF; i++) col[$i]=i } else { print $(col["RcvbufErrors"]), $(col["SndbufErrors"]) } }' /proc/net/snmp)
-    stats="$(curl -fsS "${sink_base}/stats" 2>/dev/null || echo '{}')"
-    oracle="$(python3 -c 'import json,sys; print(json.load(sys.stdin).get("metadata_unique",0))' <<<"${stats}" 2>/dev/null || echo 0)"
+    stats="$(curl -fsS "${sink_base}/stats" 2>/dev/null || true)"
+    oracle="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["metadata_unique"])' <<<"${stats}" 2>/dev/null || true)"
     printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' "$(date -u +%FT%TZ)" "${elapsed}" "${cpu}" "${rss}" "${threads}" "${rx}" "${tx}" "${udp_rcv}" "${udp_snd}" "${oracle}" >> "${metrics_file}"
     sleep 30
   done

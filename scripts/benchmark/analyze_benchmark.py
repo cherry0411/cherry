@@ -108,19 +108,61 @@ def slope(points: list[tuple[float, float]]) -> float | None:
     return sum((x - xbar) * (y - ybar) for x, y in points) / denominator
 
 
-def oracle_rate_slope(metrics: list[dict[str, float]], warmup: float) -> float | None:
-    points: list[tuple[float, float]] = []
-    for previous, current in zip(metrics, metrics[1:]):
-        dt = current["elapsed_s"] - previous["elapsed_s"]
-        a = previous.get("oracle_unique", math.nan)
-        b = current.get("oracle_unique", math.nan)
-        if dt <= 0 or not math.isfinite(a) or not math.isfinite(b) or b < a:
+def clean_oracle_samples(metrics: list[dict[str, float]]) -> tuple[list[tuple[float, float]], int]:
+    """Return monotonic oracle samples and the number of rejected observations.
+
+    A failed monitor request used to be recorded as zero.  Zipping raw rows then
+    interpreted the following healthy sample as an enormous 30-second jump.  By
+    retaining the last valid sample (and its original timestamp), a temporary
+    gap becomes one longer, correctly averaged interval instead.
+    """
+    samples: list[tuple[float, float]] = []
+    rejected = 0
+    has_positive_sample = any(
+        math.isfinite(row.get("oracle_unique", math.nan)) and row.get("oracle_unique", 0) > 0
+        for row in metrics
+    )
+    for row in metrics:
+        elapsed = row.get("elapsed_s", math.nan)
+        value = row.get("oracle_unique", math.nan)
+        if not math.isfinite(elapsed) or not math.isfinite(value):
+            rejected += 1
             continue
-        uptime_hours = ((previous["elapsed_s"] + current["elapsed_s"]) / 2 - warmup) / 3600
-        unique_per_hour = (b - a) * 3600 / dt
+        # A zero between positive samples is the legacy curl-failure sentinel.
+        if (value == 0 and has_positive_sample) or (samples and value < samples[-1][1]):
+            rejected += 1
+            continue
+        samples.append((elapsed, value))
+    return samples, rejected
+
+
+def oracle_rate_windows(metrics: list[dict[str, float]], warmup: float) -> tuple[list[tuple[float, float]], int]:
+    samples, rejected = clean_oracle_samples(metrics)
+    points: list[tuple[float, float]] = []
+    for previous, current in zip(samples, samples[1:]):
+        dt = current[0] - previous[0]
+        if dt <= 0:
+            continue
+        uptime_hours = ((previous[0] + current[0]) / 2 - warmup) / 3600
+        unique_per_hour = (current[1] - previous[1]) * 3600 / dt
         points.append((uptime_hours, unique_per_hour))
+    return points, rejected
+
+
+def oracle_rate_slope(metrics: list[dict[str, float]], warmup: float) -> float | None:
+    points, _ = oracle_rate_windows(metrics, warmup)
     # Unit: change in unique/hour for each additional uptime hour.
     return slope(points)
+
+
+def split_oracle_rates(
+    metrics: list[dict[str, float]], warmup: float, measure: float
+) -> tuple[float | None, float | None, int]:
+    points, rejected = oracle_rate_windows(metrics, warmup)
+    midpoint_hours = measure / 7200
+    first = [rate / 3600 for uptime, rate in points if uptime < midpoint_hours]
+    second = [rate / 3600 for uptime, rate in points if uptime >= midpoint_hours]
+    return mean(first), mean(second), rejected
 
 
 def main() -> None:
@@ -152,6 +194,18 @@ def main() -> None:
 
     local_windows = [row.get("meta_sent", row.get("wire_ok", 0)) for row in runtime_rows]
     nodes = [row.get("nodes", math.nan) for row in runtime_rows]
+    first_half_rate, second_half_rate, rejected_oracle_samples = split_oracle_rates(
+        metrics, args.warmup_seconds, args.measure_seconds
+    )
+    expected_runtime_windows = max(1, round(args.measure_seconds / 30))
+    oracle_sample_total = len(metrics)
+    oracle_samples_valid = oracle_sample_total - rejected_oracle_samples
+    oracle_sample_coverage = min(1.0, oracle_samples_valid / expected_runtime_windows)
+    oracle_sample_missing_rate = max(
+        rejected_oracle_samples / oracle_sample_total if oracle_sample_total else 1.0,
+        1.0 - oracle_sample_coverage,
+    )
+    transient_slope = oracle_rate_slope(metrics, args.warmup_seconds)
     result = {
         "schema_version": 1,
         "run_id": args.run_id,
@@ -162,7 +216,12 @@ def main() -> None:
             "global_unique_per_second": unique_delta / args.measure_seconds,
             "global_unique_per_hour": unique_delta * 3600 / args.measure_seconds,
             "oracle_duplicate_metadata": duplicate_delta,
-            "decay_slope_unique_per_hour_per_uptime_hour": oracle_rate_slope(metrics, args.warmup_seconds),
+            # Compatibility alias; short runs measure a post-start transient,
+            # not a proven long-run decay process.
+            "decay_slope_unique_per_hour_per_uptime_hour": transient_slope,
+            "transient_slope_unique_per_hour_per_uptime_hour": transient_slope,
+            "first_half_unique_per_second": first_half_rate,
+            "second_half_unique_per_second": second_half_rate,
         },
         "local_funnel": {
             "metadata_sent": total(runtime_rows, "meta_sent"),
@@ -197,6 +256,15 @@ def main() -> None:
             "host_tx_bytes": counter_delta(metrics, "tx_bytes"),
             "udp_rcvbuf_errors": counter_delta(metrics, "udp_rcvbuf_errors"),
             "udp_sndbuf_errors": counter_delta(metrics, "udp_sndbuf_errors"),
+        },
+        "health": {
+            "runtime_windows_expected": expected_runtime_windows,
+            "runtime_window_coverage": len(runtime_rows) / expected_runtime_windows,
+            "monitor_samples": oracle_sample_total,
+            "oracle_samples_valid": oracle_samples_valid,
+            "oracle_samples_rejected": rejected_oracle_samples,
+            "oracle_sample_coverage": oracle_sample_coverage,
+            "oracle_sample_missing_rate": oracle_sample_missing_rate,
         },
     }
     args.output.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8")

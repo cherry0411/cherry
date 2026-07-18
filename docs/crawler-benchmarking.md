@@ -63,33 +63,51 @@ For a serious A/B, run sequential ABAB blocks rather than two crawlers at once:
 ```bash
 scripts/run-crawler-abab.sh \
   --label routing-refresh \
-  --blocks 6 \
+  --blocks 12 \
   --warmup 10m \
   --measure 60m \
   --config-a configs/baseline.json --binary-a bin/crawler-a \
   --config-b configs/candidate.json --binary-b bin/crawler-b
 ```
 
-The first arm is randomized. Both arms share the same identity cohort and
-global oracle, while only one process consumes the host/network at a time.
+The first adjacent pair is randomized, then `AB` and `BA` pair orders alternate
+to balance time/oracle depletion. `--blocks` counts runs, so 12 blocks produce
+six treatment pairs. Both arms share the same identity cohort and global oracle,
+while only one process consumes the host/network at a time. Before final
+confirmation, run `--design aa --experiment routing-refresh` (the label may be
+different) to add same-arm time/depletion controls to the same experiment.
 
 Summarize completed blocks (and exclude the first cold cohort run) with:
 
 ```bash
 scripts/benchmark/compare_benchmarks.py \
   --index /home/ubuntu/cherry/bench/index.jsonl \
+  --experiment routing-refresh \
   --warm-only
 ```
 
-The comparator reports arm distributions and chronological A→B pair deltas. It
-refuses to label fewer than three pairs as enough for a durable claim.
+The comparator forms strict adjacent, non-overlapping blocks. It keeps both
+`A→B` and `B→A` orders and always reports the effect as `B−A`, so randomizing
+the first arm is not accidentally undone during analysis. Same-arm `A→A` or
+`B→B` blocks are negative controls for time drift and depletion of the shared
+global-uniqueness oracle. Legacy manifests remain readable but produce an
+explicit warning when they lack treatment/template hashes.
+
+Each run first passes health gates for runtime-window coverage, RSS, kernel UDP
+drops, and oracle sample continuity. The comparison reports absolute deltas,
+log-ratios, order-stratified effects, an exact sign test, and a deterministic
+paired-bootstrap confidence interval. A candidate is never called durable
+without at least six valid treatment pairs, five positive pairs, three valid
+negative-control pairs, a confidence interval above zero, and a measured effect
+beyond same-arm control noise. Shorter runs are directional screens only.
 
 ## Iteration policy
 
 Before running, record one causal hypothesis, one primary metric, a minimum
-worthwhile effect, and resource guardrails. Short screens can use 10-minute
-warmup plus 20–60 minutes of measurement. A candidate is not called a durable
-win until it survives at least three paired AB blocks and a 6–12 hour run.
+worthwhile effect, and resource guardrails. Short screens can use a 5–10 minute
+warmup plus 20–60 minutes of measurement and should emphasize non-depleting
+mechanical funnel metrics. A candidate is not called a durable win until it
+survives the comparator's controlled blocks and a 6–12 hour run.
 
 Use these decision rules:
 
@@ -103,6 +121,18 @@ Use these decision rules:
 5. Change one causal mechanism at a time. Parameter bundles are allowed only for
    exploration and must be decomposed before acceptance.
 6. Preserve losing results. Never reuse a label directory or overwrite logs.
+
+Because the persistent oracle is deliberately never reset, the earlier run in
+a sequential block consumes easy hashes before the later run. Always randomize
+and retain both orders, and calibrate the current time-drift/depletion bias with
+same-arm negative-control blocks. A global-unique result that disagrees with
+local mechanical efficiency is treated as a depletion warning, not a win.
+
+Monitor gaps are written as missing values rather than zero. The analyzer
+rejects missing or non-monotonic samples and averages the next delta across the
+full time gap, preventing a failed `/stats` request from becoming a fake rate
+spike. Its short-window slope is exposed as `transient_slope`; the old
+`decay_slope` key remains as a compatibility alias.
 
 The current first diagnostics are routing-table turnover (`nodes`, `node_add`,
 `node_rm`, `refresh_q`) and pre-dial wire admission loss (`wire_q_drop`). They
