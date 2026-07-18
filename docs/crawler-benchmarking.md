@@ -113,13 +113,78 @@ without at least six valid treatment pairs, five positive pairs, three valid
 negative-control pairs, a confidence interval above zero, and a measured effect
 beyond same-arm control noise. Shorter runs are directional screens only.
 
+## Mandatory experiment card
+
+No treatment enters the remote queue until its experiment card is appended to
+`docs/crawler-experiment-ledger.md`. Failed, neutral, cancelled, and rolled-back
+runs are retained just like winners. Each card must contain:
+
+1. **Question and mechanism**: one falsifiable causal hypothesis, why the single
+   changed variable should affect the funnel, and the minimum worthwhile effect.
+2. **Frozen inputs**: commit/release and binary SHA, config/template/treatment
+   SHA, server/region, resource limit, port, node-ID cohort, oracle mode and
+   oracle baseline SHA.
+3. **Change boundary**: the exact A and B values plus a list of important values
+   deliberately held constant. Bundled exploration must say how it will be
+   decomposed before promotion.
+4. **Timing and contamination**: start/end UTC, process-restart boundary, the
+   excluded restart window, warm-up rule, measurement window, block order, and
+   whether the port and node IDs were reused.
+5. **Decision contract**: primary metric, diagnostic funnel counters, resource
+   guardrails, stop conditions, and evidence that would falsify the hypothesis.
+6. **Evidence**: immutable run paths, index/result hashes, every 30-second raw
+   window (or a checked-in digest pointing to it), result summary, caveats, and
+   the next experiment derived from the result.
+7. **Rollback**: exact previous release/config, rollback triggers, commands or
+   controller action, and post-rollback health checks. A rollback is a recorded
+   outcome, not an erased run.
+
+Use this compact ledger template:
+
+```text
+### <experiment-id> — <state: planned/running/decided/rolled-back>
+Hypothesis / mechanism:
+A / B (only changed variable):
+Frozen inputs and controls:
+Warm-up / measurement / order:
+Primary metric / guardrails / falsification:
+Immutable evidence paths:
+Result and reasoning:
+Rollback point / triggers / verification:
+Next action:
+```
+
+Chat summaries are not authoritative. The immutable host artifacts and this
+ledger are the recovery point after a pause, context compaction, or hand-off.
+
 ## Iteration policy
 
 Before running, record one causal hypothesis, one primary metric, a minimum
-worthwhile effect, and resource guardrails. Short screens can use a 5–10 minute
-warmup plus 20–60 minutes of measurement and should emphasize non-depleting
-mechanical funnel metrics. A candidate is not called a durable win until it
-survives the comparator's controlled blocks and a 6–12 hour run.
+worthwhile effect, and resource guardrails. A restarted steady block uses the
+same port and persistent node-ID cohort. Its first two minutes are always tagged
+`restart-contaminated` and excluded from the primary comparison because delayed
+UDP responses, empty process caches, and re-created transaction IDs can bias the
+early rate.
+
+Warm-up is bounded and adaptive rather than guessed from a single peak:
+
+- minimum 5 minutes, default 10 minutes, maximum 15 minutes after restart;
+- inspect three consecutive 30-second windows of peer supply, dial/connect
+  conversion, blacklist growth, RSS and global-new rate;
+- warm-up may end after the minimum only when those windows have no health-gate
+  failure and no obvious one-way bootstrap trend;
+- if the stream is still non-stationary at the maximum, start measurement but
+  mark the block non-stationary and retain its full slope. Never wait until a
+  declining treatment happens to look flat.
+
+A directional mechanism screen then measures at least 5 minutes. A balanced
+`ABBA` screen therefore normally costs 40–80 minutes, not four five-minute cold
+runs. A candidate that wins the short screen gets a 20–30 minute confirmation,
+then becomes only the next baseline and remains open to every unexhausted
+optimization direction. A 6–12 hour soak is never started automatically: it is
+reserved for the user-authorized stability phase after the global search space
+and remaining expected gains have been reported. The soak validates decay,
+capacity and stability—it is not the search loop.
 
 Use these decision rules:
 

@@ -11,7 +11,107 @@ artifacts. Times below are UTC on 2026-07-18.
 - Primary metric: globally new metadata per second from the persistent oracle.
 - Guardrails: no OOM/pause, no kernel UDP buffer loss, no wire queue loss, and
   no material egress-qdisc loss regression.
-- Short 5m-warmup/20m runs are directional screens, not durable claims.
+- Restarted blocks exclude the first 2m, use a bounded 5–15m adaptive warm-up
+  (10m default), then at least 5m measurement. These are directional screens,
+  not durable claims.
+
+## Active experiment cards
+
+### `dual-region-ac7a239-short-A` — truncated calibration
+
+- **Hypothesis / mechanism:** establish a time-aligned SG/JP steady reference
+  and measure startup-to-steady funnel decay before selecting the next single
+  variable. This is a calibration A, not an optimization claim.
+- **A / B:** A is immutable release `20260718T075740Z-ac7a239ee04d`,
+  `refresh_nodes=32`, lookup rate unchanged. No B is running yet.
+- **Frozen inputs and controls:** 2C4G hosts SG `43.161.252.140` and JP
+  `43.165.167.154`; binary SHA prefix `5285bf14754c`; frozen oracle SHA prefix
+  `afb79bd40e8d`; fixed UDP port `21000`; persistent cohorts
+  `region-sg-v1`/`region-jp-v1`, 96 existing node IDs each. Both regions started
+  at `2026-07-18T09:16:37Z`.
+- **Warm-up / measurement:** execution was stopped at 300s while the timing rule
+  was being corrected. Tag 0–120s as restart-contaminated, 150–270s as warm-up
+  transition and 300s as observation start. There is no 600–900s primary A
+  window, so this run cannot support a treatment conclusion.
+- **Primary / guardrails / falsification:** oracle global-new metadata/minute;
+  secondary lookup→peer→queued→dial→connect→download by source, blacklist
+  size/rejected/expired and uptime slope. Reject any treatment with pause/OOM,
+  DHT or wire-queue loss, or material qdisc regression.
+- **Immutable evidence:** SG
+  `/home/ubuntu/cherry/bench/runs/20260718T091637Z_dual-region-long-ac7a239-sg_region-sg-v1_5285bf14754c`;
+  JP
+  `/home/ubuntu/cherry/bench/runs/20260718T091637Z_dual-region-long-ac7a239-jp_region-jp-v1_5285bf14754c`.
+  The historical directory label says `long`; the ledger records that execution
+  was deliberately truncated to a short calibration. SG artifact SHA-256:
+  manifest `b41576c15597`, crawler log `1e2015f62119`, host metrics
+  `fbb81258cb6e`, config `e688b4d5f518`; JP: manifest `7613a82b7521`, crawler
+  log `d5dea6b5c766`, host metrics `f313da612bf4`, config `5809307ccb72`.
+  The controller stopped during warm-up, so neither run has `result.json` or an
+  `index.jsonl` entry; this limitation is explicit rather than silently filled.
+- **Initial observations:** first minute SG/JP `+283/+219`; 60–120s
+  `+427/+367`; at 120s CPU `46%/39%`, RSS `661/748 MiB`, blacklist fill
+  `16.9%/14.0%`, with no DHT, wire-queue or blacklist-reject loss. These startup
+  values are diagnostics and are not the primary A estimate.
+- **Rollback:** no code/config change was deployed. Stop the benchmark-owned
+  controller, crawler and sink; verify UDP `:21000` and loopback oracle `:5070`
+  are no longer owned by the run. Previous immutable release remains
+  `20260718T075740Z-ac7a239ee04d`.
+- **Next action:** use the complete 15m funnel to choose one treatment. Current
+  candidates are lookup rate `300→600`, blacklist policy only if capacity or
+  rejection is actually observed, and randomized crawl transaction-ID origin
+  to eliminate same-port delayed-response collisions.
+
+The 30s funnel shows peer supply and blacklist growth accelerating through
+300s. At 300s blacklist size was SG/JP `94,385/89,880` of `131,072`, with no
+rejected insert or expiry; the instantaneous growth projected saturation near
+367/375s. Therefore the old “160s saturation” estimate was a hot-supply case,
+not a fixed property, and this truncated run cannot accept or reject a
+blacklist treatment. Review also falsified transaction-ID reset as a likely
+startup-peak cause: delayed replies carry IDs near the old counter tail and do
+not normally collide with a new counter beginning at one before they expire.
+
+### `lookup-rate-300-vs-600-screen1` — planned
+
+- **Hypothesis / mechanism:** with `refresh_nodes=32`, spare CPU/network may turn
+  twice as many admitted active lookup hashes into more reachable peers and
+  globally new metadata. If lookup exposure rises but downstream supply does
+  not, the experiment instead locates the next bottleneck.
+- **A / B (only changed variable):** A `lookup_rate=300`; B
+  `lookup_rate=600`. `refresh_nodes=32` and all lookup nodes/DHTs/followups,
+  instance/worker counts and autotune values remain fixed. Both use immutable
+  release `20260718T075740Z-ac7a239ee04d` and binary SHA prefix
+  `5285bf14754c`.
+- **Timing / order:** both regions start time-aligned, fixed UDP `:21000`, steady
+  96-ID cohorts. SG order `ABBA`; JP `BAAB`. Each block is 10m warm-up + 5m
+  measurement and must contain exactly ten event-time-aligned 30s measurement
+  windows. The first 2m after each restart is explicitly contaminated. Use an
+  isolated frozen oracle baseline and a private overlay per block; never
+  finalize the production oracle during the experiment.
+- **Pairing:** compare only adjacent blocks within a host: SG `AB`,`BA`; JP
+  `BA`,`AB`. Region is a stratum; do not subtract SG from JP or pool their
+  absolute rates. Report all four B−A deltas and log-ratios.
+- **Exposure / funnel:** B active lookup/s must be 1.75–2.15× A while refresh
+  queries stay within ±10%. Follow
+  `lookup_sent → get_peers queued → dial → connect → download → oracle new` and
+  retain announce/get_peers, blacklist and uptime slopes.
+- **Hard stop:** crash/OOM, metadata pause, incomplete ten-window measurement,
+  oracle continuity below 90%, any kernel UDP buffer/DHT/wire-queue loss, RSS
+  above 3.4 GiB, CPU sustained above 190% without throughput gain, or B qdisc
+  drop rate exceeding paired A by 200/min. Infrastructure failures are invalid
+  runs and never cause the order to be silently shifted.
+- **Early stop after first cross-region pair:** stop on any hard gate; stop if
+  both B arms have global-new ≤−5% with no download gain; stop if both B arms
+  fail 1.5× lookup exposure. Otherwise complete both reversed pairs.
+- **Directional retention rule (not a final/stability claim):** at least three
+  of four host-local pairs positive, positive median in each region, stratified
+  median gain ≥8% relative or ≥2 metadata/s absolute, download rate aligned and
+  all resource/drop gates satisfied. A ≤3% combined gain is not worth doubled
+  lookup traffic. Regionally divergent results become a regional hypothesis,
+  never a global promotion.
+- **Rollback:** stop only experiment-owned PIDs, verify `:21000`/`:5070`, retain
+  all runs/overlays/index records without finalizing or deleting them. Restore
+  A using the same port/cohort and immutable release; never rotate identity as
+  part of rollback.
 
 ## Completed screens
 
@@ -90,9 +190,11 @@ Promote or kill each item using the funnel before spending on long confirmation:
    A restart is useful only if global—not process-local—novelty rises enough to
    repay bootstrap time and repeated lookup work.
 
-After short screening, the chosen configuration must pass balanced orders,
-same-arm negative controls, at least six valid treatment pairs, and a 6–12 hour
-steady run.
+After short screening, each retained improvement becomes the next baseline and
+must continue through the unexhausted experiment backlog. Balanced orders and
+same-arm controls are evidence gates during iteration. A 6–12 hour steady run
+belongs to a separate stability phase and requires explicit user authorization;
+it is not an automatic promotion or an indication that optimization is done.
 
 ## Framework refinements
 

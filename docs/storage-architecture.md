@@ -54,37 +54,48 @@ crawler A / crawler B
 
 ### 2.1 当前实现如何承接目标架构
 
-本轮未提交的 exact-authority 改动是可直接部署的过渡底座，不需要等待 archive/Meili/heat 全部完成：
+当前实现已经形成可独立部署的 P0 过渡底座；正式启用仍以故障回归、迁移核对和部署配置审计为门槛，不需要等待 archive/Meili/heat 全部完成：
 
 | 链路 | 当前实现可保留部分 | 下一道正确性边界 |
 |---|---|---|
-| crawler → API | HTTP batch、512 条合批、hash 幂等 | metadata 进入内存 Channel 前先落本地 durable spool |
-| API ingest | 多请求合并为约 5k DB batch；只在 PG commit 后 ACK | 稳定 batch identity 和同事务 `ingest_receipts`，使响应丢失后的 ACK 结果也可重放 |
-| exact dedup | `torrents + rejected_hashes`、启动 exact replay、filter bypass | 版本化 metadata policy/decision；当前 P0 表先保持最小，不在本轮膨胀 |
-| metadata storage | 当前 PG `torrents + torrent_files` 完整承接 normalized metadata | 先保留 1M corpus，再迁 compact catalog + immutable zstd archive |
-| search | Meili 可选、PG fallback | PG 同事务 outbox；轮询 Meili task 到 `succeeded`，Meili 始终可重建 |
+| crawler → API | typed zero-raw segment spool、CRC、持久 epoch/sequence、group fsync、同批重试和严格 ACK 校验 | 在双 crawler 上做固定 treatment 的吞吐/背压 ABBA 后部署 |
+| API ingest | `/batch/durable` 在一个 PG transaction 提交 metadata/decision 和连续 receipt；响应丢失可重放最后批次 | crawler API key 绑定允许的 crawler identity；多 key 轮换 |
+| exact dedup | `torrents + metadata_decisions`、20-byte decision key、同 hash advisory lock；旧 `rejected_hashes` 只服务旧接口 | 清理旧接口/表前先完成兼容迁移和对账 |
+| metadata storage | `normalized/summary/hash_only/reject` 四个闭合 encoding，policy ID 随记录持久化 | 用真实 corpus 测 compact catalog + immutable zstd archive，而非保存 raw |
+| search | 当前查询只走 Meili，PG 按 Meili hash 排名回表；没有 PG 全文 fallback | PG 同事务 outbox；轮询 Meili task 到 `succeeded`，并提供全量重建 |
 | heat | `peer_count` 累计值 | 带 receipt 的 sighting batch + lazy-decay state + 量化 Meili 档位 |
 
-部署顺序必须让“尽快不丢数据”和“极限压缩”解耦：先把两台 crawler 的 normalized metadata 安全落入当前 PG，再用固定 corpus 选择压缩格式和 policy。不能为了等待最终 schema 继续让已抓到的 metadata 只停留在进程内存。
+部署顺序必须让“尽快不丢数据”和“极限压缩”解耦：先让两台 crawler 的四动作 zero-raw record 安全落入当前 PG，再用固定 corpus 选择 archive 格式和继续收紧 policy。不能为了等待最终 schema 继续让已抓到的 metadata 只停留在进程内存。
 
 ### 2.2 Crawler durable spool 与幂等中央 ingest
 
-当前 `walSink` 只在 HTTP 重试失败后追加 JSONL，默认 `metadata-2c4g.json` 又未配置 `wal_dir`；它不能覆盖“下载成功后、第一次 HTTP 发送前进程崩溃”的窗口。追加后也没有 `fdatasync`，并会删除超过 24 小时的文件。因此它是 outage fallback，不是 durable WAL。
+旧 `walSink` 仍只属于 legacy HTTP 路径。生产 durable 模式在 metadata 被标记
+为 remote-known 之前，把 policy 裁决后的 typed record 写入单写者、长度前缀、
+CRC32C segment spool，并满足：
 
-下一版 spool 使用单写者、长度前缀、CRC 的追加 segment，并满足：
-
-- normalized metadata 在 crawler 标记为可丢弃前先进入 spool；按 25–100 ms 或 128–512 条 group commit 执行 `fdatasync`，避免每条同步写拖慢 2C4G crawler。
-- 每个 record/batch 带持久化的 `crawler_id + epoch + sequence`。中央 `ingest_receipts` 以这组三元组唯一，并与 catalog、archive staging/pointer、search outbox 在同一 PG transaction 提交。
+- record 在 crawler 标记为可丢弃前先进入 spool；当前最多 128 条或 25 ms group commit，整批 fsync 后才完成 producer Submit，避免每条同步写拖慢 2C4G crawler。
+- 每个 record/batch 带持久化的 `crawler_id + epoch + sequence`。中央 receipt 以 `(crawler_id, epoch)` 串行锁定并保存最后一个连续批次的 start/end/checksum/ACK；metadata、decision 和 receipt 在同一 PG transaction 提交。
 - 中央响应成功后，crawler 以原子 cursor/manifest 标记已确认；只能删除完全 ACK 的 sealed segment。不得按年龄静默删除，达到磁盘高水位时对 metadata downloader 施加背压并报警。
-- CRC、长度上限和截断尾恢复必须 fail-safe；损坏 record 进入 quarantine/DLQ，不能导致后续完整 record 永久不可读。
+- CRC、长度上限和截断尾恢复 fail-safe：未发布整批通过 durable intent 全量回滚，完整 ACK 才推进删除 cursor；可证明的 torn tail 截断，已提交区 CRC/结构损坏则 fail closed 并保留现场，不猜测跳过字节边界。
 - replay 允许 at-least-once。metadata 由 info hash 幂等；heat 使用独立 receipt，不能因重放翻倍。
 - benchmark sink/oracle 与 production spool 指标分开。性能实验仍以全局 persistent oracle 计数，spool 作为固定 treatment 单独做 AB/BA，不能把重放量计作新 metadata。
 
-建议首版保留现有 HTTP JSON 协议，只替换其前面的持久队列，降低迁移风险；取得 corpus 后再比较 length-prefixed binary/CBOR 与 zstd frame，避免同时改 wire、协议、数据库和 archive。
+wire 继续使用闭合 typed JSON，checksum 覆盖 HTTP body 中 `events` 的精确 JSON
+字节；spool 内部没有 `json.RawMessage` 逃生口，也没有 raw bencode、`pieces` 或
+piece hash 字段。取得 corpus 后再比较 binary/CBOR 与 zstd frame，避免把 durable
+正确性和 archive 压缩实验捆绑。
 
-`ingest_receipts` 最小字段为 `(crawler_id, epoch, sequence)` 主键、`payload_sha256`、accepted/duplicate/error counts 和 committed_at。同一 identity 重试且 payload checksum 相同则返回已保存结果；identity 相同而 checksum 不同必须 `409` 并报警。API key 应绑定允许的 crawler_id，不能接受调用方任意冒充。
+`durable_batch_receipts` 保存 `(crawler_id, epoch)`、最后批次 start/end、
+`payload_sha256`、accepted/duplicate counts 和 committed_at。首次 start 必须为 1，
+后续严格连续；最后批次以相同 identity/checksum 重试时返回已保存结果，gap、
+overlap 或 checksum 冲突返回 `409`。durable route 在 API key 未配置时 fail closed，
+但当前还是一个共享 key；按 crawler identity 绑定 key 是上线公网后的下一安全边界。
 
-当前 `IngestService` 已能把多请求合并到一次 PG commit，但每个请求的 accepted/duplicate 是 commit 后在内存中分配。加入 receipt 时需要把 request ordinal 带进 repository，在**同一事务内**完成 `INSERT ... RETURNING` 的归属和 receipt 写入；不能先 commit metadata、再另开事务补 receipt。
+`DurableIngestService` 不走旧 `IngestService` 的内存 Channel：它对单个最多
+5,000-event 批次做严格结构/字节预算验证，以排序后的 per-infohash advisory lock
+串行化新旧写路径，并在**同一事务内**用 `INSERT ... RETURNING` 计算
+accepted/duplicate、处理 torrent/decision 跨表升级并更新 receipt。Meili 队列只在
+commit 后收到可重建索引任务，不参与权威 ACK。
 
 ## 3. P0 正确性阻断
 
