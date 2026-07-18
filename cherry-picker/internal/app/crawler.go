@@ -1063,6 +1063,51 @@ func (c *autoTuneController) nextAction(now time.Time, paused bool, heapAlloc, p
 	return autoTuneNoop
 }
 
+type wireTuneSample struct {
+	active, minWorkers, maxWorkers int
+	requestDepth, responseDepth    int
+	attempts, dialOK               int64
+	handshakeOK, downloadOK        int64
+	cpuUtil                        float64
+	paused                         bool
+}
+
+// nextWireWorkerTarget keeps CPU saturation as an expansion gate, not a
+// contraction signal. A busy Go scheduler is expected while useful wire work
+// is available; shrinking solely because it is busy creates a positive
+// feedback loop (fewer consumers -> a full request queue -> dropped peers)
+// even when the DHT receive path and the wire funnel are healthy.
+//
+// Contraction remains fail-safe for an explicit metadata pause, a backed-up
+// response consumer, or a demonstrably unproductive dial/handshake funnel.
+func nextWireWorkerTarget(sample wireTuneSample) int {
+	target := sample.active
+	if sample.paused {
+		target = sample.minWorkers
+	} else if sample.responseDepth > sample.active*8 && sample.active > sample.minWorkers {
+		target = sample.active * 3 / 4
+	} else if sample.attempts > 0 {
+		dialRate := float64(sample.dialOK) / float64(sample.attempts)
+		handshakeRate := 0.0
+		if sample.dialOK > 0 {
+			handshakeRate = float64(sample.handshakeOK) / float64(sample.dialOK)
+		}
+
+		switch {
+		case sample.attempts > int64(sample.active*2) &&
+			(dialRate < 0.005 || (sample.dialOK > 32 && handshakeRate < 0.01)):
+			target = sample.active * 3 / 4
+		case sample.cpuUtil > 0.90:
+			// Preserve useful saturated work, but do not add more workers.
+		case sample.requestDepth > sample.active*4 && dialRate >= 0.02 && handshakeRate >= 0.03:
+			target = sample.active + maxInt(16, sample.active/4)
+		case sample.requestDepth > sample.active && sample.downloadOK > int64(maxInt(8, sample.active/2)):
+			target = sample.active + maxInt(8, sample.active/8)
+		}
+	}
+	return clampInt(target, sample.minWorkers, sample.maxWorkers)
+}
+
 func (a *Application) tuneWireWorkers(ctx context.Context, downloader *dht.Wire) {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
@@ -1096,41 +1141,19 @@ func (a *Application) tuneWireWorkers(ctx context.Context, downloader *dht.Wire)
 			prevDownloadOK = downloadOK
 
 			active := downloader.ActiveWorkers()
-			target := active
 			reqDepth := downloader.RequestDepth()
 			respDepth := downloader.ResponseDepth()
 
 			// CPU 利用率（由 autoTuneLoop 采样；autotune 关闭时恒为 0，不影响判断）
 			cpuUtil := float64(a.cpuUtilPct.Load()) / 10_000
 
-			if a.metaPaused.Load() {
-				target = minWorkers
-			} else if cpuUtil > 0.95 && active > minWorkers {
-				// CPU 过载：wire worker 的握手/SHA1/bencode 解析在抢占
-				// UDP 收包和 DHT 处理的 CPU，收缩让位给发现侧
-				target = active * 3 / 4
-			} else if respDepth > active*8 && active > minWorkers {
-				target = active * 3 / 4
-			} else if attemptsDelta > 0 {
-				dialRate := float64(dialOKDelta) / float64(attemptsDelta)
-				handshakeRate := 0.0
-				if dialOKDelta > 0 {
-					handshakeRate = float64(handshakeDelta) / float64(dialOKDelta)
-				}
-
-				switch {
-				case attemptsDelta > int64(active*2) && (dialRate < 0.005 || (dialOKDelta > 32 && handshakeRate < 0.01)):
-					target = active * 3 / 4
-				case cpuUtil > 0.90:
-					// CPU 接近饱和：保持现状，不再扩容
-				case reqDepth > active*4 && dialRate >= 0.02 && handshakeRate >= 0.03:
-					target = active + maxInt(16, active/4)
-				case reqDepth > active && downloadDelta > int64(maxInt(8, active/2)):
-					target = active + maxInt(8, active/8)
-				}
-			}
-
-			target = clampInt(target, minWorkers, maxWorkers)
+			target := nextWireWorkerTarget(wireTuneSample{
+				active: active, minWorkers: minWorkers, maxWorkers: maxWorkers,
+				requestDepth: reqDepth, responseDepth: respDepth,
+				attempts: attemptsDelta, dialOK: dialOKDelta,
+				handshakeOK: handshakeDelta, downloadOK: downloadDelta,
+				cpuUtil: cpuUtil, paused: a.metaPaused.Load(),
+			})
 			if target != active {
 				downloader.SetActiveWorkers(target)
 				a.logger.Printf(
