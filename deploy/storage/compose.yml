@@ -1,0 +1,128 @@
+name: cherry-storage
+
+x-logging: &bounded-logging
+  driver: json-file
+  options:
+    max-size: "20m"
+    max-file: "3"
+
+services:
+  postgres:
+    # PostgreSQL is the searchable-metadata authority. The immutable digest
+    # avoids a tag moving underneath a restore or benchmark.
+    image: postgres:17.10-alpine@sha256:742f40ea20b9ff2ff31db5458d127452988a2164df9e17441e191f3b72252193
+    restart: unless-stopped
+    shm_size: 512m
+    mem_limit: 2560m
+    cpus: "2.5"
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:?set POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER:?set POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+      PGDATA: /var/lib/postgresql/data/pgdata
+    command:
+      - postgres
+      - -c
+      - shared_buffers=768MB
+      - -c
+      - effective_cache_size=2GB
+      - -c
+      - maintenance_work_mem=256MB
+      - -c
+      - work_mem=8MB
+      - -c
+      - max_connections=80
+      - -c
+      - wal_compression=zstd
+      - -c
+      - min_wal_size=512MB
+      - -c
+      - max_wal_size=4GB
+      - -c
+      - checkpoint_completion_target=0.9
+      - -c
+      - random_page_cost=1.1
+      - -c
+      - effective_io_concurrency=200
+    volumes:
+      - ${CHERRY_DATA_ROOT:?set CHERRY_DATA_ROOT}/postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 20s
+    networks: [storage]
+    logging: *bounded-logging
+
+  meilisearch:
+    image: getmeili/meilisearch:v1.45.1@sha256:ac40212f9e5a7526d8007586e3e46fb0441d29dd36c7b02fa2341d2c9a1f6493
+    restart: unless-stopped
+    mem_limit: 2816m
+    cpus: "2.0"
+    environment:
+      MEILI_ENV: production
+      MEILI_MASTER_KEY: ${MEILI_MASTER_KEY:?set MEILI_MASTER_KEY}
+      MEILI_NO_ANALYTICS: "true"
+      # Keep indexing from starving PostgreSQL and interactive search on 4C8G.
+      # S-003 measures this starting point before changing it.
+      MEILI_MAX_INDEXING_MEMORY: 1792MiB
+      MEILI_MAX_INDEXING_THREADS: "1"
+      MEILI_LOG_LEVEL: INFO
+    volumes:
+      - ${CHERRY_DATA_ROOT:?set CHERRY_DATA_ROOT}/meili:/meili_data
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:7700/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 20
+      start_period: 20s
+    networks: [storage]
+    logging: *bounded-logging
+
+  api:
+    build:
+      context: ../../backend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    mem_limit: 1280m
+    cpus: "1.5"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      meilisearch:
+        condition: service_healthy
+    environment:
+      ASPNETCORE_ENVIRONMENT: Production
+      ConnectionStrings__Default: >-
+        Host=postgres;Port=5432;Database=${POSTGRES_DB};Username=${POSTGRES_USER};Password=${POSTGRES_PASSWORD};Pooling=true;Minimum Pool Size=4;Maximum Pool Size=64;Timeout=10;Command Timeout=120
+      ApiKey: ${CHERRY_API_KEY:?set CHERRY_API_KEY}
+      MeiliSearch__Url: http://meilisearch:7700
+      MeiliSearch__ApiKey: ${MEILI_MASTER_KEY:?set MEILI_MASTER_KEY}
+      MeiliSearch__OutboxBatchSize: ${MEILI_OUTBOX_BATCH_SIZE:-500}
+      MeiliSearch__OutboxLeaseSeconds: ${MEILI_OUTBOX_LEASE_SECONDS:-300}
+      MeiliSearch__TaskPollMilliseconds: ${MEILI_TASK_POLL_MS:-250}
+      MeiliSearch__TaskTimeoutSeconds: ${MEILI_TASK_TIMEOUT_SECONDS:-120}
+      MeiliSearch__OutboxIdleMilliseconds: ${MEILI_OUTBOX_IDLE_MS:-2000}
+      Ingest__DedupCapacity: ${CHERRY_DEDUP_CAPACITY:-100000000}
+    volumes:
+      - ${CHERRY_DATA_ROOT:?set CHERRY_DATA_ROOT}/api:/app/data
+    # Deliberately loopback-only. Crawlers reach this through persistent SSH
+    # tunnels, so PostgreSQL, Meili, the API key, and metadata never cross the
+    # public Internet in plaintext.
+    ports:
+      - "127.0.0.1:${CHERRY_API_PORT:-5070}:5070"
+    healthcheck:
+      test: ["CMD-SHELL", "timeout 3 bash -c '</dev/tcp/127.0.0.1/5070' || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    security_opt:
+      - no-new-privileges:true
+    networks: [storage]
+    logging: *bounded-logging
+
+networks:
+  storage:
+    internal: true

@@ -1,0 +1,33 @@
+[Unit]
+Description=Cherry storage SSH tunnel (%i)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/cherry-storage-tunnel/%i
+ExecStart=/usr/bin/ssh -NT \
+  -i /var/lib/cherry-picker/tunnel/storage_ed25519 \
+  -o BatchMode=yes \
+  -o ExitOnForwardFailure=yes \
+  -o ServerAliveInterval=20 \
+  -o ServerAliveCountMax=3 \
+  -o StrictHostKeyChecking=yes \
+  -o UserKnownHostsFile=/etc/cherry-storage-tunnel/known_hosts \
+  -L 127.0.0.1:${LOCAL_PORT}:127.0.0.1:5070 \
+  cherry-tunnel@${STORAGE_HOST}
+Restart=always
+RestartSec=5
+StartLimitIntervalSec=0
+
+# The private key and known_hosts remain readable only by root. The service has
+# no shell session and the storage authorized_key restricts its destination.
+User=root
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadOnlyPaths=/var/lib/cherry-picker/tunnel /etc/cherry-storage-tunnel
+
+[Install]
+WantedBy=multi-user.target
