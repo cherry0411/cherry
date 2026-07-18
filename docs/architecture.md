@@ -1,5 +1,7 @@
 # Cherry DHT 搜索引擎 — 详细架构设计
 
+> 注意：本文保留了早期架构背景，其中关于 lock-free CuckooFilter、GZip 快照和“内存 Channel 即 ACK”的描述已不再代表当前正确性边界。去重权威、durable ACK、升级步骤和存储演进请以 [`storage-architecture.md`](./storage-architecture.md) 为准。
+
 ## 第一章：整体架构
 
 ### 系统定位

@@ -8,148 +8,270 @@ using Microsoft.Extensions.Logging;
 
 namespace Cherry.Application.Services;
 
-public class IngestService : IHostedService
+/// <summary>
+/// Coalesces crawler requests into database batches while preserving a durable
+/// acknowledgement boundary: a request completes only after its torrent rows
+/// and files have committed in the exact store.
+/// </summary>
+public sealed class IngestService : IHostedService
 {
+    private const int MaxDatabaseBatchSize = 5_000;
+    private const int MaxQueuedEvents = 100_000;
+    private const int WorkItemCapacity = 1_024;
+
     private readonly IServiceScopeFactory _scopeFactory;
-    private readonly IDedupFilter _dedup;
     private readonly ILogger<IngestService> _logger;
     private readonly PendingRequestTracker _tracker;
-    private readonly Channel<CrawlerEvent> _channel;
-    private readonly CancellationTokenSource _cts = new();
+    private readonly Channel<IngestWorkItem> _channel;
+    private readonly CancellationTokenSource _stopping = new();
+    private Task? _worker;
+    private int _queuedEventCount;
 
     public IngestService(
         IServiceScopeFactory scopeFactory,
-        IDedupFilter dedup,
         ILogger<IngestService> logger,
         PendingRequestTracker tracker)
     {
         _scopeFactory = scopeFactory;
-        _dedup = dedup;
         _logger = logger;
         _tracker = tracker;
-        _channel = Channel.CreateBounded<CrawlerEvent>(new BoundedChannelOptions(100_000)
+        _channel = Channel.CreateBounded<IngestWorkItem>(new BoundedChannelOptions(WorkItemCapacity)
         {
+            SingleReader = true,
+            SingleWriter = false,
             FullMode = BoundedChannelFullMode.Wait
         });
     }
 
-    public int QueueDepth => _channel.Reader.Count;
+    public int QueueDepth => Volatile.Read(ref _queuedEventCount);
 
     public async Task<BatchIngestResponse> SubmitBatchAsync(BatchIngestRequest request, CancellationToken ct)
     {
-        // 背压保护：channel 超 80% 时拒绝新请求，让爬虫退避
-        if (_channel.Reader.Count > 80_000)
-            return new BatchIngestResponse(0, 0, 0, Backpressure: true);
+        ArgumentNullException.ThrowIfNull(request);
+        if (request.Events is null)
+            return new BatchIngestResponse(0, 0, 1);
 
-        var accepted = 0;
-        var duplicates = 0;
+        var prepared = new List<PreparedEvent>(request.Events.Count);
         var errors = 0;
 
-        foreach (var evt in request.Events)
+        foreach (var crawlerEvent in request.Events)
         {
-            if (evt.Metadata is null)
-                continue;
-
-            if (string.IsNullOrWhiteSpace(evt.InfoHash))
+            if (!TryPrepare(crawlerEvent, out var preparedEvent))
             {
                 errors++;
                 continue;
             }
 
-            if (!_dedup.Add(evt.InfoHash))
-            {
-                duplicates++;
-                continue;
-            }
-
-            await _channel.Writer.WriteAsync(evt, ct);
-            accepted++;
+            prepared.Add(preparedEvent);
         }
 
-        return new BatchIngestResponse(accepted, duplicates, errors);
+        if (prepared.Count == 0)
+            return new BatchIngestResponse(0, 0, errors);
+
+        var reservedDepth = Interlocked.Add(ref _queuedEventCount, prepared.Count);
+        if (reservedDepth > MaxQueuedEvents)
+        {
+            Interlocked.Add(ref _queuedEventCount, -prepared.Count);
+            return new BatchIngestResponse(0, 0, errors, Backpressure: true);
+        }
+
+        var completion = new TaskCompletionSource<BatchIngestResponse>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var workItem = new IngestWorkItem(prepared, errors, completion);
+
+        try
+        {
+            await _channel.Writer.WriteAsync(workItem, ct);
+        }
+        catch
+        {
+            Interlocked.Add(ref _queuedEventCount, -prepared.Count);
+            throw;
+        }
+
+        // Cancellation after enqueue may leave the exact commit in progress.
+        // A client retry is safe because PostgreSQL's unique key is authoritative.
+        return await completion.Task.WaitAsync(ct);
     }
 
     public Task StartAsync(CancellationToken cancellationToken)
     {
-        // Run two concurrent batch-processing workers to keep up under burst load.
-        _ = ProcessLoop(_cts.Token);
-        _ = ProcessLoop(_cts.Token);
+        _worker = ProcessLoopAsync(_stopping.Token);
         return Task.CompletedTask;
     }
 
-    public Task StopAsync(CancellationToken cancellationToken)
+    public async Task StopAsync(CancellationToken cancellationToken)
     {
-        // Signal the ProcessLoop to drain remaining items, then stop.
-        _channel.Writer.Complete();
-        _cts.CancelAfter(TimeSpan.FromSeconds(15)); // hard-stop after 15 s if drain stalls
-        return Task.CompletedTask;
-    }
+        _channel.Writer.TryComplete();
+        if (_worker is null)
+            return;
 
-    private async Task ProcessLoop(CancellationToken ct)
-    {
-        var batch = new List<CrawlerEvent>();
-        const int batchSize = 5000;
-
-        while (await _channel.Reader.WaitToReadAsync(ct))
+        try
         {
-            batch.Clear();
-            while (batch.Count < batchSize && _channel.Reader.TryRead(out var evt))
-                batch.Add(evt);
-
-            if (batch.Count == 0) continue;
-
+            await _worker.WaitAsync(cancellationToken);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            _stopping.Cancel();
             try
             {
-                await ProcessBatchAsync(batch, ct);
+                await _worker;
             }
-            catch (Exception ex)
+            catch (OperationCanceledException)
             {
-                _logger.LogError(ex, "Failed to process batch of {Count} events", batch.Count);
+                // Pending callers are completed with cancellation by the worker.
             }
         }
     }
 
-    private async Task ProcessBatchAsync(List<CrawlerEvent> events, CancellationToken ct)
+    private async Task ProcessLoopAsync(CancellationToken cancellationToken)
+    {
+        try
+        {
+            while (await _channel.Reader.WaitToReadAsync(cancellationToken))
+            {
+                if (!_channel.Reader.TryRead(out var first))
+                    continue;
+
+                var workItems = new List<IngestWorkItem> { first };
+                var eventCount = first.Events.Count;
+
+                // Requests already contain up to 512 events. Drain immediately
+                // available requests to retain the old 5k-row COPY efficiency
+                // without acknowledging any request before the shared commit.
+                while (eventCount < MaxDatabaseBatchSize &&
+                       _channel.Reader.TryRead(out var next))
+                {
+                    workItems.Add(next);
+                    eventCount += next.Events.Count;
+                }
+
+                try
+                {
+                    await ProcessWorkItemsAsync(workItems, cancellationToken);
+                }
+                catch (Exception exception)
+                {
+                    _logger.LogError(exception,
+                        "Exact ingest transaction failed for {Count} events; no successful ACK was returned.",
+                        eventCount);
+                    foreach (var workItem in workItems)
+                        workItem.Completion.TrySetException(exception);
+                }
+                finally
+                {
+                    Interlocked.Add(ref _queuedEventCount, -eventCount);
+                }
+            }
+        }
+        finally
+        {
+            var exception = new OperationCanceledException(
+                "Ingest service stopped before the exact transaction completed.");
+            while (_channel.Reader.TryRead(out var pending))
+            {
+                Interlocked.Add(ref _queuedEventCount, -pending.Events.Count);
+                pending.Completion.TrySetException(exception);
+            }
+        }
+    }
+
+    private async Task ProcessWorkItemsAsync(
+        IReadOnlyList<IngestWorkItem> workItems,
+        CancellationToken cancellationToken)
     {
         await using var scope = _scopeFactory.CreateAsyncScope();
-        var repo = scope.ServiceProvider.GetRequiredService<ITorrentRepository>();
+        var repository = scope.ServiceProvider.GetRequiredService<ITorrentRepository>();
+        var prepared = workItems.SelectMany(item => item.Events).ToList();
+        var torrents = prepared.Select(item => item.Torrent).ToList();
 
-        var torrents = new List<Torrent>();
+        var inserted = await repository.BulkInsertTorrentsAsync(torrents, cancellationToken);
 
-        foreach (var evt in events)
-        {
-            var meta = evt.Metadata!;
-            torrents.Add(new Torrent
-            {
-                InfoHash = evt.InfoHash.ToLowerInvariant(),
-                Name = meta.Name,
-                PieceLength = meta.PieceLength,
-                TotalLength = meta.Length,
-                FileCount = meta.FileCount,
-                IsPrivate = meta.Private,
-                Source = evt.InstanceId.Length > 32 ? evt.InstanceId[..32] : evt.InstanceId,
-                Files = meta.Files.Select(f => new TorrentFile
-                {
-                    PathText = f.PathText,
-                    Length = f.Length
-                }).ToList()
-            });
-        }
-
-        var inserted = await repo.BulkInsertTorrentsAsync(torrents, ct);
-        var sources = events.Select(e => e.InstanceId).Distinct().OrderBy(s => s);
-        _logger.LogInformation("Batch processed: {Total} events → {Inserted} new from [{Sources}]",
-            events.Count, inserted, string.Join(", ", sources));
-
-        // Only hit DB if at least one hash in this batch matches a pending request
+        // Pending-request completion follows the committed torrent transaction.
+        // If this bookkeeping fails, callers receive an error and retry safely.
         if (!_tracker.IsEmpty)
         {
             var pendingHashes = _tracker.Filter(torrents.Select(t => t.InfoHash));
             if (pendingHashes.Count > 0)
             {
-                await repo.MarkRequestsDoneAsync(pendingHashes, ct);
+                await repository.MarkRequestsDoneAsync(pendingHashes, cancellationToken);
                 _tracker.Untrack(pendingHashes);
             }
         }
+
+        var unclaimedInserts = new HashSet<string>(inserted, StringComparer.Ordinal);
+        foreach (var workItem in workItems)
+        {
+            var accepted = 0;
+            foreach (var preparedEvent in workItem.Events)
+            {
+                // Exactly one occurrence claims each INSERT ... RETURNING hash;
+                // all other occurrences are exact duplicates.
+                if (unclaimedInserts.Remove(preparedEvent.Torrent.InfoHash))
+                    accepted++;
+            }
+
+            var duplicates = workItem.Events.Count - accepted;
+            workItem.Completion.TrySetResult(
+                new BatchIngestResponse(accepted, duplicates, workItem.Errors));
+        }
+
+        var sources = prepared
+            .Select(item => item.Torrent.Source)
+            .Where(source => source is not null)
+            .Distinct()
+            .OrderBy(source => source);
+        _logger.LogInformation(
+            "Exact batch committed: {Total} events -> {Inserted} new from [{Sources}]",
+            prepared.Count,
+            inserted.Count,
+            string.Join(", ", sources));
     }
+
+    private static bool TryPrepare(CrawlerEvent? crawlerEvent, out PreparedEvent preparedEvent)
+    {
+        preparedEvent = default;
+        if (crawlerEvent?.Metadata is null ||
+            crawlerEvent.Metadata.Name is null ||
+            crawlerEvent.Metadata.Files is null ||
+            crawlerEvent.Metadata.Files.Any(file => file is null || file.PathText is null) ||
+            string.IsNullOrWhiteSpace(crawlerEvent.InfoHash))
+            return false;
+
+        var infoHash = crawlerEvent.InfoHash.Trim().ToLowerInvariant();
+        if (infoHash.Length != 40 ||
+            !infoHash.All(character => character is >= 'a' and <= 'f' or >= '0' and <= '9'))
+        {
+            return false;
+        }
+
+        var metadata = crawlerEvent.Metadata;
+        var torrent = new Torrent
+        {
+            InfoHash = infoHash,
+            Name = metadata.Name,
+            PieceLength = metadata.PieceLength,
+            TotalLength = metadata.Length,
+            FileCount = metadata.FileCount,
+            IsPrivate = metadata.Private,
+            Source = (crawlerEvent.InstanceId ?? string.Empty) is { Length: > 32 } source
+                ? source[..32]
+                : crawlerEvent.InstanceId ?? string.Empty,
+            Files = metadata.Files.Select(file => new TorrentFile
+            {
+                PathText = file.PathText,
+                Length = file.Length
+            }).ToList()
+        };
+
+        preparedEvent = new PreparedEvent(torrent);
+        return true;
+    }
+
+    private sealed record IngestWorkItem(
+        List<PreparedEvent> Events,
+        int Errors,
+        TaskCompletionSource<BatchIngestResponse> Completion);
+
+    private readonly record struct PreparedEvent(Torrent Torrent);
 }

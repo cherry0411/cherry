@@ -1,3 +1,4 @@
+using System.Runtime.CompilerServices;
 using Cherry.Domain.Entities;
 using Cherry.Domain.Interfaces;
 using Cherry.Infrastructure.Data;
@@ -13,17 +14,25 @@ public class TorrentRepository : ITorrentRepository
     private readonly AppDbContext _db;
     private readonly MeiliIndexQueue? _meiliQueue;
     private readonly MeiliSearchClient? _meiliClient;
+    private readonly IProcessedHashFilter? _processedHashFilter;
 
-    public TorrentRepository(AppDbContext db, MeiliIndexQueue? meiliQueue = null, MeiliSearchClient? meiliClient = null)
+    public TorrentRepository(
+        AppDbContext db,
+        MeiliIndexQueue? meiliQueue = null,
+        MeiliSearchClient? meiliClient = null,
+        IProcessedHashFilter? processedHashFilter = null)
     {
         _db = db;
         _meiliQueue = meiliQueue;
         _meiliClient = meiliClient;
+        _processedHashFilter = processedHashFilter;
     }
 
-    public async Task<long> BulkInsertTorrentsAsync(List<Torrent> torrents, CancellationToken ct = default)
+    public async Task<IReadOnlySet<string>> BulkInsertTorrentsAsync(
+        List<Torrent> torrents,
+        CancellationToken ct = default)
     {
-        if (torrents.Count == 0) return 0;
+        if (torrents.Count == 0) return new HashSet<string>();
 
         // In-memory dedup within the batch
         var seen = new HashSet<string>();
@@ -33,7 +42,12 @@ public class TorrentRepository : ITorrentRepository
             if (seen.Add(t.InfoHash))
                 unique.Add(t);
         }
-        if (unique.Count == 0) return 0;
+        if (unique.Count == 0) return new HashSet<string>();
+
+        // Warm the probabilistic superset before the exact commit. A rollback
+        // can only create harmless false positives; warming after commit would
+        // create a race where a DB row exists while the filter still says no.
+        _processedHashFilter?.RecordCandidates(unique.Select(t => t.InfoHash));
 
         var conn = (NpgsqlConnection)_db.Database.GetDbConnection();
         if (conn.State != System.Data.ConnectionState.Open)
@@ -76,7 +90,39 @@ public class TorrentRepository : ITorrentRepository
             _meiliQueue.Enqueue(indexDocs);
         }
 
-        return insertedHashes.Count;
+        return insertedHashes;
+    }
+
+    public async Task<IReadOnlySet<string>> AddRejectedHashesAsync(
+        IReadOnlyCollection<string> infoHashes,
+        CancellationToken ct = default)
+    {
+        if (infoHashes.Count == 0)
+            return new HashSet<string>();
+
+        var unique = infoHashes.Distinct(StringComparer.Ordinal).ToArray();
+        _processedHashFilter?.RecordCandidates(unique);
+
+        var conn = (NpgsqlConnection)_db.Database.GetDbConnection();
+        if (conn.State != System.Data.ConnectionState.Open)
+            await conn.OpenAsync(ct);
+
+        await using var cmd = new NpgsqlCommand(
+            """
+            INSERT INTO rejected_hashes (info_hash)
+            SELECT decode(hash, 'hex')
+              FROM unnest(@hashes::text[]) AS t(hash)
+            ON CONFLICT (info_hash) DO NOTHING
+            RETURNING encode(info_hash, 'hex')
+            """, conn);
+        cmd.Parameters.AddWithValue("hashes", unique);
+
+        var inserted = new HashSet<string>(StringComparer.Ordinal);
+        await using var reader = await cmd.ExecuteReaderAsync(ct);
+        while (await reader.ReadAsync(ct))
+            inserted.Add(reader.GetString(0));
+
+        return inserted;
     }
 
     private static async Task<HashSet<string>> InsertTorrentsAsync(
@@ -215,6 +261,57 @@ public class TorrentRepository : ITorrentRepository
             .Where(t => hashes.Contains(t.InfoHash))
             .Select(t => t.InfoHash)
             .ToListAsync(ct);
+    }
+
+    public async Task<List<string>> CheckProcessedAsync(List<string> hashes, CancellationToken ct = default)
+    {
+        if (hashes.Count == 0)
+            return [];
+
+        var conn = (NpgsqlConnection)_db.Database.GetDbConnection();
+        if (conn.State != System.Data.ConnectionState.Open)
+            await conn.OpenAsync(ct);
+
+        await using var cmd = new NpgsqlCommand(
+            """
+            SELECT t.info_hash
+              FROM torrents AS t
+             WHERE t.info_hash = ANY(@hashes)
+            UNION
+            SELECT encode(r.info_hash, 'hex')
+              FROM rejected_hashes AS r
+              JOIN unnest(@hashes::text[]) AS h(hash)
+                ON r.info_hash = decode(h.hash, 'hex')
+            """, conn);
+        cmd.Parameters.AddWithValue("hashes", hashes.ToArray());
+
+        var processed = new List<string>();
+        await using var reader = await cmd.ExecuteReaderAsync(ct);
+        while (await reader.ReadAsync(ct))
+            processed.Add(reader.GetString(0));
+
+        return processed;
+    }
+
+    public async IAsyncEnumerable<string> StreamProcessedHashesAsync(
+        [EnumeratorCancellation] CancellationToken ct = default)
+    {
+        var conn = (NpgsqlConnection)_db.Database.GetDbConnection();
+        if (conn.State != System.Data.ConnectionState.Open)
+            await conn.OpenAsync(ct);
+
+        await using var cmd = new NpgsqlCommand(
+            """
+            SELECT info_hash FROM torrents
+            UNION ALL
+            SELECT encode(info_hash, 'hex') FROM rejected_hashes
+            """, conn);
+        await using var reader = await cmd.ExecuteReaderAsync(
+            System.Data.CommandBehavior.SequentialAccess,
+            ct);
+
+        while (await reader.ReadAsync(ct))
+            yield return reader.GetString(0);
     }
 
     public async Task<List<Torrent>> GetRecentAsync(int count, CancellationToken ct = default)

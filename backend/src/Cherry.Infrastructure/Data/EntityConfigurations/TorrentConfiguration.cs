@@ -22,7 +22,11 @@ public class TorrentConfiguration : IEntityTypeConfiguration<Torrent>
         builder.Property(x => x.PeerCount).HasColumnName("peer_count").HasDefaultValue(0);
         builder.Property(x => x.PeerUpdatedAt).HasColumnName("peer_updated_at");
         builder.Property(x => x.CreatedAt).HasColumnName("created_at").HasDefaultValueSql("NOW()");
-        builder.Property(x => x.UpdatedAt).HasColumnName("updated_at");
+        // Keep the runtime model aligned with the initial migration/model
+        // snapshot so automatic migrations do not fail pending-model validation.
+        builder.Property(x => x.UpdatedAt)
+            .HasColumnName("updated_at")
+            .HasDefaultValueSql("NOW()");
 
         builder.HasIndex(x => x.CreatedAt).HasDatabaseName("idx_torrents_created");
         builder.HasIndex(x => x.PeerCount).HasDatabaseName("idx_torrents_peer_count");

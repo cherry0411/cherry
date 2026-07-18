@@ -6,7 +6,6 @@ using Cherry.Infrastructure.Dedup;
 using Cherry.Infrastructure.Repositories;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.OpenApi;
-using Npgsql;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -39,13 +38,26 @@ if (!string.IsNullOrWhiteSpace(meiliUrl))
 
 // Core services
 var dedupPath = Path.Combine(builder.Environment.ContentRootPath, "data", "cuckoo.dat");
-var dedup = new CuckooFilter(capacity: 100_000_000, persistPath: dedupPath);
-builder.Services.AddSingleton<IDedupFilter>(dedup);
-
 var rejectedPath = Path.Combine(builder.Environment.ContentRootPath, "data", "rejected.dat");
-var rejectedStore = new RejectedHashStore(persistPath: rejectedPath);
-builder.Services.AddSingleton<IRejectedHashStore>(rejectedStore);
-builder.Services.AddSingleton(rejectedStore); // for direct Save() on shutdown
+var dedupCapacity = builder.Configuration.GetValue<long?>("Ingest:DedupCapacity") ?? 100_000_000;
+
+// Production deliberately does not trust snapshots after a crash. The hosted
+// coordinator rebuilds this empty filter from PostgreSQL before enabling it.
+var dedup = new CuckooFilter(
+    capacity: dedupCapacity,
+    persistPath: dedupPath,
+    loadPersistedSnapshot: false);
+builder.Services.AddSingleton<IDedupFilter>(dedup);
+builder.Services.AddSingleton(sp => new ProcessedHashFilter(
+    dedup,
+    sp.GetRequiredService<IServiceScopeFactory>(),
+    sp.GetRequiredService<ILogger<ProcessedHashFilter>>(),
+    dedupPath,
+    rejectedPath));
+builder.Services.AddSingleton<IProcessedHashFilter>(sp =>
+    sp.GetRequiredService<ProcessedHashFilter>());
+builder.Services.AddHostedService(sp =>
+    sp.GetRequiredService<ProcessedHashFilter>());
 builder.Services.AddSingleton<Cherry.Application.Services.PendingRequestTracker>();
 builder.Services.AddScoped<ITorrentRepository, TorrentRepository>();
 builder.Services.AddScoped<SearchService>();
@@ -98,10 +110,6 @@ app.Use(async (context, next) =>
     await next();
 });
 
-// Persist CuckooFilter and RejectedHashStore on graceful shutdown
-app.Lifetime.ApplicationStopping.Register(() => dedup.Save());
-app.Lifetime.ApplicationStopping.Register(() => rejectedStore.Save());
-
 // Auto-apply EF Core migrations and ensure pg_trgm extension
 await using (var scope = app.Services.CreateAsyncScope())
 {
@@ -110,18 +118,7 @@ await using (var scope = app.Services.CreateAsyncScope())
     await db.Database.ExecuteSqlRawAsync("CREATE EXTENSION IF NOT EXISTS pg_trgm");
     var pending = await db.Database.GetPendingMigrationsAsync();
     if (pending.Any())
-    {
-        try { await db.Database.MigrateAsync(); }
-        catch (PostgresException ex) when (ex.SqlState == "42P07")
-        {
-            // Tables already exist from manual creation — record all pending migrations
-            foreach (var migration in pending)
-            {
-                await db.Database.ExecuteSqlRawAsync(
-                    $"INSERT INTO \"__EFMigrationsHistory\" VALUES ('{migration}', '10.0.0') ON CONFLICT DO NOTHING");
-            }
-        }
-    }
+        await db.Database.MigrateAsync();
 }
 
 // Init Meilisearch index settings
@@ -190,7 +187,12 @@ TorrentEndpoints.Map(app);
 StatsEndpoints.Map(app);
 
 // Health check
-app.MapGet("/health", () => Results.Ok(new { status = "healthy", time = DateTime.UtcNow }))
+app.MapGet("/health", (IProcessedHashFilter processedHashFilter) => Results.Ok(new
+    {
+        status = "healthy",
+        processed_hash_fast_path_ready = processedHashFilter.IsReady,
+        time = DateTime.UtcNow
+    }))
     .WithTags("Health");
 
 await app.RunAsync();

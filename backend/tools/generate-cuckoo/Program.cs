@@ -20,30 +20,46 @@ class Program
 
         Console.WriteLine($"Connecting to PG and building cuckoo filter -> {outPath} (capacity={capacity})");
 
-        var filter = new CuckooFilter(capacity: capacity, persistPath: outPath);
-
-        // If file exists, we still recreate from DB; clear in-memory buckets by creating a fresh instance
-        // The constructor may have loaded existing data; to ensure fresh, create a new empty filter if file exists
-        if (System.IO.File.Exists(outPath))
-        {
-            filter = new CuckooFilter(capacity: capacity, persistPath: outPath);
-            // we'll overwrite later via Save
-        }
+        // This is an exact rebuild tool: never trust or merge an existing
+        // snapshot (including the unsupported legacy gzip format).
+        using var filter = new CuckooFilter(
+            capacity: capacity,
+            persistPath: outPath,
+            loadPersistedSnapshot: false);
 
         await using var conn = new NpgsqlConnection(connStr);
         await conn.OpenAsync();
 
-        // Stream all info_hash rows
-        await using (var cmd = new NpgsqlCommand("SELECT info_hash FROM torrents", conn))
+        // Stream the complete exact processed-hash authority. A snapshot that
+        // omitted rejected hashes could only be used after another full replay;
+        // including both tables keeps this diagnostic/offline tool honest.
+        await using (var cmd = new NpgsqlCommand(
+                         """
+                         SELECT info_hash FROM torrents
+                         UNION ALL
+                         SELECT encode(info_hash, 'hex') FROM rejected_hashes
+                         """,
+                         conn))
         await using (var reader = await cmd.ExecuteReaderAsync())
         {
             long count = 0;
+            long representedByCollision = 0;
             while (await reader.ReadAsync())
             {
                 var ih = reader.GetString(0);
                 if (!string.IsNullOrEmpty(ih))
                 {
-                    filter.Add(ih.ToLowerInvariant());
+                    var normalized = ih.ToLowerInvariant();
+                    if (!filter.Add(normalized))
+                    {
+                        if (!filter.MightContain(normalized))
+                        {
+                            throw new InvalidOperationException(
+                                $"Cuckoo filter capacity exhausted after {count} exact hashes; snapshot was not saved.");
+                        }
+
+                        representedByCollision++;
+                    }
                     count++;
                     if ((count & 0x3FFF) == 0) // log every 16384
                     {
@@ -51,7 +67,8 @@ class Program
                     }
                 }
             }
-            Console.WriteLine($"Total hashes processed: {count}");
+            Console.WriteLine(
+                $"Total hashes processed: {count} ({representedByCollision} represented by fingerprint collision)");
         }
 
         Console.WriteLine("Saving cuckoo filter to disk...");

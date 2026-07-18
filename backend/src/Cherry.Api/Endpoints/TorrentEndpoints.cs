@@ -70,7 +70,7 @@ public static class TorrentEndpoints
             .WithName("RejectHashes")
             .WithSummary("标记infohash为已过滤")
             .WithDescription("POST [\"a1\",\"b2\",...] — marks hashes as rejected by crawler filter rules. " +
-                             "Recorded in a dedicated filter so future /check calls return them as already processed, " +
+                             "Committed to the compact exact rejected-hash store so future /check calls return them as already processed, " +
                              "preventing unnecessary re-crawling.")
             .Produces(200)
             .Produces(400);
@@ -103,7 +103,6 @@ public static class TorrentEndpoints
     private static async Task<IResult> UploadTorrentAsync(
         HttpRequest request,
         ITorrentRepository repo,
-        IDedupFilter dedup,
         CancellationToken ct)
     {
         if (!request.HasFormContentType || request.Form.Files.Count == 0)
@@ -118,9 +117,6 @@ public static class TorrentEndpoints
             return Results.BadRequest("Invalid torrent file");
 
         var infoHash = ComputeInfoHash(data);
-        if (!dedup.Add(infoHash))
-            return Results.Ok(new { info_hash = infoHash, status = "duplicate" });
-
         var name = info.GetValueOrDefault("name.utf-8") as byte[] ?? info.GetValueOrDefault("name") as byte[];
         if (name is null) return Results.BadRequest("No name in torrent");
         var nameStr = Encoding.UTF8.GetString(name).Trim();
@@ -166,8 +162,9 @@ public static class TorrentEndpoints
                 Files = files
             }
         };
-        await repo.BulkInsertTorrentsAsync(torrents, ct);
-        return Results.Ok(new { info_hash = infoHash, name = nameStr, files = files.Count, status = "added" });
+        var inserted = await repo.BulkInsertTorrentsAsync(torrents, ct);
+        var status = inserted.Contains(infoHash) ? "added" : "duplicate";
+        return Results.Ok(new { info_hash = infoHash, name = nameStr, files = files.Count, status });
     }
 
     private static string ComputeInfoHash(byte[] torrentData)
@@ -387,7 +384,8 @@ public static class TorrentEndpoints
             return Results.Ok(Array.Empty<string>());
 
         var candidates = hashes
-            .Select(h => h.ToLowerInvariant())
+            .Where(hash => hash is not null)
+            .Select(hash => hash.ToLowerInvariant())
             .Where(h => h.Length == 40 && h.All(c => c is >= 'a' and <= 'f' or >= '0' and <= '9'))
             .Distinct()
             .ToList();
@@ -399,21 +397,28 @@ public static class TorrentEndpoints
         return Results.Ok(existing);
     }
 
-    private static IResult RejectHashesAsync(
+    private static async Task<IResult> RejectHashesAsync(
         [FromBody] List<string>? hashes,
-        IRejectedHashStore rejectedStore)
+        ITorrentRepository repository,
+        CancellationToken ct)
     {
         if (hashes is null || hashes.Count == 0)
             return Results.Ok();
 
-        foreach (var h in hashes)
+        var valid = hashes
+            .Where(hash => hash is not null)
+            .Select(hash => hash.ToLowerInvariant())
+            .Where(hash => hash.Length == 40 &&
+                           hash.All(character => character is >= 'a' and <= 'f' or >= '0' and <= '9'))
+            .Distinct(StringComparer.Ordinal)
+            .ToArray();
+
+        var inserted = await repository.AddRejectedHashesAsync(valid, ct);
+        return Results.Ok(new
         {
-            if (h is null) continue;
-            var clean = h.ToLowerInvariant();
-            if (clean.Length == 40 && clean.All(c => c is >= 'a' and <= 'f' or >= '0' and <= '9'))
-                rejectedStore.Add(clean);
-        }
-        return Results.Ok();
+            accepted = inserted.Count,
+            duplicates = valid.Length - inserted.Count
+        });
     }
 
     private static async Task<IResult> GetRecentAsync(
@@ -429,7 +434,7 @@ public static class TorrentEndpoints
         IngestService ingestService,
         CancellationToken ct)
     {
-        if (request.Events.Count == 0)
+        if (request.Events is null || request.Events.Count == 0)
             return Results.BadRequest(new { error = "No events provided" });
 
         var result = await ingestService.SubmitBatchAsync(request, ct);
