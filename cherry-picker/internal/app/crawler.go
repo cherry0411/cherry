@@ -12,6 +12,7 @@ package app
 import (
 	"bytes"
 	"context"
+	cryptorand "crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -110,6 +111,10 @@ type runtimeStats struct {
 	activeLookupsQueued     atomic.Uint64
 	activeLookupsDropped    atomic.Uint64
 	activeLookupsSent       atomic.Uint64
+	sampleQueriesSent       atomic.Uint64
+	sampleResponses         atomic.Uint64
+	sampleHashesReceived    atomic.Uint64
+	sampleHashesQueued      atomic.Uint64
 }
 
 type statsSnapshot struct {
@@ -127,6 +132,10 @@ type statsSnapshot struct {
 	activeLookupsQueued     uint64
 	activeLookupsDropped    uint64
 	activeLookupsSent       uint64
+	sampleQueriesSent       uint64
+	sampleResponses         uint64
+	sampleHashesReceived    uint64
+	sampleHashesQueued      uint64
 	metadataEventsSent      uint64
 	metadataEventsDropped   uint64
 	metadataEventsDeduped   uint64
@@ -138,6 +147,7 @@ type statsSnapshot struct {
 	dhtPacketDecodeErrors   uint64
 	dhtBytesReceived        uint64
 	dhtBytesSent            uint64
+	dhtFollowupsSent        uint64
 	wireDialAttempts        int64
 	wireDialOK              int64
 	wireDialFailed          int64
@@ -237,6 +247,7 @@ func (a *Application) Run(ctx context.Context) error {
 	checkQueue := make(chan string, 16_384)
 	go a.runCheckLoop(ctx, checkQueue, stats)
 	lookupQueue := make(chan string, a.cfg.Discovery.LookupQueue)
+	sampleLookupQueue := make(chan string, a.cfg.Discovery.LookupQueue)
 
 	// peer wire metadata 下载器
 	downloader := dht.NewWire(a.cfg.Metadata.BlackListSize, a.cfg.Metadata.RequestQueueSize, a.cfg.Metadata.WorkerQueueSize)
@@ -251,8 +262,20 @@ func (a *Application) Run(ctx context.Context) error {
 	onGetPeers := func(infoHash, ip string, port int) {
 		now := time.Now().UTC()
 		ihHex := hex.EncodeToString([]byte(infoHash))
-		a.submitInfohashEvent(events, ihHex, ip, port, "get_peers", stats, now)
-		a.queueActiveLookup(lookupQueue, ihHex, stats)
+		if a.cfg.Role != "metadata" {
+			a.submitInfohashEvent(events, ihHex, ip, port, "get_peers", stats, now)
+		}
+		a.queueActiveLookup(lookupQueue, ihHex, "lookup|", stats)
+	}
+	onSampleInfoHashes := func(samples string) {
+		stats.sampleResponses.Add(1)
+		stats.sampleHashesReceived.Add(uint64(len(samples) / 20))
+		for i := 0; i+20 <= len(samples); i += 20 {
+			ihHex := hex.EncodeToString([]byte(samples[i : i+20]))
+			if a.queueActiveLookup(sampleLookupQueue, ihHex, "sample|", stats) {
+				stats.sampleHashesQueued.Add(1)
+			}
+		}
 	}
 	onGetPeersResponse := func(infoHash string, peer *dht.Peer) {
 		now := time.Now().UTC()
@@ -290,9 +313,11 @@ func (a *Application) Run(ctx context.Context) error {
 		dhtCfg.PacketReadWorkers = a.cfg.Discovery.ReadWorkers
 		dhtCfg.MaxNodes = a.cfg.Discovery.MaxNodes
 		dhtCfg.RefreshNodeNum = a.cfg.Discovery.RefreshNodes
+		dhtCfg.SpreadFollowups = a.cfg.Discovery.LookupSpread
 		dhtCfg.NodeIDFile = a.nodeIDPath(i)
 		dhtCfg.OnGetPeers = onGetPeers
 		dhtCfg.OnGetPeersResponse = onGetPeersResponse
+		dhtCfg.OnSampleInfoHashes = onSampleInfoHashes
 		dhtCfg.OnAnnouncePeer = onAnnouncePeer
 		d := dht.New(dhtCfg)
 		a.dhts = append(a.dhts, d)
@@ -303,7 +328,10 @@ func (a *Application) Run(ctx context.Context) error {
 		}(addr, d)
 	}
 	if a.cfg.Metadata.Enabled && a.cfg.Discovery.ActiveLookup {
-		go a.runActiveLookupLoop(ctx, lookupQueue, stats)
+		go a.runActiveLookupLoop(ctx, lookupQueue, sampleLookupQueue, stats)
+		if a.cfg.Discovery.SampleInfohashes && a.cfg.Discovery.Mode == "crawl" {
+			go a.runSampleInfohashesLoop(ctx, stats)
+		}
 	}
 
 	// GC 策略：软上限设为探测到的内存上限（cgroup/物理内存的 70%），
@@ -339,25 +367,27 @@ func (a *Application) Run(ctx context.Context) error {
 	}
 }
 
-func (a *Application) queueActiveLookup(queue chan<- string, infoHash string, stats *runtimeStats) {
+func (a *Application) queueActiveLookup(queue chan<- string, infoHash, dedupePrefix string, stats *runtimeStats) bool {
 	if !a.cfg.Metadata.Enabled || !a.cfg.Discovery.ActiveLookup || a.remoteKnown.ContainsAndTouch(infoHash) {
-		return
+		return false
 	}
 	// Prefix keeps these keys distinct from the source/peer keys that share the
 	// same bounded LRU in discovery and combined modes.
-	if !a.infohashSeen.Set("lookup|" + infoHash) {
-		return
+	if !a.infohashSeen.Set(dedupePrefix + infoHash) {
+		return false
 	}
 	select {
 	case queue <- infoHash:
 		stats.activeLookupsQueued.Add(1)
+		return true
 	default:
 		stats.activeLookupsDropped.Add(1)
+		return false
 	}
 }
 
-func (a *Application) runActiveLookupLoop(ctx context.Context, queue <-chan string, stats *runtimeStats) {
-	rate := a.cfg.Discovery.LookupRate
+func (a *Application) runSampleInfohashesLoop(ctx context.Context, stats *runtimeStats) {
+	rate := a.cfg.Discovery.SampleRate
 	interval := time.Second / time.Duration(rate)
 	if interval < time.Millisecond {
 		interval = time.Millisecond
@@ -369,24 +399,89 @@ func (a *Application) runActiveLookupLoop(ctx context.Context, queue <-chan stri
 		select {
 		case <-ctx.Done():
 			return
-		case infoHash := <-queue:
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-			}
-			if len(a.dhts) == 0 || a.remoteKnown.ContainsAndTouch(infoHash) {
+		case <-ticker.C:
+			if len(a.dhts) == 0 {
 				continue
 			}
-			count := min(a.cfg.Discovery.LookupDHTs, len(a.dhts))
-			for i := 0; i < count; i++ {
-				d := a.dhts[(cursor+i)%len(a.dhts)]
-				if d.GetPeersLimit(infoHash, a.cfg.Discovery.LookupNodes) == nil {
-					stats.activeLookupsSent.Add(1)
+			var target [20]byte
+			if _, err := cryptorand.Read(target[:]); err != nil {
+				continue
+			}
+			d := a.dhts[cursor%len(a.dhts)]
+			cursor++
+			sent, err := d.SampleInfohashesLimit(string(target[:]), 1)
+			if err == nil && sent > 0 {
+				stats.sampleQueriesSent.Add(uint64(sent))
+			}
+		}
+	}
+}
+
+func (a *Application) runActiveLookupLoop(ctx context.Context, priority, background <-chan string, stats *runtimeStats) {
+	rate := a.cfg.Discovery.LookupRate
+	interval := time.Second / time.Duration(rate)
+	if interval < time.Millisecond {
+		interval = time.Millisecond
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	var cursor atomic.Uint64
+	var workers sync.WaitGroup
+	for range a.cfg.Discovery.LookupWorkers {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			for {
+				infoHash, ok := nextActiveLookup(ctx, priority, background)
+				if !ok {
+					return
+				}
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+				}
+				if len(a.dhts) == 0 || a.remoteKnown.ContainsAndTouch(infoHash) {
+					continue
+				}
+				count := min(a.cfg.Discovery.LookupDHTs, len(a.dhts))
+				start := int(cursor.Add(uint64(count)) - uint64(count))
+				for i := 0; i < count; i++ {
+					d := a.dhts[(start+i)%len(a.dhts)]
+					var err error
+					if a.cfg.Discovery.LookupFollowups > 0 {
+						err = d.GetPeersIterativeLimit(infoHash, a.cfg.Discovery.LookupNodes, a.cfg.Discovery.LookupFollowups)
+					} else {
+						err = d.GetPeersLimit(infoHash, a.cfg.Discovery.LookupNodes)
+					}
+					if err == nil {
+						stats.activeLookupsSent.Add(1)
+					}
 				}
 			}
-			cursor = (cursor + count) % len(a.dhts)
-		}
+		}()
+	}
+	<-ctx.Done()
+	workers.Wait()
+}
+
+// nextActiveLookup gives hashes observed in live get_peers traffic strict
+// preference over BEP 51 samples. Sampling can consume otherwise-idle lookup
+// capacity without pushing fresher, higher-conversion work to the back of a
+// shared FIFO.
+func nextActiveLookup(ctx context.Context, priority, background <-chan string) (string, bool) {
+	select {
+	case infoHash := <-priority:
+		return infoHash, true
+	default:
+	}
+	select {
+	case <-ctx.Done():
+		return "", false
+	case infoHash := <-priority:
+		return infoHash, true
+	case infoHash := <-background:
+		return infoHash, true
 	}
 }
 
@@ -1067,6 +1162,10 @@ func (a *Application) emitStats(ctx context.Context, events chan<- pipeline.Even
 				activeLookupsQueued:     stats.activeLookupsQueued.Load(),
 				activeLookupsDropped:    stats.activeLookupsDropped.Load(),
 				activeLookupsSent:       stats.activeLookupsSent.Load(),
+				sampleQueriesSent:       stats.sampleQueriesSent.Load(),
+				sampleResponses:         stats.sampleResponses.Load(),
+				sampleHashesReceived:    stats.sampleHashesReceived.Load(),
+				sampleHashesQueued:      stats.sampleHashesQueued.Load(),
 				metadataEventsSent:      stats.metadataEventsSent.Load(),
 				metadataEventsDropped:   stats.metadataEventsDropped.Load(),
 				metadataEventsDeduped:   stats.metadataEventsDeduped.Load(),
@@ -1078,6 +1177,7 @@ func (a *Application) emitStats(ctx context.Context, events chan<- pipeline.Even
 				dhtPacketDecodeErrors:   packetStats.DecodeErrors,
 				dhtBytesReceived:        packetStats.BytesReceived,
 				dhtBytesSent:            packetStats.BytesSent,
+				dhtFollowupsSent:        packetStats.FollowupsSent,
 				wireDialAttempts:        downloader.Stats.DialAttempts.Load(),
 				wireDialOK:              downloader.Stats.DialOK.Load(),
 				wireDialFailed:          downloader.Stats.DialFailed.Load(),
@@ -1112,6 +1212,10 @@ func (a *Application) emitStats(ctx context.Context, events chan<- pipeline.Even
 					"active_lookups_queued":     current.activeLookupsQueued,
 					"active_lookups_dropped":    current.activeLookupsDropped,
 					"active_lookups_sent":       current.activeLookupsSent,
+					"sample_queries_sent":       current.sampleQueriesSent,
+					"sample_responses":          current.sampleResponses,
+					"sample_hashes_received":    current.sampleHashesReceived,
+					"sample_hashes_queued":      current.sampleHashesQueued,
 					"metadata_events_sent":      current.metadataEventsSent,
 					"metadata_events_dropped":   current.metadataEventsDropped,
 					"metadata_events_deduped":   current.metadataEventsDeduped,
@@ -1123,6 +1227,7 @@ func (a *Application) emitStats(ctx context.Context, events chan<- pipeline.Even
 					"dht_packet_decode_errors":  current.dhtPacketDecodeErrors,
 					"dht_bytes_received":        current.dhtBytesReceived,
 					"dht_bytes_sent":            current.dhtBytesSent,
+					"dht_followups_sent":        current.dhtFollowupsSent,
 					"wire_dial_attempts":        uint64(current.wireDialAttempts),
 					"wire_dial_ok":              uint64(current.wireDialOK),
 					"wire_dial_failed":          uint64(current.wireDialFailed),
@@ -1143,7 +1248,7 @@ func (a *Application) logRuntimeDelta(current, previous statsSnapshot) {
 	netInKBps := (current.dhtBytesReceived - previous.dhtBytesReceived) / 1024 / interval
 	netOutKBps := (current.dhtBytesSent - previous.dhtBytesSent) / 1024 / interval
 	a.logger.Printf(
-		"runtime 30s: dht_recv=%d handled=%d dropped=%d decode_err=%d net_in=%dKB/s net_out=%dKB/s lookup_queue=%d lookup_drop=%d lookup_sent=%d peer_sent=%d peer_drop=%d peer_dedup=%d meta_req=%d meta_req_dedup=%d meta_sent=%d meta_drop=%d meta_dedup=%d meta_filtered=%d check_drop=%d paused=%v wire_dial=%d wire_conn=%d wire_dial_fail=%d wire_hs=%d wire_hs_fail=%d wire_ok=%d wire_dl_fail=%d wire_bl=%d",
+		"runtime 30s: dht_recv=%d handled=%d dropped=%d decode_err=%d net_in=%dKB/s net_out=%dKB/s lookup_queue=%d lookup_drop=%d lookup_sent=%d follow_sent=%d sample_q=%d sample_resp=%d sample_hash=%d sample_unique=%d peer_sent=%d peer_drop=%d peer_dedup=%d meta_req=%d meta_req_dedup=%d meta_sent=%d meta_drop=%d meta_dedup=%d meta_filtered=%d check_drop=%d paused=%v wire_dial=%d wire_conn=%d wire_dial_fail=%d wire_hs=%d wire_hs_fail=%d wire_ok=%d wire_dl_fail=%d wire_bl=%d",
 		current.dhtPacketsReceived-previous.dhtPacketsReceived,
 		current.dhtPacketsHandled-previous.dhtPacketsHandled,
 		current.dhtPacketsDropped-previous.dhtPacketsDropped,
@@ -1153,6 +1258,11 @@ func (a *Application) logRuntimeDelta(current, previous statsSnapshot) {
 		current.activeLookupsQueued-previous.activeLookupsQueued,
 		current.activeLookupsDropped-previous.activeLookupsDropped,
 		current.activeLookupsSent-previous.activeLookupsSent,
+		current.dhtFollowupsSent-previous.dhtFollowupsSent,
+		current.sampleQueriesSent-previous.sampleQueriesSent,
+		current.sampleResponses-previous.sampleResponses,
+		current.sampleHashesReceived-previous.sampleHashesReceived,
+		current.sampleHashesQueued-previous.sampleHashesQueued,
 		current.peerEventsSent-previous.peerEventsSent,
 		current.peerEventsDropped-previous.peerEventsDropped,
 		current.peerEventsDeduped-previous.peerEventsDeduped,
@@ -1366,6 +1476,7 @@ func (a *Application) aggregatePacketStats() dht.PacketStats {
 		agg.DecodeErrors += ps.DecodeErrors
 		agg.BytesReceived += ps.BytesReceived
 		agg.BytesSent += ps.BytesSent
+		agg.FollowupsSent += ps.FollowupsSent
 	}
 	return agg
 }
@@ -1481,25 +1592,26 @@ func normalizeMetadata(data []byte) (*pipeline.Metadata, error) {
 			if !ok {
 				continue
 			}
+			path := pathParts(item)
+			if len(path) == 0 {
+				continue
+			}
 			entry := pipeline.MetadataFile{}
 			if length, ok := asInt64(item["length"]); ok {
 				entry.Length = length
 			}
-			if path := pathParts(item); len(path) > 0 {
-				entry.Path = path
-				clean := make([]string, 0, len(path))
-				for _, p := range path {
-					p = fixEncoding(p)
-					if p != "" && !isPaddingFile(p) {
-						clean = append(clean, p)
-					}
+			clean := make([]string, 0, len(path))
+			for _, p := range path {
+				p = fixEncoding(p)
+				if p != "" && !isPaddingFile(p) {
+					clean = append(clean, p)
 				}
-				if len(clean) == 0 {
-					continue
-				}
-				entry.Path = clean
-				entry.PathText = filepath.ToSlash(filepath.Join(clean...))
 			}
+			if len(clean) == 0 {
+				continue
+			}
+			entry.Path = clean
+			entry.PathText = filepath.ToSlash(filepath.Join(clean...))
 			metadata.Files = append(metadata.Files, entry)
 		}
 	}

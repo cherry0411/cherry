@@ -1,4 +1,4 @@
-﻿package app
+package app
 
 import (
 	"io"
@@ -124,6 +124,44 @@ func TestNormalizeMetadataSingleFile(t *testing.T) {
 	}
 	if metadata.Files[0].Length != 4865957888 {
 		t.Fatalf("File.Length = %d, want 4865957888", metadata.Files[0].Length)
+	}
+}
+
+func TestNormalizeMetadataSkipsFilesWithoutUsablePaths(t *testing.T) {
+	data := []byte(dht.Encode(map[string]interface{}{
+		"files": []interface{}{
+			map[string]interface{}{"length": 99},
+			map[string]interface{}{
+				"length": 7,
+				"path":   []interface{}{"release-name", "file.txt"},
+			},
+		},
+	}))
+
+	metadata, err := normalizeMetadata(data)
+	if err != nil {
+		t.Fatalf("normalizeMetadata() error = %v", err)
+	}
+	if metadata.Name != "release-name" {
+		t.Fatalf("Name = %q, want release-name", metadata.Name)
+	}
+	if metadata.Length != 7 {
+		t.Fatalf("Length = %d, want 7", metadata.Length)
+	}
+	if metadata.FileCount != 1 {
+		t.Fatalf("FileCount = %d, want 1", metadata.FileCount)
+	}
+}
+
+func TestNormalizeMetadataRejectsOnlyFilesWithoutPaths(t *testing.T) {
+	data := []byte(dht.Encode(map[string]interface{}{
+		"files": []interface{}{
+			map[string]interface{}{"length": 99},
+		},
+	}))
+
+	if _, err := normalizeMetadata(data); err == nil {
+		t.Fatal("normalizeMetadata() error = nil, want malformed metadata error")
 	}
 }
 

@@ -11,8 +11,12 @@ type crawlPacket struct {
 	infoHash   string
 	token      string
 	nodes      string
+	samples    string
 	values     []string
 	hasValues  bool
+	hasSamples bool
+	interval   int
+	num        int
 	port       int
 	implied    int
 	hasPayload bool
@@ -122,6 +126,13 @@ func parseCrawlRespDict(data []byte, i int, pkt *crawlPacket) (int, bool) {
 		case "values":
 			pkt.values, i, ok = parseCrawlStringList(data, i)
 			pkt.hasValues = ok
+		case "samples":
+			pkt.samples, i, ok = parseCrawlString(data, i)
+			pkt.hasSamples = ok
+		case "interval":
+			pkt.interval, i, ok = parseCrawlInt(data, i)
+		case "num":
+			pkt.num, i, ok = parseCrawlInt(data, i)
 		default:
 			i, ok = skipCrawlValue(data, i)
 		}

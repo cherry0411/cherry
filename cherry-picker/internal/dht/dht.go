@@ -21,6 +21,15 @@ const (
 	StandardMode = iota
 	// CrawlMode for crawling the dht network.
 	CrawlMode
+
+	// Crawl-mode get_peers responses normally arrive within a few seconds. A
+	// 32-bit generation counter makes stale responses safe even when this much
+	// smaller per-instance ring wraps, while avoiding 150+ MB of fixed memory
+	// across the 96 identities used on a 2C/4G crawler.
+	crawlTxRingBits   = 13
+	crawlTxRingSize   = 1 << crawlTxRingBits
+	crawlTxRingMask   = crawlTxRingSize - 1
+	crawlTxLockShards = 256
 )
 
 var (
@@ -29,6 +38,9 @@ var (
 	// ErrOnGetPeersResponseNotSet is the error that config
 	// OnGetPeersResponseNotSet is not set when call dht.GetPeers.
 	ErrOnGetPeersResponseNotSet = errors.New("OnGetPeersResponse is not set")
+	// ErrOnSampleInfoHashesNotSet indicates that BEP 51 sampling was requested
+	// without a consumer for the returned hashes.
+	ErrOnSampleInfoHashesNotSet = errors.New("OnSampleInfoHashes is not set")
 	// ErrInvalidInfoHash indicates a get_peers target that is not exactly 20 bytes.
 	ErrInvalidInfoHash = errors.New("infohash must be 20 raw bytes or 40 hex characters")
 )
@@ -62,6 +74,10 @@ type Config struct {
 	OnGetPeers func(string, string, int)
 	// callback when receive get_peers response
 	OnGetPeersResponse func(string, *Peer)
+	// callback when a BEP 51 response returns concatenated 20-byte infohashes.
+	// The string aliases the UDP packet buffer and is valid only for the
+	// duration of the callback.
+	OnSampleInfoHashes func(string)
 	// callback when got announce_peer request
 	OnAnnouncePeer func(string, string, int)
 	// blcoked ips
@@ -83,6 +99,9 @@ type Config struct {
 	PacketReadWorkers int
 	// the nodes num to be fresh in a kbucket
 	RefreshNodeNum int
+	// SpreadFollowups stripes parallel iterative chains across the returned
+	// compact-node list instead of converging every chain on its first entry.
+	SpreadFollowups bool
 	// NodeIDFile is the path to persist the node ID across restarts.
 	// If empty or the file doesn't exist, a new random ID is generated and saved.
 	NodeIDFile string
@@ -151,18 +170,26 @@ type DHT struct {
 	packetPool         sync.Pool
 	stats              packetStats
 
-	// crawl 模式轻量级事务环形缓冲（约 1.5MB）。
+	// crawl 模式轻量级事务环形缓冲（约 400KB）。
 	// 存储 get_peers 出站请求的 info_hash，用于响应到达时还原原始 info_hash
-	// 并触发 OnGetPeersResponse 回调。32 位事务号用于代际校验，低 16 位
+	// 并触发 OnGetPeersResponse 回调。32 位事务号用于代际校验，低 13 位
 	// 作为环形索引；分片锁避免响应读取与槽位复用并发时的数据竞争。
-	crawlTxBuf [1 << 16]crawlTxEntry
-	crawlTxMu  [256]sync.RWMutex
+	crawlTxBuf [crawlTxRingSize]crawlTxEntry
+	crawlTxMu  [crawlTxLockShards]sync.RWMutex
 	crawlTxCtr atomic.Uint32
+
+	// BEP 51 asks indexers not to resample a node before its advertised
+	// interval. Reservations also suppress duplicate probes while a response is
+	// in flight. The map is bounded by the crawl routing table in practice.
+	sampleMu   sync.Mutex
+	sampleNext map[string]time.Time
 }
 
 type crawlTxEntry struct {
-	counter  uint32
-	infoHash [20]byte
+	counter   uint32
+	infoHash  [20]byte
+	nodeID    [20]byte
+	followups uint8
 }
 
 type packetStats struct {
@@ -173,6 +200,7 @@ type packetStats struct {
 	decodeErrors  atomic.Uint64
 	bytesReceived atomic.Uint64
 	bytesSent     atomic.Uint64
+	followupsSent atomic.Uint64
 }
 
 type PacketStats struct {
@@ -183,6 +211,7 @@ type PacketStats struct {
 	DecodeErrors  uint64
 	BytesReceived uint64
 	BytesSent     uint64
+	FollowupsSent uint64
 }
 
 // New returns a DHT pointer. If config is nil, then config will be set to
@@ -198,10 +227,11 @@ func New(config *Config) *DHT {
 	}
 
 	d := &DHT{
-		Config:    config,
-		node:      node,
-		blackList: newBlackList(config.BlackListMaxSize),
-		packets:   make(chan packet, config.PacketJobLimit),
+		Config:     config,
+		node:       node,
+		blackList:  newBlackList(config.BlackListMaxSize),
+		packets:    make(chan packet, config.PacketJobLimit),
+		sampleNext: make(map[string]time.Time),
 		packetPool: sync.Pool{
 			New: func() interface{} {
 				return make([]byte, 8192)
@@ -374,6 +404,7 @@ func (dht *DHT) PacketStats() PacketStats {
 		DecodeErrors:  dht.stats.decodeErrors.Load(),
 		BytesReceived: dht.stats.bytesReceived.Load(),
 		BytesSent:     dht.stats.bytesSent.Load(),
+		FollowupsSent: dht.stats.followupsSent.Load(),
 	}
 }
 
@@ -436,34 +467,50 @@ func crawlTxCounter(txID string) (uint32, bool) {
 }
 
 func (dht *DHT) rememberCrawlInfoHash(txID, infoHash string) bool {
+	return dht.rememberCrawlInfoHashWithFollowups(txID, infoHash, 0)
+}
+
+func (dht *DHT) rememberCrawlInfoHashWithFollowups(txID, infoHash string, followups uint8) bool {
+	return dht.rememberCrawlLookup(txID, infoHash, "", followups)
+}
+
+func (dht *DHT) rememberCrawlLookup(txID, infoHash, nodeID string, followups uint8) bool {
 	ctr, ok := crawlTxCounter(txID)
-	if !ok || len(infoHash) != 20 {
+	if !ok || len(infoHash) != 20 || (nodeID != "" && len(nodeID) != 20) {
 		return false
 	}
-	idx := uint16(ctr)
-	mu := &dht.crawlTxMu[idx>>8]
+	idx := ctr & crawlTxRingMask
+	mu := &dht.crawlTxMu[idx%crawlTxLockShards]
 	mu.Lock()
 	entry := &dht.crawlTxBuf[idx]
 	entry.counter = ctr
 	copy(entry.infoHash[:], infoHash)
+	entry.nodeID = [20]byte{}
+	copy(entry.nodeID[:], nodeID)
+	entry.followups = followups
 	mu.Unlock()
 	return true
 }
 
 func (dht *DHT) crawlInfoHash(txID string) ([20]byte, bool) {
+	entry, ok := dht.crawlTransaction(txID)
+	return entry.infoHash, ok
+}
+
+func (dht *DHT) crawlTransaction(txID string) (crawlTxEntry, bool) {
 	ctr, ok := crawlTxCounter(txID)
 	if !ok {
-		return [20]byte{}, false
+		return crawlTxEntry{}, false
 	}
-	idx := uint16(ctr)
-	mu := &dht.crawlTxMu[idx>>8]
+	idx := ctr & crawlTxRingMask
+	mu := &dht.crawlTxMu[idx%crawlTxLockShards]
 	mu.RLock()
 	entry := dht.crawlTxBuf[idx]
 	mu.RUnlock()
 	if entry.counter != ctr || entry.infoHash == [20]byte{} {
-		return [20]byte{}, false
+		return crawlTxEntry{}, false
 	}
-	return entry.infoHash, true
+	return entry, true
 }
 
 // GetPeers returns peers who have announced having infoHash.
@@ -476,6 +523,23 @@ func (dht *DHT) GetPeers(infoHash string) error {
 // Bounded lookups let the crawler turn high-volume inbound get_peers hashes
 // into peer candidates without creating an unbounded UDP amplification loop.
 func (dht *DHT) GetPeersLimit(infoHash string, limit int) error {
+	return dht.getPeersLimit(infoHash, limit, 0)
+}
+
+// GetPeersIterativeLimit uses a bounded crawl-mode continuation. Each initial
+// no-value response may query one node returned as closer to the infohash. The
+// depth is capped so untrusted responses cannot create an unbounded query chain.
+func (dht *DHT) GetPeersIterativeLimit(infoHash string, limit, followups int) error {
+	if followups < 0 {
+		followups = 0
+	}
+	if followups > 8 {
+		followups = 8
+	}
+	return dht.getPeersLimit(infoHash, limit, uint8(followups))
+}
+
+func (dht *DHT) getPeersLimit(infoHash string, limit int, followups uint8) error {
 	if !dht.Ready {
 		return ErrNotReady
 	}
@@ -499,10 +563,91 @@ func (dht *DHT) GetPeersLimit(infoHash string, limit int) error {
 	neighbors := dht.routingTable.GetNeighbors(target, limit)
 
 	for _, no := range neighbors {
-		dht.transactionManager.getPeers(no, infoHash)
+		if dht.IsCrawlMode() {
+			sendCrawlGetPeersQueryWithFollowups(dht, no, infoHash, followups)
+		} else {
+			dht.transactionManager.getPeers(no, infoHash)
+		}
 	}
 
 	return nil
+}
+
+const defaultSampleInterval = 10 * time.Minute
+
+// reserveSampleNode suppresses repeated BEP 51 requests to the same endpoint.
+// The fallback interval is replaced by the node's advertised interval when a
+// response arrives.
+func (dht *DHT) reserveSampleNode(address string, now time.Time) bool {
+	dht.sampleMu.Lock()
+	defer dht.sampleMu.Unlock()
+	if next, ok := dht.sampleNext[address]; ok && now.Before(next) {
+		return false
+	}
+	dht.sampleNext[address] = now.Add(defaultSampleInterval)
+	return true
+}
+
+func (dht *DHT) markSampleInterval(address string, seconds int) {
+	if seconds <= 0 {
+		return
+	}
+	interval := time.Duration(seconds) * time.Second
+	if interval < time.Minute {
+		interval = time.Minute
+	}
+	if interval > 6*time.Hour {
+		interval = 6 * time.Hour
+	}
+	dht.sampleMu.Lock()
+	dht.sampleNext[address] = time.Now().Add(interval)
+	dht.sampleMu.Unlock()
+}
+
+// SampleInfohashesLimit sends BEP 51 sample_infohashes queries to up to limit
+// eligible nodes near target. It returns the number actually sent; nodes still
+// inside their advertised sampling interval are skipped.
+func (dht *DHT) SampleInfohashesLimit(target string, limit int) (int, error) {
+	if !dht.Ready {
+		return 0, ErrNotReady
+	}
+	if dht.OnSampleInfoHashes == nil {
+		return 0, ErrOnSampleInfoHashesNotSet
+	}
+	if len(target) == 40 {
+		data, err := hex.DecodeString(target)
+		if err != nil {
+			return 0, err
+		}
+		target = string(data)
+	}
+	if len(target) != 20 {
+		return 0, ErrInvalidInfoHash
+	}
+	if limit <= 0 {
+		limit = 1
+	}
+
+	// Pull a few alternatives because the closest endpoint may still be in its
+	// cooldown. This remains a small top-k scan even with a 1,000-node table.
+	candidateLimit := limit * 8
+	if candidateLimit < 8 {
+		candidateLimit = 8
+	}
+	neighbors := dht.routingTable.GetNeighbors(newBitmapFromString(target), candidateLimit)
+	now := time.Now()
+	sent := 0
+	for _, no := range neighbors {
+		if !dht.reserveSampleNode(no.addr.String(), now) {
+			continue
+		}
+		sendCrawlSampleInfohashesQuery(dht, no, target)
+		sent++
+		if sent >= limit {
+			break
+		}
+	}
+	return sent, nil
 }
 
 // Run starts the dht.

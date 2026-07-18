@@ -117,11 +117,15 @@ func sendCrawlFindNodeQuery(dht *DHT, addr *net.UDPAddr, target string) {
 // 同时将 info_hash 存入 crawlTxBuf，供 handleResponseCrawl 还原。
 // bencode: d1:ad2:id20:<id>9:info_hash20:<ih>e1:q9:get_peers1:t2:<txid>1:y1:qe
 func sendCrawlGetPeersQuery(dht *DHT, no *node, infoHash string) {
+	sendCrawlGetPeersQueryWithFollowups(dht, no, infoHash, 0)
+}
+
+func sendCrawlGetPeersQueryWithFollowups(dht *DHT, no *node, infoHash string, followups uint8) {
 	if len(infoHash) != 20 {
 		return
 	}
 	txID := dht.crawlGenTxID()
-	dht.rememberCrawlInfoHash(txID, infoHash)
+	dht.rememberCrawlLookup(txID, infoHash, no.id.RawString(), followups)
 
 	buf := crawlResponsePool.Get().([]byte)[:0]
 	buf = append(buf, "d1:ad2:id20:"...)
@@ -131,6 +135,27 @@ func sendCrawlGetPeersQuery(dht *DHT, no *node, infoHash string) {
 	buf = append(buf, "e1:q9:get_peers1:t"...)
 	buf = strconv.AppendInt(buf, int64(len(txID)), 10)
 	buf = append(buf, ':')
+	buf = append(buf, txID...)
+	buf = append(buf, "1:y1:qe"...)
+	dht.writeToUDP(buf, no.addr)
+	crawlResponsePool.Put(buf)
+}
+
+// sendCrawlSampleInfohashesQuery sends the BEP 51 sampling RPC. Unlike a
+// get_peers query it needs no transaction-side payload: the response is
+// self-describing through its samples field.
+// bencode: d1:ad2:id20:<id>6:target20:<target>e1:q17:sample_infohashes1:t4:<txid>1:y1:qe
+func sendCrawlSampleInfohashesQuery(dht *DHT, no *node, target string) {
+	if len(target) != 20 {
+		return
+	}
+	txID := dht.crawlGenTxID()
+	buf := crawlResponsePool.Get().([]byte)[:0]
+	buf = append(buf, "d1:ad2:id20:"...)
+	buf = dht.appendCrawlID(buf, target)
+	buf = append(buf, "6:target20:"...)
+	buf = append(buf, target...)
+	buf = append(buf, "e1:q17:sample_infohashes1:t4:"...)
 	buf = append(buf, txID...)
 	buf = append(buf, "1:y1:qe"...)
 	dht.writeToUDP(buf, no.addr)

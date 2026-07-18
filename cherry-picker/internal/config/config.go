@@ -35,22 +35,27 @@ type DedupeConfig struct {
 }
 
 type DiscoveryConfig struct {
-	Mode           string
-	EmitPeerEvents bool
-	PrimeNodes     string
-	Instances      int
-	ActiveLookup   bool
-	LookupNodes    int
-	LookupDHTs     int
-	LookupQueue    int
-	LookupRate     int
-	PacketWorkers  int
-	PacketJobs     int
-	ReadWorkers    int
-	MaxNodes       int
-	RefreshNodes   int
-	NodeIDFile     string
-	NodeIDDir      string
+	Mode             string
+	EmitPeerEvents   bool
+	PrimeNodes       string
+	Instances        int
+	ActiveLookup     bool
+	LookupNodes      int
+	LookupDHTs       int
+	LookupQueue      int
+	LookupRate       int
+	LookupWorkers    int
+	LookupFollowups  int
+	LookupSpread     bool
+	SampleInfohashes bool
+	SampleRate       int
+	PacketWorkers    int
+	PacketJobs       int
+	ReadWorkers      int
+	MaxNodes         int
+	RefreshNodes     int
+	NodeIDFile       string
+	NodeIDDir        string
 }
 
 type MetadataConfig struct {
@@ -118,22 +123,27 @@ func Load() (Config, error) {
 			MetadataTTL: getenvDuration("CHERRY_PICKER_DEDUPE_METADATA_TTL", 30*time.Minute),
 		},
 		Discovery: DiscoveryConfig{
-			Mode:           strings.ToLower(getenvDefault("CHERRY_PICKER_DHT_MODE", "crawl")),
-			EmitPeerEvents: getenvBool("CHERRY_PICKER_EMIT_PEER_EVENTS", true),
-			PrimeNodes:     getenvDefault("CHERRY_PICKER_DHT_PRIME_NODES", ""),
-			Instances:      getenvInt("CHERRY_PICKER_DHT_INSTANCES", 1),
-			ActiveLookup:   getenvBool("CHERRY_PICKER_DHT_ACTIVE_LOOKUP", true),
-			LookupNodes:    getenvInt("CHERRY_PICKER_DHT_LOOKUP_NODES", 32),
-			LookupDHTs:     getenvInt("CHERRY_PICKER_DHT_LOOKUP_DHTS", 1),
-			LookupQueue:    getenvInt("CHERRY_PICKER_DHT_LOOKUP_QUEUE", 8192),
-			LookupRate:     getenvInt("CHERRY_PICKER_DHT_LOOKUP_RATE", 100),
-			PacketWorkers:  getenvInt("CHERRY_PICKER_DHT_PACKET_WORKERS", defaultPacketWorkers()),
-			PacketJobs:     getenvInt("CHERRY_PICKER_DHT_PACKET_JOBS", defaultPacketJobs()),
-			ReadWorkers:    getenvInt("CHERRY_PICKER_DHT_READ_WORKERS", 0),
-			MaxNodes:       getenvInt("CHERRY_PICKER_DHT_MAX_NODES", defaultMaxNodes()),
-			RefreshNodes:   getenvInt("CHERRY_PICKER_DHT_REFRESH_NODES", defaultRefreshNodes()),
-			NodeIDFile:     getenvDefault("CHERRY_PICKER_NODE_ID_FILE", ""),
-			NodeIDDir:      getenvDefault("CHERRY_PICKER_NODE_ID_DIR", ""),
+			Mode:             strings.ToLower(getenvDefault("CHERRY_PICKER_DHT_MODE", "crawl")),
+			EmitPeerEvents:   getenvBool("CHERRY_PICKER_EMIT_PEER_EVENTS", true),
+			PrimeNodes:       getenvDefault("CHERRY_PICKER_DHT_PRIME_NODES", ""),
+			Instances:        getenvInt("CHERRY_PICKER_DHT_INSTANCES", 1),
+			ActiveLookup:     getenvBool("CHERRY_PICKER_DHT_ACTIVE_LOOKUP", true),
+			LookupNodes:      getenvInt("CHERRY_PICKER_DHT_LOOKUP_NODES", 32),
+			LookupDHTs:       getenvInt("CHERRY_PICKER_DHT_LOOKUP_DHTS", 1),
+			LookupQueue:      getenvInt("CHERRY_PICKER_DHT_LOOKUP_QUEUE", 8192),
+			LookupRate:       getenvInt("CHERRY_PICKER_DHT_LOOKUP_RATE", 100),
+			LookupWorkers:    getenvInt("CHERRY_PICKER_DHT_LOOKUP_WORKERS", 1),
+			LookupFollowups:  getenvInt("CHERRY_PICKER_DHT_LOOKUP_FOLLOWUPS", 0),
+			LookupSpread:     getenvBool("CHERRY_PICKER_DHT_LOOKUP_SPREAD", false),
+			SampleInfohashes: getenvBool("CHERRY_PICKER_DHT_SAMPLE_INFOHASHES", false),
+			SampleRate:       getenvInt("CHERRY_PICKER_DHT_SAMPLE_RATE", 20),
+			PacketWorkers:    getenvInt("CHERRY_PICKER_DHT_PACKET_WORKERS", defaultPacketWorkers()),
+			PacketJobs:       getenvInt("CHERRY_PICKER_DHT_PACKET_JOBS", defaultPacketJobs()),
+			ReadWorkers:      getenvInt("CHERRY_PICKER_DHT_READ_WORKERS", 0),
+			MaxNodes:         getenvInt("CHERRY_PICKER_DHT_MAX_NODES", defaultMaxNodes()),
+			RefreshNodes:     getenvInt("CHERRY_PICKER_DHT_REFRESH_NODES", defaultRefreshNodes()),
+			NodeIDFile:       getenvDefault("CHERRY_PICKER_NODE_ID_FILE", ""),
+			NodeIDDir:        getenvDefault("CHERRY_PICKER_NODE_ID_DIR", ""),
 		},
 		Metadata: MetadataConfig{
 			Enabled:          getenvBool("CHERRY_PICKER_METADATA_ENABLED", true),
@@ -197,22 +207,27 @@ func loadFromFile(path string) (Config, error) {
 			MetadataTTL: parseDuration(raw.Dedupe.MetadataTTL),
 		},
 		Discovery: DiscoveryConfig{
-			Mode:           strings.ToLower(strings.TrimSpace(raw.Discovery.Mode)),
-			EmitPeerEvents: raw.Discovery.EmitPeerEvents,
-			PrimeNodes:     strings.TrimSpace(raw.Discovery.PrimeNodes),
-			Instances:      intOrDefault(raw.Discovery.Instances, 1),
-			ActiveLookup:   activeLookup,
-			LookupNodes:    intOrDefault(raw.Discovery.LookupNodes, 32),
-			LookupDHTs:     intOrDefault(raw.Discovery.LookupDHTs, 1),
-			LookupQueue:    intOrDefault(raw.Discovery.LookupQueue, 8192),
-			LookupRate:     intOrDefault(raw.Discovery.LookupRate, 100),
-			PacketWorkers:  intOrDefault(raw.Discovery.PacketWorkers, 512),
-			PacketJobs:     intOrDefault(raw.Discovery.PacketJobs, 65536),
-			ReadWorkers:    raw.Discovery.ReadWorkers,
-			MaxNodes:       intOrDefault(raw.Discovery.MaxNodes, 50000),
-			RefreshNodes:   intOrDefault(raw.Discovery.RefreshNodes, 2048),
-			NodeIDFile:     strings.TrimSpace(raw.Discovery.NodeIDFile),
-			NodeIDDir:      strings.TrimSpace(raw.Discovery.NodeIDDir),
+			Mode:             strings.ToLower(strings.TrimSpace(raw.Discovery.Mode)),
+			EmitPeerEvents:   raw.Discovery.EmitPeerEvents,
+			PrimeNodes:       strings.TrimSpace(raw.Discovery.PrimeNodes),
+			Instances:        intOrDefault(raw.Discovery.Instances, 1),
+			ActiveLookup:     activeLookup,
+			LookupNodes:      intOrDefault(raw.Discovery.LookupNodes, 32),
+			LookupDHTs:       intOrDefault(raw.Discovery.LookupDHTs, 1),
+			LookupQueue:      intOrDefault(raw.Discovery.LookupQueue, 8192),
+			LookupRate:       intOrDefault(raw.Discovery.LookupRate, 100),
+			LookupWorkers:    intOrDefault(raw.Discovery.LookupWorkers, 1),
+			LookupFollowups:  raw.Discovery.LookupFollowups,
+			LookupSpread:     raw.Discovery.LookupSpread,
+			SampleInfohashes: raw.Discovery.SampleInfohashes,
+			SampleRate:       intOrDefault(raw.Discovery.SampleRate, 20),
+			PacketWorkers:    intOrDefault(raw.Discovery.PacketWorkers, 512),
+			PacketJobs:       intOrDefault(raw.Discovery.PacketJobs, 65536),
+			ReadWorkers:      raw.Discovery.ReadWorkers,
+			MaxNodes:         intOrDefault(raw.Discovery.MaxNodes, 50000),
+			RefreshNodes:     intOrDefault(raw.Discovery.RefreshNodes, 2048),
+			NodeIDFile:       strings.TrimSpace(raw.Discovery.NodeIDFile),
+			NodeIDDir:        strings.TrimSpace(raw.Discovery.NodeIDDir),
 		},
 		Metadata: MetadataConfig{
 			Enabled:          raw.Metadata.Enabled,
@@ -278,6 +293,18 @@ func normalize(cfg Config) Config {
 	}
 	if cfg.Discovery.LookupRate <= 0 {
 		cfg.Discovery.LookupRate = 100
+	}
+	if cfg.Discovery.LookupWorkers <= 0 {
+		cfg.Discovery.LookupWorkers = 1
+	}
+	if cfg.Discovery.LookupFollowups < 0 {
+		cfg.Discovery.LookupFollowups = 0
+	}
+	if cfg.Discovery.LookupFollowups > 8 {
+		cfg.Discovery.LookupFollowups = 8
+	}
+	if cfg.Discovery.SampleRate <= 0 {
+		cfg.Discovery.SampleRate = 20
 	}
 	if cfg.Discovery.PacketWorkers <= 0 {
 		cfg.Discovery.PacketWorkers = defaultPacketWorkers()
@@ -367,22 +394,27 @@ type fileDedupeConfig struct {
 }
 
 type fileDiscoveryConfig struct {
-	Mode           string `json:"mode"`
-	EmitPeerEvents bool   `json:"emit_peer_events"`
-	PrimeNodes     string `json:"prime_nodes"`
-	Instances      int    `json:"instances"`
-	ActiveLookup   *bool  `json:"active_lookup"`
-	LookupNodes    int    `json:"lookup_nodes"`
-	LookupDHTs     int    `json:"lookup_dhts"`
-	LookupQueue    int    `json:"lookup_queue"`
-	LookupRate     int    `json:"lookup_rate"`
-	PacketWorkers  int    `json:"packet_workers"`
-	PacketJobs     int    `json:"packet_jobs"`
-	ReadWorkers    int    `json:"read_workers"`
-	MaxNodes       int    `json:"max_nodes"`
-	RefreshNodes   int    `json:"refresh_nodes"`
-	NodeIDFile     string `json:"node_id_file"`
-	NodeIDDir      string `json:"node_id_dir"`
+	Mode             string `json:"mode"`
+	EmitPeerEvents   bool   `json:"emit_peer_events"`
+	PrimeNodes       string `json:"prime_nodes"`
+	Instances        int    `json:"instances"`
+	ActiveLookup     *bool  `json:"active_lookup"`
+	LookupNodes      int    `json:"lookup_nodes"`
+	LookupDHTs       int    `json:"lookup_dhts"`
+	LookupQueue      int    `json:"lookup_queue"`
+	LookupRate       int    `json:"lookup_rate"`
+	LookupWorkers    int    `json:"lookup_workers"`
+	LookupFollowups  int    `json:"lookup_followups"`
+	LookupSpread     bool   `json:"lookup_spread"`
+	SampleInfohashes bool   `json:"sample_infohashes"`
+	SampleRate       int    `json:"sample_rate"`
+	PacketWorkers    int    `json:"packet_workers"`
+	PacketJobs       int    `json:"packet_jobs"`
+	ReadWorkers      int    `json:"read_workers"`
+	MaxNodes         int    `json:"max_nodes"`
+	RefreshNodes     int    `json:"refresh_nodes"`
+	NodeIDFile       string `json:"node_id_file"`
+	NodeIDDir        string `json:"node_id_dir"`
 }
 
 type fileMetadataConfig struct {

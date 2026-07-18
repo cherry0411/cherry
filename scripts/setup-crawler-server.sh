@@ -1,8 +1,7 @@
-iptables -t raw -A PREROUTING -p udp --dport 20003:20022 -j NOTRACK
-iptables -t raw -A PREROUTING -p udp --sport 20003:20022 -j NOTRACK
-iptables -t raw -A OUTPUT    -p udp --dport 20003:20022 -j NOTRACK
-iptables -t raw -A OUTPUT    -p udp --sport 20003:20022 -j NOTRACK
+#!/usr/bin/env bash
+set -euo pipefail
 
-sysctl -w net.netfilter.nf_conntrack_max=2097152
-sysctl -w net.netfilter.nf_conntrack_udp_timeout=10
-sysctl -w net.netfilter.nf_conntrack_udp_timeout_stream=10
+# Backward-compatible entry point. The old version unconditionally enlarged
+# conntrack to two million entries and installed redundant NOTRACK rules.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+exec "${SCRIPT_DIR}/tune-crawler-os.sh" "$@"

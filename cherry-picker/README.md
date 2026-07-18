@@ -38,7 +38,7 @@ Durations use Go duration strings such as `2s`, `30s`, or `10m`.
 
 ## Environment variables
 
-- `CHERRY_PICKER_ROLE`: `combined` or `discovery`.
+- `CHERRY_PICKER_ROLE`: `combined`, `discovery`, or `metadata`.
 - `CHERRY_PICKER_INSTANCE_ID`: logical instance identifier.
 - `CHERRY_PICKER_LISTEN_ADDR`: UDP listen address, default `:6881`.
 - `CHERRY_PICKER_DHT_INSTANCES`: number of consecutive UDP listeners starting at `CHERRY_PICKER_LISTEN_ADDR`; explicit `CHERRY_PICKER_LISTEN_ADDRS` takes precedence.
@@ -46,7 +46,14 @@ Durations use Go duration strings such as `2s`, `30s`, or `10m`.
 - `CHERRY_PICKER_DHT_MODE`: `crawl` or `standard`, default `crawl`.
 - `CHERRY_PICKER_DHT_ACTIVE_LOOKUP`: actively query the routing table for hashes observed in inbound `get_peers` requests.
 - `CHERRY_PICKER_DHT_LOOKUP_NODES`: closest nodes queried per active lookup.
+- `CHERRY_PICKER_DHT_LOOKUP_DHTS`: identities used for each observed hash.
+- `CHERRY_PICKER_DHT_LOOKUP_QUEUE`: backlog for newly observed live hashes.
 - `CHERRY_PICKER_DHT_LOOKUP_RATE`: maximum hashes actively queried per second.
+- `CHERRY_PICKER_DHT_LOOKUP_WORKERS`: workers sharing the global lookup rate.
+- `CHERRY_PICKER_DHT_LOOKUP_FOLLOWUPS`: bounded iterative depth, from `0` to `8`.
+- `CHERRY_PICKER_DHT_LOOKUP_SPREAD`: diversify bounded chains across returned nodes.
+- `CHERRY_PICKER_DHT_SAMPLE_INFOHASHES`: enable low-priority BEP 51 sampling.
+- `CHERRY_PICKER_DHT_SAMPLE_RATE`: maximum BEP 51 sample queries per second.
 - `CHERRY_PICKER_EMIT_PEER_EVENTS`: `true` or `false`.
 - `CHERRY_PICKER_EVENT_QUEUE`: in-memory exporter queue size.
 - `CHERRY_PICKER_METADATA_ENABLED`: enable metadata fetch workers.
@@ -63,6 +70,7 @@ Durations use Go duration strings such as `2s`, `30s`, or `10m`.
 - `CHERRY_PICKER_EXPORTER_RETRY_BACKOFF`: per-attempt retry backoff base duration.
 - `CHERRY_PICKER_DEDUPE_PEER_TTL`: local dedupe TTL for repeated peer events.
 - `CHERRY_PICKER_DEDUPE_METADATA_TTL`: local dedupe TTL for repeated metadata work.
+- `CHERRY_PICKER_PPROF_ADDR`: optional local Go profiling listener, for example `127.0.0.1:6060`.
 
 ## Example
 
@@ -116,11 +124,22 @@ $env:CHERRY_PICKER_DHT_INSTANCES = "96"
 go run ./cmd/cherry-picker
 ```
 
-On a 2-core/4-GB Linux server, start at 32 identities, observe two or more 30-second runtime windows, then increase to 64 and 96 only while `dropped=0`, memory remains below the cgroup limit, and metadata throughput improves:
+On a public 2-core/4-GB Linux server, the measured native profile uses 96
+identities and two strictly-progressing iterative chains per live hash. Use
+`configs/metadata-2c4g.json` as the starting point, and keep BEP 51 sampling
+disabled when the live-hash queue is continuously busy:
 
 ```bash
-CHERRY_PICKER_DHT_INSTANCES=32 docker compose up -d crawler
+GOMAXPROCS=2 \
+CHERRY_PICKER_MEM_LIMIT_MB=3072 \
+CHERRY_PICKER_CONFIG=configs/metadata-2c4g.json \
+./cherry-picker
 ```
+
+Apply the root `scripts/tune-crawler-os.sh` on native Linux. Its bounded socket
+buffers and descriptor limits are sized for 96 listeners on 4 GB; the legacy
+multi-million-entry conntrack and 128 MB-per-socket settings were intentionally
+removed.
 
 Before a full deployment, validate the current network path with a known public infohash:
 

@@ -1,80 +1,64 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Linux host tuning for a high-throughput DHT metadata crawler.
-# Run as root on the crawler host:
+# Resource-aware Linux tuning for Cherry's native crawler. Defaults target a
+# 2 vCPU / 4 GiB host with 96 UDP listeners; every setting is bounded and the
+# script is idempotent.
+#
 #   sudo bash scripts/tune-crawler-os.sh
 #
-# The script writes persistent sysctl, limits, and systemd defaults, applies
-# sysctl immediately, and performs best-effort NIC queue/RPS tuning.
+# Optional overrides:
+#   NOFILE_LIMIT=65536 DHT_PORT_RANGE=21000:21095 ENABLE_NOTRACK=auto
 
 SYSCTL_FILE="/etc/sysctl.d/99-cherry-crawler.conf"
 LIMITS_FILE="/etc/security/limits.d/99-cherry-crawler.conf"
-SYSTEMD_SYSTEM_DIR="/etc/systemd/system.conf.d"
-SYSTEMD_USER_DIR="/etc/systemd/user.conf.d"
-SYSTEMD_SYSTEM_FILE="${SYSTEMD_SYSTEM_DIR}/99-cherry-crawler.conf"
-SYSTEMD_USER_FILE="${SYSTEMD_USER_DIR}/99-cherry-crawler.conf"
 
-NOFILE_LIMIT="${NOFILE_LIMIT:-1048576}"
-NPROC_LIMIT="${NPROC_LIMIT:-262144}"
-TXQUEUELEN="${TXQUEUELEN:-10000}"
+NOFILE_LIMIT="${NOFILE_LIMIT:-65536}"
+NPROC_LIMIT="${NPROC_LIMIT:-32768}"
+DHT_PORT_RANGE="${DHT_PORT_RANGE:-21000:21095}"
+ENABLE_NOTRACK="${ENABLE_NOTRACK:-auto}"
+TXQUEUELEN="${TXQUEUELEN:-4096}"
 
 if [[ "${EUID}" -ne 0 ]]; then
   echo "must run as root" >&2
   exit 1
 fi
 
+sysctl_line_if_present() {
+  local key="$1" value="$2"
+  local path="/proc/sys/${key//./\/}"
+  if [[ -e "${path}" ]]; then
+    printf '%s = %s\n' "${key}" "${value}" >> "${SYSCTL_FILE}"
+  fi
+}
+
 write_sysctl() {
   cat > "${SYSCTL_FILE}" <<'EOF'
-# Cherry crawler high-throughput network tuning.
+# Cherry crawler tuning for 2 vCPU / 4 GiB.
+# Keep per-socket buffers modest: 96 listeners multiply every socket limit.
+net.core.rmem_max = 1048576
+net.core.wmem_max = 524288
+net.core.rmem_default = 262144
+net.core.wmem_default = 262144
+net.core.optmem_max = 131072
+net.core.netdev_max_backlog = 16384
 
-# Large UDP/TCP socket buffers for bursty DHT traffic.
-net.core.rmem_max = 134217728
-net.core.wmem_max = 134217728
-net.core.rmem_default = 16777216
-net.core.wmem_default = 16777216
-net.core.optmem_max = 16777216
-
-# Larger packet backlog between NIC and userspace.
-net.core.netdev_max_backlog = 250000
-net.core.somaxconn = 65535
-
-# UDP memory pressure thresholds, in pages. Keep high enough for DHT bursts.
-net.ipv4.udp_mem = 262144 524288 1048576
-net.ipv4.udp_rmem_min = 8192
-net.ipv4.udp_wmem_min = 8192
-
-# Outbound TCP metadata fetches create many short-lived connections.
+# Metadata downloads create many short-lived outbound TCP connections.
 net.ipv4.ip_local_port_range = 10000 65535
-net.ipv4.tcp_tw_reuse = 1
-net.ipv4.tcp_fin_timeout = 10
-net.ipv4.tcp_syn_retries = 3
-net.ipv4.tcp_synack_retries = 3
-net.ipv4.tcp_orphan_retries = 1
-net.ipv4.tcp_max_syn_backlog = 65535
-net.ipv4.tcp_max_tw_buckets = 2000000
-
-# Avoid slow path memory growth under large numbers of sockets.
-net.ipv4.tcp_rmem = 4096 87380 16777216
-net.ipv4.tcp_wmem = 4096 65536 16777216
 net.ipv4.tcp_moderate_rcvbuf = 1
 
-# Keep reverse-path filtering loose; DHT traffic can be asymmetric on some VPS/NAT setups.
-net.ipv4.conf.all.rp_filter = 0
-net.ipv4.conf.default.rp_filter = 0
+# Enough descriptor headroom without oversized global tables.
+fs.file-max = 262144
+fs.nr_open = 1048576
 
-# File/socket scale.
-fs.file-max = 2097152
-fs.nr_open = 2097152
+# Prefer dropping Go heap pages before swapping under transient pressure.
+vm.swappiness = 10
 EOF
 
-  if [[ -e /proc/sys/net/netfilter/nf_conntrack_max ]]; then
-    cat >> "${SYSCTL_FILE}" <<'EOF'
-
-# If conntrack is enabled on the host, raise the ceiling to avoid drops.
-net.netfilter.nf_conntrack_max = 1048576
-EOF
-  fi
+  # Some kernels do not expose these knobs. Only persist keys present on this
+  # host so sysctl --system remains clean across distributions.
+  sysctl_line_if_present net.ipv4.udp_rmem_min 8192
+  sysctl_line_if_present net.ipv4.udp_wmem_min 8192
 }
 
 write_limits() {
@@ -85,94 +69,71 @@ write_limits() {
 * hard nproc ${NPROC_LIMIT}
 root soft nofile ${NOFILE_LIMIT}
 root hard nofile ${NOFILE_LIMIT}
-root soft nproc ${NPROC_LIMIT}
-root hard nproc ${NPROC_LIMIT}
 EOF
+}
 
-  mkdir -p "${SYSTEMD_SYSTEM_DIR}" "${SYSTEMD_USER_DIR}"
-  cat > "${SYSTEMD_SYSTEM_FILE}" <<EOF
-[Manager]
-DefaultLimitNOFILE=${NOFILE_LIMIT}
-DefaultLimitNPROC=${NPROC_LIMIT}
-EOF
-  cat > "${SYSTEMD_USER_FILE}" <<EOF
-[Manager]
-DefaultLimitNOFILE=${NOFILE_LIMIT}
-DefaultLimitNPROC=${NPROC_LIMIT}
-EOF
+configure_notrack() {
+  local enabled="${ENABLE_NOTRACK}"
+  if [[ "${enabled}" == "auto" ]]; then
+    # Do not load conntrack just to bypass it. If the host is not tracking
+    # connections already, there is no table pressure to optimize away.
+    if [[ -e /proc/sys/net/netfilter/nf_conntrack_count || -e /proc/net/nf_conntrack ]]; then
+      enabled=true
+    else
+      enabled=false
+    fi
+  fi
+  [[ "${enabled}" == "true" ]] || return 0
+  command -v iptables >/dev/null 2>&1 || return 0
+
+  # Only local inbound DHT and locally sourced DHT replies/queries need bypass.
+  # Avoid the four broad/redundant rules used by the legacy script.
+  iptables -t raw -C PREROUTING -p udp --dport "${DHT_PORT_RANGE}" -j NOTRACK 2>/dev/null ||
+    iptables -t raw -A PREROUTING -p udp --dport "${DHT_PORT_RANGE}" -j NOTRACK
+  iptables -t raw -C OUTPUT -p udp --sport "${DHT_PORT_RANGE}" -j NOTRACK 2>/dev/null ||
+    iptables -t raw -A OUTPUT -p udp --sport "${DHT_PORT_RANGE}" -j NOTRACK
 }
 
 tune_nics() {
   local cpu_count
   cpu_count="$(nproc)"
-  local mask
-  if (( cpu_count >= 32 )); then
-    mask="ffffffff"
-  else
-    mask="$(printf '%x' "$(( (1 << cpu_count) - 1 ))")"
-  fi
 
   for dev_path in /sys/class/net/*; do
-    local dev
+    local dev rx_queues mask
     dev="$(basename "${dev_path}")"
     [[ "${dev}" == "lo" ]] && continue
-    [[ ! -e "${dev_path}/operstate" ]] && continue
+    [[ -e "${dev_path}/operstate" ]] || continue
 
     ip link set dev "${dev}" txqueuelen "${TXQUEUELEN}" 2>/dev/null || true
+    rx_queues="$(find "${dev_path}/queues" -maxdepth 1 -name 'rx-*' 2>/dev/null | wc -l)"
 
-    for rps in "${dev_path}"/queues/rx-*/rps_cpus; do
-      [[ -e "${rps}" ]] || continue
-      echo "${mask}" > "${rps}" 2>/dev/null || true
-    done
-
-    for rps_flow in "${dev_path}"/queues/rx-*/rps_flow_cnt; do
-      [[ -e "${rps_flow}" ]] || continue
-      echo 4096 > "${rps_flow}" 2>/dev/null || true
-    done
-
-    if command -v ethtool >/dev/null 2>&1; then
-      ethtool -G "${dev}" rx 4096 tx 4096 >/dev/null 2>&1 || true
-      ethtool -K "${dev}" gro on gso on tso on >/dev/null 2>&1 || true
+    # A multi-queue NIC already distributes work in hardware. RPS on top of at
+    # least one RX queue per CPU adds cross-CPU cache traffic on small hosts.
+    if (( rx_queues > 0 && rx_queues < cpu_count )); then
+      if (( cpu_count >= 32 )); then
+        mask=ffffffff
+      else
+        mask="$(printf '%x' "$(( (1 << cpu_count) - 1 ))")"
+      fi
+      for rps in "${dev_path}"/queues/rx-*/rps_cpus; do
+        [[ -e "${rps}" ]] && echo "${mask}" > "${rps}" 2>/dev/null || true
+      done
     fi
   done
-
-  if [[ -e /proc/sys/net/core/rps_sock_flow_entries ]]; then
-    echo 32768 > /proc/sys/net/core/rps_sock_flow_entries || true
-  fi
 }
 
 main() {
   write_sysctl
   write_limits
-
-  sysctl --system
+  sysctl --system >/dev/null
+  configure_notrack
   tune_nics
 
-  if command -v systemctl >/dev/null 2>&1; then
-    systemctl daemon-reexec || true
-  fi
-
-  cat <<EOF
-
-Cherry crawler OS tuning applied.
-
-Persistent files:
-  ${SYSCTL_FILE}
-  ${LIMITS_FILE}
-  ${SYSTEMD_SYSTEM_FILE}
-  ${SYSTEMD_USER_FILE}
-
-Recommended runtime checks:
-  ulimit -n
-  sysctl net.core.rmem_max net.core.netdev_max_backlog net.ipv4.ip_local_port_range
-  ss -s
-  cat /proc/net/sockstat
-
-For Docker Compose, keep service ulimits at least:
-  nofile soft/hard: ${NOFILE_LIMIT}
-
-Reboot is recommended so PAM/systemd limits apply to all services.
-EOF
+  echo "Cherry crawler OS tuning applied"
+  echo "  sysctl: ${SYSCTL_FILE}"
+  echo "  limits: ${LIMITS_FILE}"
+  echo "  DHT ports: ${DHT_PORT_RANGE}"
+  echo "Start the crawler from a new login/session, or set LimitNOFILE=${NOFILE_LIMIT} in its systemd unit."
 }
 
 main "$@"

@@ -227,9 +227,14 @@ func (deque *keyedDeque) Push(key interface{}, val interface{}) {
 
 	if e, ok := deque.index[key]; ok {
 		deque.syncedList.Remove(e)
+		// The element is no longer reachable from the list or primary index.
+		// Keeping it in invertedIndex retains both the list.Element and its
+		// value forever on every refresh of an existing DHT node.
+		delete(deque.invertedIndex, e)
 	}
-	deque.index[key] = deque.syncedList.PushBack(val)
-	deque.invertedIndex[deque.index[key]] = key
+	e := deque.syncedList.PushBack(val)
+	deque.index[key] = e
+	deque.invertedIndex[e] = key
 }
 
 // Get returns the keyed value.

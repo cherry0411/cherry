@@ -39,6 +39,16 @@ func handleResponseCrawl(dht *DHT, addr *net.UDPAddr, response map[string]interf
 	// 跳过它们可节省：bencode node 解析 × 8 + newNode 分配 × 9 + Insert 写锁竞争。
 	tableFull := atomic.LoadInt64(&dht.routingTable.nodeCount) >= int64(dht.MaxNodes)
 
+	if samples, ok := r["samples"].(string); ok {
+		if interval, ok := r["interval"].(int); ok {
+			dht.markSampleInterval(addr.String(), interval)
+		}
+		if dht.OnSampleInfoHashes != nil && len(samples)%20 == 0 {
+			dht.OnSampleInfoHashes(samples)
+		}
+		return true
+	}
+
 	if dht.OnGetPeersResponse != nil {
 		if values, ok := r["values"].([]interface{}); ok {
 			t := response["t"].(string)
@@ -54,6 +64,9 @@ func handleResponseCrawl(dht *DHT, addr *net.UDPAddr, response map[string]interf
 			}
 			return true
 		}
+	}
+	if nodesStr, ok := r["nodes"].(string); ok {
+		followCrawlGetPeersResponse(dht, response["t"].(string), nodesStr)
 	}
 
 	// 路由表已满且没有 values → 这个响应没有价值，直接跳过全部处理。
@@ -89,6 +102,14 @@ func handleResponseCrawlFast(dht *DHT, addr *net.UDPAddr, pkt crawlPacket) bool 
 
 	tableFull := atomic.LoadInt64(&dht.routingTable.nodeCount) >= int64(dht.MaxNodes)
 
+	if pkt.hasSamples {
+		dht.markSampleInterval(addr.String(), pkt.interval)
+		if dht.OnSampleInfoHashes != nil && len(pkt.samples)%20 == 0 {
+			dht.OnSampleInfoHashes(pkt.samples)
+		}
+		return true
+	}
+
 	if dht.OnGetPeersResponse != nil && pkt.hasValues {
 		if ih, ok := dht.crawlInfoHash(pkt.t); ok {
 			infoHash := string(ih[:])
@@ -101,6 +122,7 @@ func handleResponseCrawlFast(dht *DHT, addr *net.UDPAddr, pkt crawlPacket) bool 
 		}
 		return true
 	}
+	followCrawlGetPeersResponse(dht, pkt.t, pkt.nodes)
 
 	if tableFull {
 		return true
@@ -124,4 +146,61 @@ func handleResponseCrawlFast(dht *DHT, addr *net.UDPAddr, pkt crawlPacket) bool 
 		}
 	}
 	return true
+}
+
+// followCrawlGetPeersResponse advances one bounded step toward the target.
+// BEP 5 responses contain the closest known nodes; deployed implementations
+// conventionally order that compact list by distance, so the first valid,
+// non-blacklisted endpoint gives a cheap alpha=1 continuation. A response can
+// trigger at most one query, preventing amplification.
+func followCrawlGetPeersResponse(dht *DHT, txID, nodes string) bool {
+	if len(nodes) < 26 || len(nodes)%26 != 0 {
+		return false
+	}
+	entry, ok := dht.crawlTransaction(txID)
+	if !ok || entry.followups == 0 {
+		return false
+	}
+	nodeCount := len(nodes) / 26
+	start := 0
+	if dht.SpreadFollowups {
+		start = int(entry.counter % uint32(nodeCount))
+	}
+	for offset := 0; offset < nodeCount; offset++ {
+		i := ((start + offset) % nodeCount) * 26
+		if !crawlNodeIsCloser(nodes[i:i+20], entry.nodeID, entry.infoHash) {
+			continue
+		}
+		no, err := newNodeFromCompactInfo(nodes[i:i+26], dht.Network)
+		if err != nil || dht.blackList.in(no.addr.IP.String(), no.addr.Port) {
+			continue
+		}
+		sendCrawlGetPeersQueryWithFollowups(dht, no, string(entry.infoHash[:]), entry.followups-1)
+		dht.stats.followupsSent.Add(1)
+		return true
+	}
+	return false
+}
+
+// crawlNodeIsCloser enforces monotonic progress toward the infohash without
+// allocating bitmaps. It prevents a malicious or stale response from bouncing
+// a bounded lookup between the same nodes, which makes deeper chains safe.
+func crawlNodeIsCloser(candidate string, current, target [20]byte) bool {
+	if len(candidate) != 20 {
+		return false
+	}
+	if current == [20]byte{} {
+		return true // compatibility for transactions created without a node ID
+	}
+	for i := range target {
+		candidateDistance := candidate[i] ^ target[i]
+		currentDistance := current[i] ^ target[i]
+		if candidateDistance < currentDistance {
+			return true
+		}
+		if candidateDistance > currentDistance {
+			return false
+		}
+	}
+	return false
 }

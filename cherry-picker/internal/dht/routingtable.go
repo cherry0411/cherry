@@ -50,9 +50,22 @@ func newNodeFromCompactInfo(
 	}
 
 	id := compactNodeInfo[:20]
-	ip, port, _ := decodeCompactIPPortInfo(compactNodeInfo[20:])
+	ip, port, err := decodeCompactIPPortInfo(compactNodeInfo[20:])
+	if err != nil {
+		return nil, err
+	}
 
-	return newNode(id, network, genAddress(ip.String(), port))
+	// Compact node data already contains a parsed IPv4 address and port.
+	// Going through genAddress -> net.ResolveUDPAddr here used to dominate
+	// crawler allocations while routing tables warmed up.
+	_ = network // kept in the signature for compatibility with callers
+	addr := &net.UDPAddr{IP: ip, Port: port}
+	return &node{
+		id:             newBitmapFromString(id),
+		addr:           addr,
+		lastActiveTime: time.Now(),
+		compactInfo:    compactNodeInfo,
+	}, nil
 }
 
 // CompactIPPortInfo returns "Compact IP-address/port info".
@@ -218,21 +231,12 @@ func (bucket *kbucket) Replace(no *node) {
 		return
 	}
 
-	no = bucket.candidates.Remove(bucket.candidates.Back()).(*node)
-
-	inserted := false
-	for e := range bucket.nodes.Iter() {
-		if e.Value.(*node).lastActiveTime.After(
-			no.lastActiveTime) && !inserted {
-
-			bucket.nodes.InsertBefore(no, e)
-			inserted = true
-		}
+	replacement := bucket.candidates.Remove(bucket.candidates.Back())
+	if replacement == nil {
+		return
 	}
-
-	if !inserted {
-		bucket.nodes.PushBack(no)
-	}
+	no = replacement.(*node)
+	bucket.nodes.Push(no.id.RawString(), no)
 }
 
 // Fresh pings the expired nodes in the bucket.
@@ -316,12 +320,12 @@ func (tableNode *routingTableNode) Split() {
 
 	for e := range tableNode.KBucket().nodes.Iter() {
 		nd := e.Value.(*node)
-		tableNode.Child(nd.id.Bit(prefixLen)).KBucket().nodes.PushBack(nd)
+		tableNode.Child(nd.id.Bit(prefixLen)).KBucket().nodes.Push(nd.id.RawString(), nd)
 	}
 
 	for e := range tableNode.KBucket().candidates.Iter() {
 		nd := e.Value.(*node)
-		tableNode.Child(nd.id.Bit(prefixLen)).KBucket().candidates.PushBack(nd)
+		tableNode.Child(nd.id.Bit(prefixLen)).KBucket().candidates.Push(nd.id.RawString(), nd)
 	}
 
 	for i := 0; i < 2; i++ {
@@ -423,7 +427,7 @@ func (rt *routingTable) Insert(nd *node) bool {
 			root = root.Child(nd.id.Bit(prefixLen - 1))
 		} else {
 			// Finally, store node as a candidate and fresh the bucket.
-			root.KBucket().candidates.PushBack(nd)
+			root.KBucket().candidates.Push(nd.id.RawString(), nd)
 			if root.KBucket().candidates.Len() > rt.k {
 				root.KBucket().candidates.Remove(
 					root.KBucket().candidates.Front())
@@ -438,14 +442,30 @@ func (rt *routingTable) Insert(nd *node) bool {
 
 // GetNeighbors returns the size-length nodes closest to id.
 func (rt *routingTable) GetNeighbors(id *bitmap, size int) []*node {
-	nodes := rt.AllNodes()
-	if len(nodes) == 0 {
+	rt.cachedNodes.RLock()
+	defer rt.cachedNodes.RUnlock()
+
+	count := len(rt.cachedNodes.data)
+	if count == 0 {
 		return nil
 	}
-	if size <= 0 || size >= len(nodes) {
+	if size <= 0 || size >= count {
+		nodes := make([]*node, 0, count)
+		for _, val := range rt.cachedNodes.data {
+			nodes = append(nodes, val.(*node))
+		}
 		return nodes
 	}
-	return getTopKNodes(nodes, id, size)
+
+	// Select directly from the protected map. Active lookups call this path
+	// hundreds of times per second; avoiding an all-node snapshot removes one
+	// O(n) allocation per lookup. Calls are spread across many DHT instances,
+	// so the short read-side critical section does not serialize insertions.
+	topk := newTopKHeap(id, size)
+	for _, val := range rt.cachedNodes.data {
+		topk.add(val.(*node))
+	}
+	return topk.sorted()
 }
 
 // AllNodes returns a snapshot of all cached nodes without additional sorting.
@@ -603,34 +623,60 @@ func (rt *routingTable) Len() int {
 }
 
 // Implementation of heap with heap.Interface.
-type heapItem struct {
+type topKHeap struct {
 	target *bitmap
-	value  *node
+	nodes  []*node
 }
 
-type topKHeap []*heapItem
-
-func (kHeap topKHeap) Len() int {
-	return len(kHeap)
+func newTopKHeap(target *bitmap, capacity int) *topKHeap {
+	return &topKHeap{target: target, nodes: make([]*node, 0, capacity)}
 }
 
-func (kHeap topKHeap) Less(i, j int) bool {
-	return compareDistanceToTarget(kHeap[i].value.id, kHeap[j].value.id, kHeap[i].target) == 1
+func (kHeap *topKHeap) Len() int {
+	return len(kHeap.nodes)
 }
 
-func (kHeap topKHeap) Swap(i, j int) {
-	kHeap[i], kHeap[j] = kHeap[j], kHeap[i]
+func (kHeap *topKHeap) Less(i, j int) bool {
+	// A max-heap by XOR distance: the farthest retained node is the root.
+	return compareDistanceToTarget(kHeap.nodes[i].id, kHeap.nodes[j].id, kHeap.target) == 1
+}
+
+func (kHeap *topKHeap) Swap(i, j int) {
+	kHeap.nodes[i], kHeap.nodes[j] = kHeap.nodes[j], kHeap.nodes[i]
 }
 
 func (kHeap *topKHeap) Push(x interface{}) {
-	*kHeap = append(*kHeap, x.(*heapItem))
+	kHeap.nodes = append(kHeap.nodes, x.(*node))
 }
 
 func (kHeap *topKHeap) Pop() interface{} {
-	n := len(*kHeap)
-	x := (*kHeap)[n-1]
-	*kHeap = (*kHeap)[:n-1]
+	n := len(kHeap.nodes)
+	x := kHeap.nodes[n-1]
+	kHeap.nodes[n-1] = nil
+	kHeap.nodes = kHeap.nodes[:n-1]
 	return x
+}
+
+func (kHeap *topKHeap) add(value *node) {
+	if len(kHeap.nodes) < cap(kHeap.nodes) {
+		heap.Push(kHeap, value)
+		return
+	}
+	// The previous implementation compared against the last heap element,
+	// which is not the farthest element in a binary heap. Compare with the
+	// root and repair in place to keep the true closest K nodes.
+	if compareDistanceToTarget(kHeap.nodes[0].id, value.id, kHeap.target) == 1 {
+		kHeap.nodes[0] = value
+		heap.Fix(kHeap, 0)
+	}
+}
+
+func (kHeap *topKHeap) sorted() []*node {
+	tops := make([]*node, kHeap.Len())
+	for i := len(tops) - 1; i >= 0; i-- {
+		tops[i] = heap.Pop(kHeap).(*node)
+	}
+	return tops
 }
 
 // getTopKNodes solves the top-k problem with heap. It's time complexity is
@@ -643,34 +689,11 @@ func getTopKNodes(queue []*node, id *bitmap, k int) []*node {
 		return queue
 	}
 
-	topkHeap := make(topKHeap, 0, k+1)
-
+	topk := newTopKHeap(id, k)
 	for _, value := range queue {
-		if topkHeap.Len() == k {
-			var last = topkHeap[topkHeap.Len()-1]
-			if compareDistanceToTarget(last.value.id, value.id, id) == 1 {
-				item := &heapItem{
-					target: id,
-					value:  value,
-				}
-				heap.Push(&topkHeap, item)
-				heap.Pop(&topkHeap)
-			}
-		} else {
-			item := &heapItem{
-				target: id,
-				value:  value,
-			}
-			heap.Push(&topkHeap, item)
-		}
+		topk.add(value)
 	}
-
-	tops := make([]*node, topkHeap.Len())
-	for i := len(tops) - 1; i >= 0; i-- {
-		tops[i] = heap.Pop(&topkHeap).(*heapItem).value
-	}
-
-	return tops
+	return topk.sorted()
 }
 
 func compareDistanceToTarget(left, right, target *bitmap) int {

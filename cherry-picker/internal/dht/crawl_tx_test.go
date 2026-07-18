@@ -2,8 +2,10 @@ package dht
 
 import (
 	"fmt"
+	"net"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestCrawlTransactionInfoHashRoundTrip(t *testing.T) {
@@ -19,6 +21,89 @@ func TestCrawlTransactionInfoHashRoundTrip(t *testing.T) {
 	}
 }
 
+func TestFollowCrawlGetPeersResponseSendsOneBoundedQuery(t *testing.T) {
+	receiver, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer receiver.Close()
+	sender, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sender.Close()
+
+	remote, err := newNode("abcdefghijklmnopqrst", "udp4", receiver.LocalAddr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := &DHT{
+		Config:    &Config{Network: "udp4"},
+		conn:      sender,
+		blackList: newBlackList(16),
+	}
+	d.node, err = newNode("zyxwvutsrqponmlkjihg", "udp4", sender.LocalAddr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	infoHash := "0123456789abcdefghij"
+	txID := d.crawlGenTxID()
+	if !d.rememberCrawlInfoHashWithFollowups(txID, infoHash, 1) {
+		t.Fatal("failed to remember iterative transaction")
+	}
+	if !followCrawlGetPeersResponse(d, txID, remote.compactInfo) {
+		t.Fatal("expected one follow-up query")
+	}
+	if got := d.stats.followupsSent.Load(); got != 1 {
+		t.Fatalf("followups sent = %d, want 1", got)
+	}
+
+	if err := receiver.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 512)
+	n, _, err := receiver.ReadFromUDP(buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pkt, ok := parseCrawlPacket(buf[:n])
+	if !ok || pkt.q != getPeersType || pkt.infoHash != infoHash {
+		t.Fatalf("follow-up packet = %#v, ok=%v", pkt, ok)
+	}
+	entry, ok := d.crawlTransaction(pkt.t)
+	if !ok || entry.followups != 0 {
+		t.Fatalf("follow-up generation = %#v, ok=%v", entry, ok)
+	}
+	if string(entry.nodeID[:]) != remote.id.RawString() {
+		t.Fatalf("follow-up node ID = %x, want %x", entry.nodeID, remote.id.data)
+	}
+}
+
+func TestCrawlNodeIsCloser(t *testing.T) {
+	var target, current [20]byte
+	current[19] = 0x10
+
+	closer := make([]byte, 20)
+	closer[19] = 0x08
+	farther := make([]byte, 20)
+	farther[19] = 0x20
+	equal := make([]byte, 20)
+	equal[19] = 0x10
+
+	if !crawlNodeIsCloser(string(closer), current, target) {
+		t.Fatal("closer node was rejected")
+	}
+	if crawlNodeIsCloser(string(farther), current, target) {
+		t.Fatal("farther node was accepted")
+	}
+	if crawlNodeIsCloser(string(equal), current, target) {
+		t.Fatal("equal-distance node was accepted")
+	}
+	if crawlNodeIsCloser("short", current, target) {
+		t.Fatal("malformed node ID was accepted")
+	}
+}
+
 func TestCrawlTransactionRejectsOverwrittenGeneration(t *testing.T) {
 	d := &DHT{}
 	oldTxID := d.crawlGenTxID()
@@ -26,8 +111,8 @@ func TestCrawlTransactionRejectsOverwrittenGeneration(t *testing.T) {
 		t.Fatal("failed to remember old transaction")
 	}
 	oldCounter, _ := crawlTxCounter(oldTxID)
-	d.crawlTxCtr.Store(oldCounter + (1 << 16) - 1)
-	newTxID := d.crawlGenTxID() // same low 16-bit ring index
+	d.crawlTxCtr.Store(oldCounter + crawlTxRingSize - 1)
+	newTxID := d.crawlGenTxID() // same low ring index, different generation
 	if !d.rememberCrawlInfoHash(newTxID, "abcdefghij0123456789") {
 		t.Fatal("failed to remember new transaction")
 	}
