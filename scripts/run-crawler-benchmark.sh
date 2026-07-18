@@ -201,7 +201,8 @@ PY
 
 log_file="${run_dir}/crawler.log"
 metrics_file="${run_dir}/host-metrics.csv"
-echo "utc,elapsed_s,cpu_pct,rss_kb,threads,rx_bytes,tx_bytes,udp_rcvbuf_errors,udp_sndbuf_errors,oracle_unique" > "${metrics_file}"
+netdev="$(ip route show default 2>/dev/null | awk 'NR == 1 {print $5}')"
+echo "utc,elapsed_s,cpu_pct,rss_kb,threads,rx_bytes,tx_bytes,udp_rcvbuf_errors,udp_sndbuf_errors,tx_qdisc_drops,oracle_unique" > "${metrics_file}"
 start_epoch="$(date +%s)"
 
 env GOMAXPROCS=2 CHERRY_PICKER_MEM_LIMIT_MB=3072 CHERRY_PICKER_CONFIG="${effective_config}" \
@@ -218,9 +219,10 @@ monitor() {
     threads="$(awk '/Threads:/ {print $2}' "/proc/${crawler_pid}/status" 2>/dev/null || echo 0)"
     read -r rx tx < <(awk -F'[: ]+' '$1 != "lo" && NF > 10 {rx += $3; tx += $11} END {print rx+0, tx+0}' /proc/net/dev)
     read -r udp_rcv udp_snd < <(awk '$1 == "Udp:" { if (++row == 1) { for (i=2; i<=NF; i++) col[$i]=i } else { print $(col["RcvbufErrors"]), $(col["SndbufErrors"]) } }' /proc/net/snmp)
+    qdisc_drops="$(tc -s qdisc show dev "${netdev}" 2>/dev/null | awk '/^qdisc .* root/{root=1; next} root && /Sent / {for (i=1; i<=NF; i++) if ($i == "(dropped") {gsub(/,/, "", $(i+1)); print $(i+1); exit}}' || true)"
     stats="$(curl -fsS "${sink_base}/stats" 2>/dev/null || true)"
     oracle="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["metadata_unique"])' <<<"${stats}" 2>/dev/null || true)"
-    printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' "$(date -u +%FT%TZ)" "${elapsed}" "${cpu}" "${rss}" "${threads}" "${rx}" "${tx}" "${udp_rcv}" "${udp_snd}" "${oracle}" >> "${metrics_file}"
+    printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' "$(date -u +%FT%TZ)" "${elapsed}" "${cpu}" "${rss}" "${threads}" "${rx}" "${tx}" "${udp_rcv}" "${udp_snd}" "${qdisc_drops}" "${oracle}" >> "${metrics_file}"
     sleep 30
   done
 }

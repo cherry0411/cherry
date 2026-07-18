@@ -61,6 +61,7 @@ def parse_host_metrics(path: Path, warmup: float, total: float) -> list[dict[str
                 for key in (
                     "cpu_pct", "rss_kb", "threads", "rx_bytes", "tx_bytes",
                     "udp_rcvbuf_errors", "udp_sndbuf_errors", "oracle_unique",
+                    "tx_qdisc_drops",
                 ):
                     try:
                         row[key] = float(raw.get(key, ""))
@@ -272,6 +273,7 @@ def main() -> None:
             "host_tx_bytes": counter_delta(metrics, "tx_bytes"),
             "udp_rcvbuf_errors": counter_delta(metrics, "udp_rcvbuf_errors"),
             "udp_sndbuf_errors": counter_delta(metrics, "udp_sndbuf_errors"),
+            "tx_qdisc_drops": counter_delta(metrics, "tx_qdisc_drops"),
         },
         "health": {
             "runtime_windows_expected": expected_runtime_windows,

@@ -15,6 +15,7 @@ Every run has an immutable directory under `bench/runs/` containing:
 - warm/cold identity mode, port, node-ID cohort, host/kernel/sysctl snapshot;
 - complete crawler log and 30-second CPU/RSS/network/oracle samples;
 - per-run kernel UDP receive/send buffer error deltas;
+- egress qdisc drop deltas, which expose burst loss below the process socket;
 - uniqueness-oracle snapshots at the exact measurement boundaries;
 - oracle check-hash/found deltas, exposing how much of each arm's discovery
   stream was already consumed by prior sequential runs;
