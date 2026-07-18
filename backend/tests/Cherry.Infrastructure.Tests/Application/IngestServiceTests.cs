@@ -219,8 +219,9 @@ public sealed class IngestServiceTests
         public Task<Torrent?> GetByInfoHashAsync(string infoHash, CancellationToken ct = default) =>
             throw new NotSupportedException();
 
-        public Task<(List<Torrent> Items, long Total)> SearchAsync(
+        public Task<(List<Torrent> Items, long Total, DateOnly? HeatAsOfDay, int HeatCoverageDays)> SearchAsync(
             string query,
+            string heatWindow,
             int page,
             int pageSize,
             CancellationToken ct = default) =>

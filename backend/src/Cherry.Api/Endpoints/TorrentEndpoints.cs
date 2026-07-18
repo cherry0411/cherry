@@ -101,6 +101,7 @@ public static class TorrentEndpoints
             .WithDescription("Search torrents by name using trigram fuzzy matching. Supports pagination and file type filter.")
             .Produces<SearchResponse>(200)
             .Produces(400)
+            .Produces(StatusCodes.Status503ServiceUnavailable)
             .CacheOutput(p => p.Expire(TimeSpan.FromSeconds(15)));
 
         group.MapGet("/{infoHash:regex(^[a-f0-9]{{40}}$)}", GetDetailAsync)
@@ -503,21 +504,39 @@ public static class TorrentEndpoints
     private sealed class DurableRequestTooLargeException(string message) : Exception(message);
 
     private static async Task<IResult> SearchAsync(
-        [FromQuery] string q,
+        [FromQuery] string? q,
+        [FromQuery] string? heatWindow,
         [FromQuery] int page,
         [FromQuery] int size,
         SearchService searchService,
+        ILogger<SearchService> logger,
         CancellationToken ct)
     {
-        if (string.IsNullOrWhiteSpace(q))
-            return Results.BadRequest(new { error = "Query parameter 'q' is required" });
+        q = q?.Trim() ?? string.Empty;
+        heatWindow = string.IsNullOrWhiteSpace(heatWindow) ? "7d" : heatWindow.Trim().ToLowerInvariant();
+        if (heatWindow is not ("1d" or "7d" or "15d" or "30d"))
+            return Results.BadRequest(new { error = "heatWindow must be 1d, 7d, 15d, or 30d" });
 
         page = Math.Max(1, page);
         size = Math.Clamp(size == 0 ? 20 : size, 1, 100);
 
-        var result = await searchService.SearchAsync(
-            new SearchRequest(q, page, size), ct);
-        return Results.Ok(result);
+        try
+        {
+            var result = await searchService.SearchAsync(
+                new SearchRequest(q, heatWindow, page, size), ct);
+            return Results.Ok(result);
+        }
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+        {
+            logger.LogWarning("Meilisearch request timed out");
+            return Results.Json(new { error = "Search index is temporarily unavailable" }, statusCode: 503);
+        }
+        catch (Exception exception) when (
+            exception is HttpRequestException or Cherry.Infrastructure.Search.MeiliSearchUnavailableException)
+        {
+            logger.LogWarning(exception, "Meilisearch request failed");
+            return Results.Json(new { error = "Search index is temporarily unavailable" }, statusCode: 503);
+        }
     }
 
     private static async Task<IResult> GetDetailAsync(

@@ -833,3 +833,106 @@ respectively, `06c6027193966648b3b49df2bf1faca879821803c1eb498b063ed233fcff4840`
 `13dc4a83e6afa3dbb49daf3d06bb4d274e5e993438c62e790dce617da22d5baa`,
 `3a5b2dbd60e14d6e89b83a783c8a14c2d65b0d89b75457f81277766dfd348ba7`,
 and `15890658ecc1e7f6f3e16998a5774023f0c07c369a4ef121c7db6f2f454af91d`.
+
+## Iteration S-007: implemented heat path and real-component gate
+
+S-007 turns the S-005 choice into an end-to-end implementation. Crawler heat
+admission observes only inbound public DHT `get_peers` actors, normalizes IPv6
+to /64, derives a daily keyed 64-bit identity, and never persists or transmits
+the network address. A separate transport HMAC secret authenticates the compact
+CHHT v1 payload; the raw secret is never sent as an API key. The crawler uses a
+bounded non-blocking queue and a segmented crash-safe spool. A segment advances
+only after an exact authenticated receipt, or an authenticated `day_closed`
+negative receipt whose loss is counted explicitly.
+
+The API authenticates and canonically decodes before checking day state, then
+group-commits exact observations into one SQLite/WAL writer. Day sealing maps
+hashes to catalog IDs in batches and commits exactly 64 immutable PostgreSQL
+frames plus a manifest before deleting SQLite. Only a complete expected-crawler
+day contributes heat. A partial day still advances the sequential projection
+with a zero contribution and clears its bit in the 30-day coverage mask, so one
+regional outage cannot permanently block later days. Search exposes both the
+projected date and selected-window coverage count.
+
+Meilisearch receives only `id`, `name`, `firstSeen`, and four projected heat
+values. Its ranking rules keep words/typo/proximity/attribute/exactness ahead of
+the selected heat sort for text queries; an empty query is the heat-sorted hot
+list. Real Meilisearch 1.45.1 returned `[3,1,2]` for the controlled text query
+(the typo result remained last despite high heat) and `[2,3,1]` for the empty
+query. Settings creation/update and indexing task completion are checked;
+startup or projection cannot silently advance across a failed Meili task.
+
+### Bounded end-to-end ingest result
+
+The reproducible standard-library harness sent two independent sequential
+crawler streams concurrently to the real .NET API. The API was limited to
+0.75 CPU and 640 MiB; PostgreSQL 17.10 and Meilisearch 1.45.1 were separately
+limited as recorded in
+`scripts/benchmark/testdata/storage_heat_s007_e2e_20260718.json`.
+
+| Measure | Result |
+|---|---:|
+| Source observations | 8,192,000 |
+| Wall time / throughput | 79.372 s / 103,211 observations/s |
+| Exact unique pairs | 4,017,247 |
+| ACK p50 / p95 / p99 | 50.8 / 100.9 / 162.8 ms |
+| API sampled peak | 66.19% of one CPU / 158.5 MiB |
+| Queue rejects / failed batches | 0 / 0 |
+| Final SQLite DB | 72,945,664 bytes; integrity `ok` |
+| Response-loss replay | same 4,096 inserted count; 20.7 ms ACK |
+
+The final database used 18.16 bytes per exact pair in this run, but the stream
+had only 2,000 distinct hashes, so dictionary overhead is under-represented.
+S-005's long-tail key-shape result remains the storage-capacity authority. The
+approximately 497 MB of sampled API block writes also shows that production
+disk endurance and fsync tails, not CPU, are the next host-specific gate.
+
+Three real PostgreSQL 17 integration cases now cover exact accumulation through
+64-frame sealing and verified deletion, complete-partial-complete projection
+including the D-29 coverage bit, and Meili
+pending→processing→failed→resubmit→succeeded recovery without premature
+watermark advancement or frame GC. The full backend suite passed 76/76, while
+the Go suite and vet passed independently.
+
+### Decision, limitations and rollback
+
+The required path remains SQLite/WAL plus PostgreSQL daily frames; Redis is not
+introduced. This gate is synthetic, uses Docker Desktop storage, samples rather
+than continuously records resources, and does not combine peak metadata
+indexing, query traffic, UTC sealing and heat ingest. It therefore validates
+the implementation and 2C4G direction but is not a final stability promotion.
+
+Rollback disables heat ingestion while retaining crawler spools and durable
+PostgreSQL frames/manifests. A daily SQLite file is never deleted until its 64
+frames and manifest verify; after repair, unacknowledged segments replay. A
+closed partial day cannot be retroactively projected, so its authenticated
+negative receipts and partial manifest remain explicit loss evidence.
+
+## Iteration S-008: final-image metadata/search/restart gate
+
+A fresh PostgreSQL 17.10 and Meilisearch 1.45.1 stack ran the final API image
+under the deployment's 2C4G limits. Twenty 1,000-event durable batches inserted
+20,000 zero-raw, one-file Chinese/English records in 5.362 seconds (3,730
+events/s). All receipts committed, the 20,000 search documents drained through
+40 successful 500-document Meili tasks with no retry, and the final outbox was
+empty. Controlled Chinese, English and empty-query hot-list requests all
+returned the expected document class.
+
+The thin Meili document store reported 1,794,048 raw bytes (81 average bytes
+per document). PostgreSQL used 16,111,283 database bytes; the 20,000 compact
+detail payloads themselves totalled 884,642 bytes. These are implementation
+figures, not corpus projections: every synthetic record had one short path.
+
+Sampled peaks remained far below the hard limits: API 44.96% of one CPU and
+108.5 MiB, PostgreSQL 67.09% and 54.43 MiB, Meili 35.60% and 127.5 MiB. After
+an API restart, the probabilistic fast path rebuilt from all 20,000 exact
+PostgreSQL hashes before enabling. Replaying the last metadata range returned
+its original 1,000-accepted receipt without a duplicate effect; replaying the
+first heat range returned its original 4,096-received/2,048-inserted receipt.
+
+Evidence is in
+`scripts/benchmark/testdata/storage_full_stack_s008_20260718.json`. The default
+Meili outbox batch stays at 500: observed crawler production is far below this
+gate, while a smaller task bounds retry amplification and the queue had no
+capacity pressure. UTC sealing is covered by real PostgreSQL integration tests,
+not a wall-clock rollover in this run. This remains pre-stability evidence.

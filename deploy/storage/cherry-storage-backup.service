@@ -1,0 +1,16 @@
+[Unit]
+Description=Cherry off-host PostgreSQL and heat base backup
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/cherry-backup.env
+ExecStart=/usr/local/sbin/cherry-storage-backup
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+CPUWeight=20
+IOWeight=20
+UMask=0077

@@ -169,3 +169,55 @@ func TestLoadDefaultStoragePolicyIsConservative(t *testing.T) {
 		t.Fatalf("default bounded spool bytes=%d", cfg.Exporter.SpoolMaxBytes)
 	}
 }
+
+func TestLoadHeatConfigDefaultsDisabledAndUsesSecretFilePaths(t *testing.T) {
+	t.Setenv("CHERRY_PICKER_CONFIG", "")
+	t.Setenv("CHERRY_PICKER_HEAT_ENABLED", "true")
+	t.Setenv("CHERRY_PICKER_HEAT_ENDPOINT", "https://storage.example/api/v1/heat/ingest")
+	t.Setenv("CHERRY_PICKER_HEAT_CRAWLER_ID", "jp-1")
+	t.Setenv("CHERRY_PICKER_HEAT_MASTER_SECRET_FILE", "/run/secrets/heat-master")
+	t.Setenv("CHERRY_PICKER_HEAT_HMAC_SECRET_FILE", "/run/secrets/heat-hmac")
+	t.Setenv("CHERRY_PICKER_HEAT_SPOOL_DIR", "/var/lib/cherry-picker/heat")
+	t.Setenv("CHERRY_PICKER_HEAT_KNOWN_CRAWLERS", "1.1.1.1,2001:db8::/32")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Heat.Enabled || cfg.Heat.CrawlerID != "jp-1" ||
+		cfg.Heat.MasterSecretFile != "/run/secrets/heat-master" ||
+		cfg.Heat.HMACSecretFile != "/run/secrets/heat-hmac" || cfg.Heat.QueueCapacity != 65_536 ||
+		cfg.Heat.BatchSize != 4_096 || cfg.Heat.SpoolMaxBytes != 512<<20 {
+		t.Fatalf("unexpected heat config: %+v", cfg.Heat)
+	}
+}
+
+func TestLoadHeatConfigFromJSONContainsPathsNotSecretValues(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "crawler.json")
+	if err := os.WriteFile(path, []byte(`{
+  "role": "combined",
+  "heat": {
+    "enabled": true,
+    "endpoint": "https://storage.example/api/v1/heat/ingest",
+    "crawler_id": "jp-1",
+    "master_secret_file": "/run/secrets/heat-master",
+    "hmac_secret_file": "/run/secrets/heat-hmac",
+    "spool_dir": "/var/lib/cherry-picker/heat",
+    "queue_capacity": 100,
+    "batch_size": 200,
+    "flush_interval": "10ms"
+  }
+}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CHERRY_PICKER_CONFIG", path)
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Heat.Enabled || cfg.Heat.HMACSecretFile != "/run/secrets/heat-hmac" ||
+		cfg.Heat.QueueCapacity != 100 || cfg.Heat.BatchSize != 100 ||
+		cfg.Heat.FlushInterval != 10*time.Millisecond {
+		t.Fatalf("unexpected JSON heat config: %+v", cfg.Heat)
+	}
+}

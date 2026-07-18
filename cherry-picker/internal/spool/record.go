@@ -79,8 +79,9 @@ type NormalizedMetadata struct {
 }
 
 // SummaryMetadata is the bounded representation for torrents whose complete
-// path list is too expensive. RepresentativeFiles contains basenames or short
-// normalized paths only and is capped by validation.
+// path list is too expensive. RepresentativeFiles is retained only so rolling
+// upgrades can decode and replay older durable summaries; the current storage
+// policy always leaves it empty. Validation remains bounded for legacy input.
 type SummaryMetadata struct {
 	Name                string             `json:"name"`
 	TotalLength         uint64             `json:"total_length"`

@@ -1,0 +1,92 @@
+{
+  "schema": "cherry.storage-heat-s007-e2e.v1",
+  "recorded_at_utc": "2026-07-18T13:10:13.972738+00:00",
+  "limits": {
+    "host_profile": "2C4G target",
+    "api": {
+      "cpus": 0.75,
+      "memory_bytes": 671088640
+    },
+    "postgres": {
+      "cpus": 2.0,
+      "memory_bytes": 1610612736
+    },
+    "meilisearch": {
+      "cpus": 1.0,
+      "memory_bytes": 1342177280,
+      "max_indexing_memory": "640MiB",
+      "max_indexing_threads": 1
+    }
+  },
+  "runtime": {
+    "api_image_id": "sha256:cf0580afa6da3fe8b88f1f840d95960b35bd91d102bb9b73b393434523f45ff9",
+    "postgres_version": "17.10",
+    "postgres_image": "postgres@sha256:742f40ea20b9ff2ff31db5458d127452988a2164df9e17441e191f3b72252193",
+    "meilisearch_version": "1.45.1",
+    "meilisearch_image": "getmeili/meilisearch@sha256:ac40212f9e5a7526d8007586e3e46fb0441d29dd36c7b02fa2341d2c9a1f6493",
+    "harness_sha256": "68f66a321a5f7008738231db674bfe5bb30a6986d87dc31d2218b4e1942dbe8b",
+    "raw_run_sha256": "c5f374e0be0855b5b1f27c7bcd62d121451509071f920b924819ec77c941cd72"
+  },
+  "heat_ingest": {
+    "crawler_streams": 2,
+    "batches_per_crawler": 1000,
+    "source_records_per_batch": 4096,
+    "source_records": 8192000,
+    "wall_seconds": 79.37154879979789,
+    "source_records_per_second": 103210.78678536332,
+    "canonical_records_received": 8192000,
+    "exact_pairs_inserted": 4017247,
+    "ack_ms": {
+      "mean": 55.98036054894328,
+      "p50": 50.79249991104007,
+      "p95": 100.89410003274679,
+      "p99": 162.77899965643883
+    },
+    "response_loss_replay": {
+      "ack_ms": 20.659999921917915,
+      "original_inserted_count": 4096,
+      "replay_inserted_count": 4096,
+      "exactly_once_effect": true
+    },
+    "sqlite": {
+      "database_bytes": 72945664,
+      "hash_dictionary_rows": 2000,
+      "seen_rows": 4017247,
+      "receipt_rows": 2000,
+      "database_bytes_per_exact_pair": 18.155632,
+      "integrity_check": "ok"
+    },
+    "sampled_api_resources": {
+      "peak_cpu_percent_of_one_cpu": 66.19,
+      "peak_memory_mib": 158.5,
+      "block_write_bytes_approx": 497000000,
+      "queue_rejections": 0,
+      "failed_batches": 0
+    }
+  },
+  "real_component_gates": {
+    "postgres17_tests": {
+      "passed": 76,
+      "failed": 0,
+      "coverage": [
+        "exact actor-day deduplication, catalog mapping, 64 immutable frames, verification before SQLite deletion",
+        "complete-partial-complete projection recovery and 30-bit coverage mask including D-29",
+        "Meilisearch pending-processing-failed-resubmit-succeeded task recovery without premature watermark or GC"
+      ]
+    },
+    "meilisearch_ranking": {
+      "text_query_document_order": [3, 1, 2],
+      "empty_query_document_order": [2, 3, 1],
+      "expected_semantics": "text relevance precedes heat for non-empty queries; empty queries are heat-first hot lists",
+      "passed": true
+    }
+  },
+  "limitations": [
+    "Synthetic actor/hash stream with only 2000 distinct hashes; dictionary overhead is under-represented, so the S-005 key-shape benchmark remains the capacity authority.",
+    "Docker Desktop storage is not the production server filesystem and does not establish production fsync/checkpoint tail latency.",
+    "Resource polling was sampled and the run did not combine maximum metadata indexing, search traffic, day sealing and heat ingestion simultaneously.",
+    "This is an implementation and directional resource gate, not the user-authorized final stability test."
+  ],
+  "decision": "Accept SQLite/WAL exact daily state and PostgreSQL daily frames without Redis as the required path; retain Redis only as an optional future intraday cache.",
+  "rollback": "Disable Heat, preserve crawler spools and PostgreSQL frame/manifests, then replay after repair; do not delete a daily SQLite accumulator until its 64-frame manifest is durably verified."
+}

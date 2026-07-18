@@ -22,6 +22,7 @@ type Config struct {
 	Metadata    MetadataConfig
 	Filter      FilterConfig
 	Exporter    ExporterConfig
+	Heat        HeatConfig
 	AutoTune    bool
 	TargetCPU   float64
 	// MemLimitMB 显式指定进程内存上限（MB）。0 = 自动探测
@@ -88,8 +89,6 @@ type FilterConfig struct {
 	SummaryAbovePathBytes int
 	MaxFullPathBytes      int
 	MaxStoredNameBytes    int
-	SummaryMaxAliases     int
-	SummaryAliasBytes     int
 	SummaryMaxExtensions  int
 	HashOnlyAboveFiles    int
 	RejectAboveFiles      int
@@ -124,6 +123,25 @@ type ExporterConfig struct {
 	// SpoolMaxBytes 是 spool 总磁盘上限（字节），用于背压；durable
 	// spool 启用时 0/负数会归一化为安全的 4 GiB 默认值。
 	SpoolMaxBytes int64
+}
+
+// HeatConfig is a separate privacy-reduced, durable get_peers activity
+// channel. Secret values are never accepted inline: only paths to 0600 files
+// are configured. Enabled defaults to false.
+type HeatConfig struct {
+	Enabled          bool
+	Endpoint         string
+	CrawlerID        string
+	MasterSecretFile string
+	HMACSecretFile   string
+	SpoolDir         string
+	SpoolMaxBytes    int64
+	KnownCrawlers    string
+	QueueCapacity    int
+	BatchSize        int
+	FlushInterval    time.Duration
+	HTTPTimeout      time.Duration
+	RetryBackoff     time.Duration
 }
 
 func Load() (Config, error) {
@@ -189,8 +207,6 @@ func Load() (Config, error) {
 			SummaryAbovePathBytes: getenvInt("CHERRY_PICKER_POLICY_SUMMARY_PATH_BYTES", 0),
 			MaxFullPathBytes:      getenvInt("CHERRY_PICKER_POLICY_MAX_PATH_BYTES", 0),
 			MaxStoredNameBytes:    getenvInt("CHERRY_PICKER_POLICY_MAX_NAME_BYTES", 0),
-			SummaryMaxAliases:     getenvInt("CHERRY_PICKER_POLICY_SUMMARY_ALIASES", 0),
-			SummaryAliasBytes:     getenvInt("CHERRY_PICKER_POLICY_SUMMARY_ALIAS_BYTES", 0),
 			SummaryMaxExtensions:  getenvInt("CHERRY_PICKER_POLICY_SUMMARY_EXTENSIONS", 0),
 			HashOnlyAboveFiles:    getenvInt("CHERRY_PICKER_POLICY_HASH_ONLY_FILES", 0),
 			RejectAboveFiles:      getenvInt("CHERRY_PICKER_POLICY_REJECT_FILES", 0),
@@ -211,6 +227,21 @@ func Load() (Config, error) {
 			CrawlerID:      strings.TrimSpace(os.Getenv("CHERRY_PICKER_CRAWLER_ID")),
 			SpoolDir:       getenvDefault("CHERRY_PICKER_SPOOL_DIR", ""),
 			SpoolMaxBytes:  int64(getenvInt("CHERRY_PICKER_SPOOL_MAX_BYTES", 0)),
+		},
+		Heat: HeatConfig{
+			Enabled:          getenvBool("CHERRY_PICKER_HEAT_ENABLED", false),
+			Endpoint:         strings.TrimSpace(os.Getenv("CHERRY_PICKER_HEAT_ENDPOINT")),
+			CrawlerID:        strings.TrimSpace(os.Getenv("CHERRY_PICKER_HEAT_CRAWLER_ID")),
+			MasterSecretFile: strings.TrimSpace(os.Getenv("CHERRY_PICKER_HEAT_MASTER_SECRET_FILE")),
+			HMACSecretFile:   strings.TrimSpace(os.Getenv("CHERRY_PICKER_HEAT_HMAC_SECRET_FILE")),
+			SpoolDir:         strings.TrimSpace(os.Getenv("CHERRY_PICKER_HEAT_SPOOL_DIR")),
+			SpoolMaxBytes:    int64(getenvInt("CHERRY_PICKER_HEAT_SPOOL_MAX_BYTES", 0)),
+			KnownCrawlers:    strings.TrimSpace(os.Getenv("CHERRY_PICKER_HEAT_KNOWN_CRAWLERS")),
+			QueueCapacity:    getenvInt("CHERRY_PICKER_HEAT_QUEUE", 0),
+			BatchSize:        getenvInt("CHERRY_PICKER_HEAT_BATCH", 0),
+			FlushInterval:    getenvDuration("CHERRY_PICKER_HEAT_FLUSH", 0),
+			HTTPTimeout:      getenvDuration("CHERRY_PICKER_HEAT_HTTP_TIMEOUT", 0),
+			RetryBackoff:     getenvDuration("CHERRY_PICKER_HEAT_RETRY_BACKOFF", 0),
 		},
 	}
 
@@ -287,8 +318,6 @@ func loadFromFile(path string) (Config, error) {
 			SummaryAbovePathBytes: raw.Filter.SummaryAbovePathBytes,
 			MaxFullPathBytes:      raw.Filter.MaxFullPathBytes,
 			MaxStoredNameBytes:    raw.Filter.MaxStoredNameBytes,
-			SummaryMaxAliases:     raw.Filter.SummaryMaxAliases,
-			SummaryAliasBytes:     raw.Filter.SummaryAliasBytes,
 			SummaryMaxExtensions:  raw.Filter.SummaryMaxExtensions,
 			HashOnlyAboveFiles:    raw.Filter.HashOnlyAboveFiles,
 			RejectAboveFiles:      raw.Filter.RejectAboveFiles,
@@ -309,6 +338,21 @@ func loadFromFile(path string) (Config, error) {
 			CrawlerID:      strings.TrimSpace(raw.Exporter.CrawlerID),
 			SpoolDir:       strings.TrimSpace(raw.Exporter.SpoolDir),
 			SpoolMaxBytes:  raw.Exporter.SpoolMaxBytes,
+		},
+		Heat: HeatConfig{
+			Enabled:          raw.Heat.Enabled,
+			Endpoint:         strings.TrimSpace(raw.Heat.Endpoint),
+			CrawlerID:        strings.TrimSpace(raw.Heat.CrawlerID),
+			MasterSecretFile: strings.TrimSpace(raw.Heat.MasterSecretFile),
+			HMACSecretFile:   strings.TrimSpace(raw.Heat.HMACSecretFile),
+			SpoolDir:         strings.TrimSpace(raw.Heat.SpoolDir),
+			SpoolMaxBytes:    raw.Heat.SpoolMaxBytes,
+			KnownCrawlers:    strings.TrimSpace(raw.Heat.KnownCrawlers),
+			QueueCapacity:    raw.Heat.QueueCapacity,
+			BatchSize:        raw.Heat.BatchSize,
+			FlushInterval:    parseDuration(raw.Heat.FlushInterval),
+			HTTPTimeout:      parseDuration(raw.Heat.HTTPTimeout),
+			RetryBackoff:     parseDuration(raw.Heat.RetryBackoff),
 		},
 	}
 
@@ -410,6 +454,27 @@ func normalize(cfg Config) Config {
 		// consume the crawler's entire disk. Operators can raise this explicitly.
 		cfg.Exporter.SpoolMaxBytes = 4 << 30
 	}
+	if cfg.Heat.QueueCapacity <= 0 {
+		cfg.Heat.QueueCapacity = 65_536
+	}
+	if cfg.Heat.BatchSize <= 0 {
+		cfg.Heat.BatchSize = 4_096
+	}
+	if cfg.Heat.BatchSize > cfg.Heat.QueueCapacity {
+		cfg.Heat.BatchSize = cfg.Heat.QueueCapacity
+	}
+	if cfg.Heat.FlushInterval <= 0 {
+		cfg.Heat.FlushInterval = 25 * time.Millisecond
+	}
+	if cfg.Heat.HTTPTimeout <= 0 {
+		cfg.Heat.HTTPTimeout = 10 * time.Second
+	}
+	if cfg.Heat.RetryBackoff <= 0 {
+		cfg.Heat.RetryBackoff = time.Second
+	}
+	if cfg.Heat.SpoolMaxBytes <= 0 {
+		cfg.Heat.SpoolMaxBytes = 512 << 20
+	}
 
 	switch cfg.Role {
 	case "discovery":
@@ -443,6 +508,7 @@ type fileConfig struct {
 	Metadata    fileMetadataConfig  `json:"metadata"`
 	Filter      fileFilterConfig    `json:"filter"`
 	Exporter    fileExporterConfig  `json:"exporter"`
+	Heat        fileHeatConfig      `json:"heat"`
 }
 
 type fileFilterConfig struct {
@@ -453,8 +519,6 @@ type fileFilterConfig struct {
 	SummaryAbovePathBytes int `json:"summary_above_path_bytes"`
 	MaxFullPathBytes      int `json:"max_full_path_bytes"`
 	MaxStoredNameBytes    int `json:"max_stored_name_bytes"`
-	SummaryMaxAliases     int `json:"summary_max_aliases"`
-	SummaryAliasBytes     int `json:"summary_alias_bytes"`
 	SummaryMaxExtensions  int `json:"summary_max_extensions"`
 	HashOnlyAboveFiles    int `json:"hash_only_above_files"`
 	RejectAboveFiles      int `json:"reject_above_files"`
@@ -514,6 +578,22 @@ type fileExporterConfig struct {
 	SpoolMaxBytes  int64  `json:"spool_max_bytes"`
 }
 
+type fileHeatConfig struct {
+	Enabled          bool   `json:"enabled"`
+	Endpoint         string `json:"endpoint"`
+	CrawlerID        string `json:"crawler_id"`
+	MasterSecretFile string `json:"master_secret_file"`
+	HMACSecretFile   string `json:"hmac_secret_file"`
+	SpoolDir         string `json:"spool_dir"`
+	SpoolMaxBytes    int64  `json:"spool_max_bytes"`
+	KnownCrawlers    string `json:"known_crawlers"`
+	QueueCapacity    int    `json:"queue_capacity"`
+	BatchSize        int    `json:"batch_size"`
+	FlushInterval    string `json:"flush_interval"`
+	HTTPTimeout      string `json:"http_timeout"`
+	RetryBackoff     string `json:"retry_backoff"`
+}
+
 // normalizeFilterConfig applies built-in defaults for any filter threshold that
 // is zero (unset). A negative value disables the corresponding rule.
 func normalizeFilterConfig(f *FilterConfig) {
@@ -537,12 +617,6 @@ func normalizeFilterConfig(f *FilterConfig) {
 	}
 	if f.MaxStoredNameBytes <= 0 {
 		f.MaxStoredNameBytes = 1 << 10
-	}
-	if f.SummaryMaxAliases <= 0 {
-		f.SummaryMaxAliases = 32
-	}
-	if f.SummaryAliasBytes <= 0 {
-		f.SummaryAliasBytes = 4 << 10
 	}
 	if f.SummaryMaxExtensions <= 0 {
 		f.SummaryMaxExtensions = 32

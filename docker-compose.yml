@@ -54,7 +54,7 @@ services:
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-cherry}
       POSTGRES_USER: ${POSTGRES_USER:-cherry}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-cindy131120}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
     volumes:
       - pgdata:/var/lib/postgresql/data
     ports:
@@ -73,7 +73,7 @@ services:
         condition: service_healthy
     environment:
       ConnectionStrings__Default: >-
-        Host=postgres;Port=5432;Database=${POSTGRES_DB:-cherry};Username=${POSTGRES_USER:-cherry};Password=${POSTGRES_PASSWORD:-cindy131120};Pooling=true;MaxPoolSize=64
+        Host=postgres;Port=5432;Database=${POSTGRES_DB:-cherry};Username=${POSTGRES_USER:-cherry};Password=${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env};Pooling=true;MaxPoolSize=64
       MeiliSearch__Url: http://meilisearch:7700
       ApiKey: ${CHERRY_API_KEY:-}
     volumes:

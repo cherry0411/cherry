@@ -23,8 +23,15 @@ func TestDefaultPolicyFileThreshold(t *testing.T) {
 	if summary.Action != ActionSummary || summary.Record.Encoding != spool.EncodingSummary {
 		t.Fatalf("above threshold: %+v", summary)
 	}
-	if summary.Record.Summary.FileCount != 2001 || len(summary.Record.Summary.RepresentativeFiles) > 32 || len(summary.Record.Summary.Extensions) > 32 {
+	if summary.Record.Summary.FileCount != 2001 || len(summary.Record.Summary.RepresentativeFiles) != 0 || len(summary.Record.Summary.Extensions) > 32 {
 		t.Fatalf("unbounded summary: %+v", summary.Record.Summary)
+	}
+	encoded, err := json.Marshal(summary.Record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(encoded), "representative_files") {
+		t.Fatalf("new summary emitted removed representative_files field: %s", encoded)
 	}
 }
 
@@ -37,12 +44,8 @@ func TestDefaultPolicyPathBudget(t *testing.T) {
 	if decision.Action != ActionSummary || decision.Reason != ReasonPathBytes {
 		t.Fatalf("decision=%+v", decision)
 	}
-	aliasBytes := 0
-	for _, file := range decision.Record.Summary.RepresentativeFiles {
-		aliasBytes += len(file.Path)
-	}
-	if aliasBytes > DefaultConfig().SummaryAliasBytes {
-		t.Fatalf("alias bytes=%d exceed budget", aliasBytes)
+	if len(decision.Record.Summary.RepresentativeFiles) != 0 {
+		t.Fatalf("new summary unexpectedly retained representative files: %+v", decision.Record.Summary)
 	}
 }
 
@@ -97,7 +100,6 @@ func TestPolicyRejectsBudgetsOutsideClosedWireSchema(t *testing.T) {
 		func(config *Config) { config.SummaryAboveFiles = maxWireNormalizedFiles + 1 },
 		func(config *Config) { config.MaxNameBytes = maxWireNameBytes + 1 },
 		func(config *Config) { config.MaxFullPathBytes = maxWirePathBytes + 1 },
-		func(config *Config) { config.SummaryMaxAliases = maxWireSummaryAliases + 1 },
 		func(config *Config) { config.SummaryMaxExtensions = maxWireSummaryExts + 1 },
 	}
 	for index, mutate := range tests {

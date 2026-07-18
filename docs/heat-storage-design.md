@@ -26,9 +26,9 @@ Permanent raw bencode retention remains **0%**.
   a tie-breaker for non-empty searches and the primary ordering for an empty
   hot-list query.
 
-## Current implementation is not a heat authority
+## Retired predecessor was not a heat authority
 
-The current crawler increments `peer_count` only after a metadata request hits
+The pre-CHHT crawler incremented `peer_count` only after a metadata request hit
 its finite `(infohash, IP, port)` LRU or after the hash is already in the
 remote-known cache. A first usable peer is not counted. The 20-second HTTP path
 sends only `{hash: count}`, has no identity or receipt, drops the swapped map on
@@ -36,7 +36,8 @@ failure, and cannot deduplicate between regions. PostgreSQL accumulates the
 integer and a manually invoked endpoint halves values whose last update is more
 than seven days old. Meilisearch is not updated by this path. Therefore the
 field is neither a peer count nor a 1/7/15/30-day activity measure and must be
-retired rather than migrated as truth.
+retired rather than migrated as truth. The implemented CHHT/SQLite/frame path
+described below replaces it; `peer_count` is not present in the compact catalog.
 
 ## K-001: compact internal key cost on real PostgreSQL 17
 
@@ -144,6 +145,8 @@ IPv6 actor = HMAC64(secret, family || public /64 prefix)
 ephemeral SQLite per UTC day:
   hashes(id, info_hash20 unique)
   seen(hash_id, actor_fp64) primary key(hash_id, actor_fp64)
+  receipts(crawler_id, epoch, start_sequence, end_sequence, digest)
+  completions(crawler_id, epoch, start_sequence, next_sequence, clean=1)
 
 durable PostgreSQL:
   heat_day_frames(day, shard, codec_version, entry_count,
@@ -185,8 +188,9 @@ change are in `D ∪ D-1 ∪ D-7 ∪ D-15 ∪ D-30`. For each affected ID the pr
 streams the current 30 frames, computes absolute 1/7/15/30-day values, skips an
 unchanged vector and uses an idempotent Meilisearch partial PUT. Missed days
 must be replayed sequentially; initial or new-index rebuilds use the complete
-30-day union. A sealed empty day is explicit, while missing/partial coverage
-halts projection instead of being treated as zero. Frame GC follows the
+30-day union. A sealed empty day is explicit. A missing or unsealed day halts;
+a sealed partial day advances with zero contribution and a cleared coverage
+bit, so later good days remain usable without fabricating observations. Frame GC follows the
 `projected_through` watermark, so outages may temporarily retain more than 31
 days.
 
@@ -203,3 +207,22 @@ HLL can err in both directions and the tested Bloom conservatively undercounted.
 A bounded Redis Bloom may be added only as a disposable current-day cache if
 the product later requires live intraday ranking; it never becomes the daily
 authority.
+
+## H-002 decision: authenticated fail-closed daily completion
+
+Receipt presence is not coverage proof. A day is `complete` only when every
+configured `ExpectedCrawlerId` has an authenticated, idempotent completion in
+that day's SQLite file and sealing re-verifies a single-epoch receipt chain
+that starts and ends at the completion's exact sequence anchors. Missing,
+conflicting, discontinuous, multi-epoch, dirty, or late completion evidence is
+`partial`. Empty days require an explicit completion with `start == next`.
+
+Batch and completion authentication resolve a crawler-specific Base64 transport
+key. Production startup fails if any expected crawler lacks its own key; the
+cross-region actor master remains shared but cannot authenticate transport.
+The crawler persists a spool-epoch-bound boundary ledger. UTC rollover takes a
+writer barrier, and completion waits until the ordinary spool cursor proves all
+records through the day's exclusive end were durably receipted. Queue drop,
+writer loss, negative day-closed receipt, first partial startup, clock jump,
+abnormal restart, or any same-day graceful stop/restart marks the day dirty.
+This intentionally permits false `partial` and forbids false `complete`.

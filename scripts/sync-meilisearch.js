@@ -1,89 +1,149 @@
-// Sync PostgreSQL torrents → Meilisearch
-// Usage: node scripts/sync-meilisearch.js
-const { Client } = require('pg');
-const MEILI = 'http://localhost:7700';
-const BATCH = 1000;
+#!/usr/bin/env node
+// Refresh the thin Meilisearch metadata projection through Cherry's durable
+// outbox. The explicit recovery mode recreates a verified-empty physical index
+// and coordinates metadata + heat replay from PostgreSQL.
+//
+// Usage:
+//   CHERRY_API_KEY=... node scripts/sync-meilisearch.js
+//   CHERRY_API_KEY=... node scripts/sync-meilisearch.js --recover-empty-index
+//
+// Optional:
+//   CHERRY_API_URL=http://127.0.0.1:5070
+//   CHERRY_REBUILD_TIMEOUT_SECONDS=1800
+//   CHERRY_REBUILD_POLL_MILLISECONDS=2000
+//   --no-wait
 
-const pg = new Client({
-    host: process.env.PG_HOST || 'localhost',
-    port: process.env.PG_PORT || 5432,
-    database: process.env.PG_DB || 'cherry',
-    user: process.env.PG_USER || 'postgres',
-    password: process.env.PG_PASSWORD || 'cindy131120',
-});
-pg.connect();
+'use strict';
+
+const apiUrl = (process.env.CHERRY_API_URL || 'http://127.0.0.1:5070').replace(/\/+$/, '');
+const apiKey = process.env.CHERRY_API_KEY || process.env.API_KEY;
+const noWait = process.argv.includes('--no-wait');
+const recoverEmptyIndex = process.argv.includes('--recover-empty-index');
+const timeoutSeconds = positiveNumber(
+    process.env.CHERRY_REBUILD_TIMEOUT_SECONDS,
+    1800,
+    'CHERRY_REBUILD_TIMEOUT_SECONDS');
+const pollMilliseconds = positiveNumber(
+    process.env.CHERRY_REBUILD_POLL_MILLISECONDS,
+    2000,
+    'CHERRY_REBUILD_POLL_MILLISECONDS');
+
+if (!apiKey) {
+    fail('CHERRY_API_KEY (or API_KEY) is required; direct PostgreSQL/Meili rebuild is intentionally unsupported');
+}
+
+function positiveNumber(raw, fallback, name) {
+    if (raw === undefined || raw === '') return fallback;
+    const value = Number(raw);
+    if (!Number.isFinite(value) || value <= 0) fail(`${name} must be a positive number`);
+    return value;
+}
+
+function fail(message) {
+    console.error(`Error: ${message}`);
+    process.exit(1);
+}
+
+async function api(path, options = {}) {
+    const response = await fetch(`${apiUrl}${path}`, {
+        ...options,
+        headers: {
+            Accept: 'application/json',
+            'X-API-Key': apiKey,
+            ...(options.headers || {})
+        }
+    });
+    const body = await response.text();
+    let json = null;
+    if (body) {
+        try {
+            json = JSON.parse(body);
+        } catch {
+            throw new Error(`${options.method || 'GET'} ${path} returned non-JSON HTTP ${response.status}: ${body.slice(0, 512)}`);
+        }
+    }
+    if (!response.ok) {
+        throw new Error(`${options.method || 'GET'} ${path} returned HTTP ${response.status}: ${JSON.stringify(json)}`);
+    }
+    return json;
+}
 
 async function main() {
-    // 1. Check total
-    const { rows: [{ count }] } = await pg.query('SELECT COUNT(*) FROM torrents');
-    console.log(`Total: ${count} torrents`);
-
-    // 2. Create Meilisearch index with searchable fields (delete if exists then recreate)
-    await fetch(`${MEILI}/indexes/torrents`, { method: 'DELETE' }).catch(() => {});
-    await fetch(`${MEILI}/indexes`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-            uid: 'torrents',
-            primaryKey: 'infoHash'
-        })
-    });
-
-    // 3. Configure searchable + sortable fields
-    await fetch(`${MEILI}/indexes/torrents/settings`, {
-        method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-            searchableAttributes: ['name'],
-            sortableAttributes: ['peerCount', 'totalLength', 'fileCount', 'createdAt'],
-            filterableAttributes: ['fileCount', 'totalLength', 'isPrivate', 'peerCount'],
-            typoTolerance: { minWordSizeForTypos: { oneTypo: 5, twoTypos: 8 }, disableOnWords: [], disableOnAttributes: [] },
-            rankingRules: [
-                'sort',
-                'createdAt:desc',
-                'words',
-                'exactness'
-            ]
-        })
-    });
-
-    // 4. Batch import using cursor pagination on info_hash (avoids relying on numeric id column)
-    let last = '';
-    let processed = 0;
-    while (true) {
-        const { rows } = await pg.query(
-            `SELECT info_hash, name, total_length, file_count, is_private, peer_count, created_at
-             FROM torrents
-             WHERE info_hash > $1
-             ORDER BY info_hash
-             LIMIT $2`,
-            [last, BATCH]
-        );
-
-        if (rows.length === 0) break;
-
-        const docs = rows.map(r => ({
-            infoHash: r.info_hash,
-            name: r.name,
-            totalLength: parseInt(r.total_length),
-            fileCount: parseInt(r.file_count),
-            isPrivate: r.is_private,
-            peerCount: r.peer_count || 0,
-            createdAt: r.created_at ? new Date(r.created_at).getTime() : 0
-        }));
-
-        await fetch(`${MEILI}/indexes/torrents/documents`, {
+    const rebuild = recoverEmptyIndex
+        ? await api('/api/v1/search/outbox/recover-empty-index', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(docs)
-        });
-
-        processed += rows.length;
-        last = rows[rows.length - 1].info_hash;
-        console.log(`${processed} / ${count}`);
+            body: JSON.stringify({ confirmation: 'DELETE_AND_REBUILD_TORRENTS_INDEX' })
+        })
+        : await api('/api/v1/search/outbox/rebuild', { method: 'POST' });
+    const enqueued = recoverEmptyIndex
+        ? rebuild?.metadataRowsEnqueued
+        : rebuild?.enqueued;
+    if (recoverEmptyIndex) {
+        console.log(
+            `Verified a fresh index with ${rebuild?.verifiedEmptyDocuments ?? 'unknown'} documents; ` +
+            `enqueued ${enqueued ?? 'unknown'} metadata rows; ` +
+            `heat rebuild=${Boolean(rebuild?.heatRebuildRequested)}` +
+            `${rebuild?.heatTargetDay ? ` target=${rebuild.heatTargetDay}` : ''}.`);
+    } else {
+        console.log(`Metadata refresh enqueued for ${enqueued ?? 'unknown'} catalog rows.`);
     }
+    if (noWait) return;
 
-    console.log('Done. Try: curl http://localhost:7700/indexes/torrents/search?q=test');
-    process.exit(0);
+    const deadline = Date.now() + timeoutSeconds * 1000;
+    let lastLine = '';
+    const heatRequested = recoverEmptyIndex && Boolean(rebuild?.heatRebuildRequested);
+    const heatTargetDay = rebuild?.heatTargetDay || null;
+    while (true) {
+        const status = await api('/api/v1/search/outbox/stats');
+        const backlog = status?.backlog || {};
+        const recovery = status?.recovery || {};
+        const heat = recovery?.heat || {};
+        const depth = Number(backlog.depth);
+        const due = Number(backlog.due);
+        const retrying = Number(backlog.retrying);
+        const heatPending = Number(heat.pendingTasks);
+        const heatCaughtUp = !heatRequested || (
+            heat.rebuildRequired === false &&
+            heatPending === 0 &&
+            (!heatTargetDay || heat.projectedThrough === heatTargetDay));
+        const line = recoverEmptyIndex
+            ? `depth=${depth} due=${due} retrying=${retrying} ` +
+              `heatTarget=${heat.projectedThrough || '-'} heatPending=${heatPending} heatRebuild=${String(heat.rebuildRequired)}`
+            : `depth=${depth} due=${due} retrying=${retrying} oldest=${Number(backlog.oldestAgeSeconds || 0).toFixed(1)}s`;
+        if (line !== lastLine) {
+            console.log(line);
+            lastLine = line;
+        }
+        if (depth === 0 && heatCaughtUp) {
+            if (!recoverEmptyIndex) {
+                console.log('Meilisearch metadata projection is caught up.');
+                return;
+            }
+            // COUNT(*) is deliberately deferred until projection catch-up; doing
+            // it on every poll is expensive for a large authoritative catalog.
+            const verified = await api('/api/v1/search/outbox/stats?verifyDocuments=true');
+            const authoritativeDocuments = Number(verified?.recovery?.authoritativeDocuments);
+            const meiliDocuments = Number(verified?.recovery?.meiliDocuments);
+            if (!Number.isFinite(authoritativeDocuments) || !Number.isFinite(meiliDocuments)) {
+                throw new Error(`unexpected recovery counts: ${JSON.stringify(verified)}`);
+            }
+            if (authoritativeDocuments === meiliDocuments) {
+                console.log(
+                    `Meilisearch metadata and heat recovery is caught up; ` +
+                    `${meiliDocuments} documents match PostgreSQL.`);
+                return;
+            }
+            console.log(
+                `Projection drained but document counts differ: ` +
+                `Meili=${meiliDocuments}, PostgreSQL=${authoritativeDocuments}; waiting for replay.`);
+        }
+        if (!Number.isFinite(depth)) throw new Error(`unexpected outbox stats: ${JSON.stringify(status)}`);
+        if (Date.now() >= deadline) {
+            throw new Error(`projection did not recover within ${timeoutSeconds}s (${line})`);
+        }
+        await new Promise(resolve => setTimeout(resolve, pollMilliseconds));
+    }
 }
-main().catch(e => { console.error(e); process.exit(1); });
+
+main().catch(error => fail(error instanceof Error ? error.message : String(error)));

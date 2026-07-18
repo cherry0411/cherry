@@ -1,0 +1,15 @@
+[Unit]
+Description=Download and verify latest Cherry storage base backup
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/cherry-backup.env
+ExecStart=/usr/local/sbin/cherry-storage-backup-verify
+Nice=15
+IOSchedulingClass=idle
+CPUWeight=10
+IOWeight=10
+UMask=0077

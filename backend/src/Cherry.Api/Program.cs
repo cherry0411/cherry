@@ -4,10 +4,35 @@ using Cherry.Domain.Interfaces;
 using Cherry.Infrastructure.Data;
 using Cherry.Infrastructure.Dedup;
 using Cherry.Infrastructure.Repositories;
+using Cherry.Infrastructure.Heat;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.OpenApi;
 
 var builder = WebApplication.CreateBuilder(args);
+
+var heatOptions = (builder.Configuration.GetSection("Heat").Get<HeatOptions>() ?? new HeatOptions())
+    .Normalize(builder.Environment.ContentRootPath);
+if (heatOptions.Enabled)
+{
+    if (heatOptions.ParsedCoverageStartDay is null)
+        throw new InvalidOperationException("Heat:CoverageStartDay must be yyyy-MM-dd when heat is enabled");
+    if (heatOptions.ExpectedCrawlerIds.Length == 0)
+        throw new InvalidOperationException("Heat:ExpectedCrawlerIds must list every required crawler when heat is enabled");
+    heatOptions.ValidateExpectedCrawlerSecrets();
+    if (!string.Equals(heatOptions.IndexUid, "torrents", StringComparison.Ordinal))
+        throw new InvalidOperationException("Heat:IndexUid must be 'torrents' for the current thin search index");
+}
+builder.Services.AddSingleton(heatOptions);
+builder.Services.AddSingleton<HeatRuntimeMetrics>();
+builder.Services.AddSingleton<HeatProjectionStatusCache>();
+builder.Services.AddSingleton<Cherry.Infrastructure.Search.SearchRecoveryCoordinator>();
+builder.Services.AddSingleton<HeatAccumulatorService>();
+if (heatOptions.Enabled)
+{
+    builder.Services.AddHostedService(sp => sp.GetRequiredService<HeatAccumulatorService>());
+    builder.Services.AddScoped<HeatDaySealer>();
+    builder.Services.AddHostedService<HeatLifecycleWorker>();
+}
 
 // Database
 var connStr = builder.Configuration.GetConnectionString("Default")
@@ -67,6 +92,9 @@ if (!string.IsNullOrWhiteSpace(meiliUrl))
                 60_000))
     });
     builder.Services.AddHostedService<Cherry.Infrastructure.Search.SearchOutboxWorker>();
+    builder.Services.AddScoped<Cherry.Infrastructure.Search.SearchRecoveryService>();
+    if (heatOptions.Enabled)
+        builder.Services.AddHostedService<HeatProjectionWorker>();
 }
 builder.Services.AddSingleton<Cherry.Infrastructure.Search.SearchOutboxMetrics>();
 builder.Services.AddScoped<Cherry.Infrastructure.Search.SearchOutboxStore>();
@@ -125,6 +153,7 @@ var apiKey = builder.Configuration["ApiKey"];
 const string durableCrawlerPath = "/api/v1/torrents/batch/durable";
 const string searchOutboxStatsPath = "/api/v1/search/outbox/stats";
 const string searchOutboxRebuildPath = "/api/v1/search/outbox/rebuild";
+const string searchRecoveryPath = "/api/v1/search/outbox/recover-empty-index";
 var protectedCrawlerPaths = new[]
 {
     "/api/v1/torrents/batch",
@@ -137,7 +166,8 @@ app.Use(async (context, next) =>
     var normalizedPath = context.Request.Path.Value?.TrimEnd('/');
     if (string.Equals(normalizedPath, durableCrawlerPath, StringComparison.OrdinalIgnoreCase) ||
         string.Equals(normalizedPath, searchOutboxStatsPath, StringComparison.OrdinalIgnoreCase) ||
-        string.Equals(normalizedPath, searchOutboxRebuildPath, StringComparison.OrdinalIgnoreCase))
+        string.Equals(normalizedPath, searchOutboxRebuildPath, StringComparison.OrdinalIgnoreCase) ||
+        string.Equals(normalizedPath, searchRecoveryPath, StringComparison.OrdinalIgnoreCase))
     {
         if (string.IsNullOrWhiteSpace(apiKey))
         {
@@ -183,16 +213,24 @@ await using (var scope = app.Services.CreateAsyncScope())
         await db.Database.MigrateAsync();
 }
 
-// Init Meilisearch index settings
+// Init Meilisearch index settings. If a lost Meili volume was just recreated,
+// PostgreSQL is authoritative and startup conservatively schedules a full
+// metadata + heat replay. Any recovery failure aborts startup loudly; serving
+// a silent, permanently empty search index is not an acceptable degraded mode.
 if (!string.IsNullOrWhiteSpace(meiliUrl))
 {
-    try
+    await using var meiliScope = app.Services.CreateAsyncScope();
+    var meiliInit = meiliScope.ServiceProvider.GetRequiredService<Cherry.Infrastructure.Search.MeiliSearchClient>();
+    await meiliInit.EnsureIndexAsync(CancellationToken.None);
+    var recovery = meiliScope.ServiceProvider.GetRequiredService<Cherry.Infrastructure.Search.SearchRecoveryService>();
+    var recovered = await recovery.RecoverIfProvablyEmptyAsync(CancellationToken.None);
+    if (recovered is not null)
     {
-        using var meiliScope = app.Services.CreateScope();
-        var meiliInit = meiliScope.ServiceProvider.GetService<Cherry.Infrastructure.Search.MeiliSearchClient>();
-        if (meiliInit != null) await meiliInit.EnsureIndexAsync(CancellationToken.None);
+        app.Logger.LogWarning(
+            "Detected an empty Meilisearch index with a non-empty PostgreSQL catalog; queued {MetadataRows} metadata rows and heat rebuild={HeatRebuild}",
+            recovered.MetadataRowsEnqueued,
+            recovered.HeatRebuildRequested);
     }
-    catch { }
 }
 
 // Seed PendingRequestTracker: load pending hashes from DB, then mark any that
@@ -248,12 +286,14 @@ app.UseSwaggerUI(options =>
 TorrentEndpoints.Map(app);
 StatsEndpoints.Map(app);
 SearchOutboxEndpoints.Map(app);
+HeatEndpoints.Map(app);
 
 // Health check
-app.MapGet("/health", (IProcessedHashFilter processedHashFilter) => Results.Ok(new
+app.MapGet("/health", (IProcessedHashFilter processedHashFilter, HeatOptions heat, HeatRuntimeMetrics heatMetrics) => Results.Ok(new
     {
         status = "healthy",
         processed_hash_fast_path_ready = processedHashFilter.IsReady,
+        heat = heatMetrics.Snapshot(heat.Enabled),
         time = DateTime.UtcNow
     }))
     .WithTags("Health");

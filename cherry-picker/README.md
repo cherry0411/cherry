@@ -78,6 +78,85 @@ Durations use Go duration strings such as `2s`, `30s`, or `10m`.
   metrics and expiry implementation are wired.
 - `CHERRY_PICKER_PPROF_ADDR`: optional local Go profiling listener, for example `127.0.0.1:6060`.
 
+### Inbound `get_peers` heat
+
+Heat export is a separate, default-off channel for daily popularity evidence.
+It observes only validated external inbound `get_peers` requests; metadata
+responses, announces, sampling and active outbound lookups never feed it.
+Private, local, reserved and configured crawler addresses are rejected. Public
+IPv4 addresses retain the complete address for pseudonymization; public IPv6
+addresses are reduced to `/64`. The source address is immediately converted to
+a UTC-day-scoped 64-bit HMAC actor and is never written to disk or exported.
+Ports, node IDs and regions are not collected.
+
+- `CHERRY_PICKER_HEAT_ENABLED`: enable the channel; default `false`.
+- `CHERRY_PICKER_HEAT_ENDPOINT`: HTTPS CHHT v1 ingestion endpoint. Plain HTTP is accepted only for loopback tests.
+- `CHERRY_PICKER_HEAT_CRAWLER_ID`: stable 1-64 byte receipt identity using ASCII letters, digits, `.`, `_` or `-`.
+- `CHERRY_PICKER_HEAT_MASTER_SECRET_FILE`: shared actor-pseudonym master secret file.
+- `CHERRY_PICKER_HEAT_HMAC_SECRET_FILE`: raw CHHT HMAC signing secret file.
+- `CHERRY_PICKER_HEAT_SPOOL_DIR`: dedicated segmented durable spool directory.
+- `CHERRY_PICKER_HEAT_SPOOL_MAX_BYTES`: hard bound on current spool disk usage; default 512 MiB.
+- `CHERRY_PICKER_HEAT_KNOWN_CRAWLERS`: comma-separated IPs/CIDRs excluded from heat.
+- `CHERRY_PICKER_HEAT_QUEUE`, `CHERRY_PICKER_HEAT_BATCH`: bounded admission queue and delivery batch sizes.
+- `CHERRY_PICKER_HEAT_FLUSH`, `CHERRY_PICKER_HEAT_HTTP_TIMEOUT`, `CHERRY_PICKER_HEAT_RETRY_BACKOFF`: Go duration values for batching and delivery.
+
+Both secret files must be regular files containing at least 32 raw bytes and
+must be mode `0600` on production Linux. One final CRLF/LF written by an editor
+is removed; all other bytes are significant. `HMACSecretFile` contains the
+original raw secret bytes. In production, backend
+`Heat__CrawlerSecrets__{crawler-id}` is the Base64 encoding of that crawler's
+raw transport key; every expected crawler must have a different key. The
+legacy single `Heat__SharedSecret` remains only for tests/migration and does not
+satisfy production startup validation. The Base64 text itself is not the HMAC
+key. Transport keys only derive `X-CHHT-Signature` and are never sent. The actor
+master secret is shared across regions so actor-day identities deduplicate, but
+it is separate from every transport key and never reaches storage.
+
+The compact body starts with `CHHT`, version 1 and the UTC day, followed by
+strictly sorted raw 20-byte infohash groups and sorted unique big-endian
+64-bit actors. Delivery sends decimal `X-CHHT-Epoch`, `X-CHHT-Sequence` and
+`X-CHHT-End-Sequence`, plus lowercase SHA-256 and HMAC headers. The HMAC input
+is exactly `CHHT/1\n{crawler}\n{epoch}\n{start}\n{end}\n{payloadSha256}\n`
+followed by the raw request body. The interoperable fixed vector is
+`internal/heat/testdata/chht_v1_golden.json`.
+
+At a proven UTC boundary the crawler also sends an empty-body
+`POST /api/v1/heat/completions`. Its signature input is exactly
+`CHHT-COMPLETE/1\n{crawler}\n{day}\n{epoch}\n{start}\n{next}\n1\n`.
+`start` is the day's first spool sequence and `next` is its exclusive durable
+end. The backend stores the completion in the same per-day SQLite transaction
+stream and accepts it only when the crawler's single-epoch receipts form an
+exact contiguous chain from `start` to `next` (or `start == next` for an empty
+day). An identical replay is idempotent; a conflict or any later new batch is
+rejected.
+
+Admission is non-blocking. A full memory queue increments `QueueDropped`; a
+full/unwritable spool increments retry/failure metrics and never silently
+claims durability. Once a batch has crossed `fsync`, endpoint errors and lost
+responses replay exactly the same body and receipt. The cursor advances only
+for an HTTP 200 JSON receipt whose crawler/day/epoch/range/digest match and
+whose `nextSequence` is exactly `endSequence + 1`; an arbitrary 2xx, malformed
+body or mismatched proxy response is retried without deletion. A strictly
+authenticated HTTP 410 with `code=day_closed` and the same complete receipt
+identity is an explicit durable negative receipt: the crawler advances so an
+irrecoverably closed old day does not block current data, increments
+`ClosedDayRejectedRecords/Batches`, and logs that coverage is partial. It is
+never counted as exported or as a successful ACK. PostgreSQL's partial day
+manifest is the durable fact; these crawler counters are diagnostic and exact
+rejected-batch counts are not preserved over a restart. Acknowledged sealed
+segments are reclaimed during continuous production. Metadata delivery, its
+spool, and the experiment oracle remain independent. The crash/directory-sync
+guarantees target Linux; Windows support is for development and cannot provide
+the same power-loss directory semantics.
+
+The crawler's `heat.completion.json` is a small fsync/rename ledger bound to the
+spool epoch. A writer barrier prevents a new UTC day from overtaking earlier
+queue entries. Queue overflow, forced writer loss, closed-day negative receipt,
+clock jump, first partial startup day, abnormal restart, and even a graceful
+same-day stop/restart poison that day. Dirty days never send a completion.
+Therefore restart recovery may conservatively report `partial`, but cannot
+turn locally unpersisted observations into `complete`.
+
 ## Example
 
 ```powershell

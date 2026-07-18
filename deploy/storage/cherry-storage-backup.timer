@@ -1,0 +1,12 @@
+[Unit]
+Description=Weekly Cherry storage base backup
+
+[Timer]
+OnCalendar=Sun *-*-* 03:30:00 UTC
+Persistent=true
+RandomizedDelaySec=30m
+AccuracySec=1m
+Unit=cherry-storage-backup.service
+
+[Install]
+WantedBy=timers.target

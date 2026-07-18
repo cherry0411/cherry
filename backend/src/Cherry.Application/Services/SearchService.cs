@@ -16,8 +16,9 @@ public class SearchService
 
     public async Task<SearchResponse> SearchAsync(SearchRequest request, CancellationToken ct = default)
     {
-        var (items, total) = await _repo.SearchAsync(
+        var (items, total, heatAsOfDay, heatCoverageDays) = await _repo.SearchAsync(
             request.Query,
+            request.HeatWindow,
             request.Page,
             request.PageSize,
             ct);
@@ -29,10 +30,14 @@ public class SearchService
             TotalLength: t.TotalLength,
             FileCount: t.FileCount,
             CreatedAt: t.CreatedAt,
-            Files: null
+            Files: null,
+            Heat1d: t.Heat1d,
+            Heat7d: t.Heat7d,
+            Heat15d: t.Heat15d,
+            Heat30d: t.Heat30d
         )).ToList();
 
-        return new SearchResponse(dtos, total, request.Page, request.PageSize);
+        return new SearchResponse(dtos, total, request.Page, request.PageSize, heatAsOfDay, heatCoverageDays);
     }
 
     public async Task<List<string>> CheckExistsAsync(List<string> hashes, CancellationToken ct)
@@ -59,7 +64,11 @@ public class SearchService
             TotalLength: t.TotalLength,
             FileCount: t.FileCount,
             CreatedAt: t.CreatedAt,
-            Files: null
+            Files: null,
+            Heat1d: 0,
+            Heat7d: 0,
+            Heat15d: 0,
+            Heat30d: 0
         )).ToList();
     }
 
@@ -75,7 +84,11 @@ public class SearchService
             TotalLength: t.TotalLength,
             FileCount: t.FileCount,
             CreatedAt: t.CreatedAt,
-            Files: t.Files.Select(f => new TorrentFileDto(f.PathText, f.Length)).ToList()
+            Files: t.Files.Select(f => new TorrentFileDto(f.PathText, f.Length)).ToList(),
+            Heat1d: 0,
+            Heat7d: 0,
+            Heat15d: 0,
+            Heat30d: 0
         );
     }
 }

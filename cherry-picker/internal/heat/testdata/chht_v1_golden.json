@@ -1,0 +1,23 @@
+{
+  "schema": "cherry.chht.grouped.v1.golden",
+  "content_type": "application/vnd.cherry.heat-v1",
+  "crawler": "jp-crawler-01",
+  "epoch": "72623859790382856",
+  "start_sequence": "100",
+  "end_sequence": "103",
+  "utc_day_since_unix_epoch": 20654,
+  "signing_secret_raw_ascii": "0123456789abcdef0123456789abcdef",
+  "backend_shared_secret_base64": "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=",
+  "hmac_prefix_utf8": "CHHT/1\njp-crawler-01\n72623859790382856\n100\n103\n2f260987e99b008f8a5cac8100a7287aaa1e8c7cb3cbf4dd975bba65fe0df387\n",
+  "payload_hex": "4348485401000050ae02000102030405060708090a0b0c0d0e0f101112130200000000000000010000000000000002fffefdfcfbfaf9f8f7f6f5f4f3f2f1f0efeeedec01000000000000002a",
+  "payload_sha256_lower_hex": "2f260987e99b008f8a5cac8100a7287aaa1e8c7cb3cbf4dd975bba65fe0df387",
+  "signature_hmac_sha256_lower_hex": "17c7ce782ca1bdeb70a934b7081854253e585e4500df406622a29fc6f2fe0a7a",
+  "headers": {
+    "X-CHHT-Crawler": "jp-crawler-01",
+    "X-CHHT-Epoch": "72623859790382856",
+    "X-CHHT-Sequence": "100",
+    "X-CHHT-End-Sequence": "103",
+    "X-CHHT-Payload-SHA256": "2f260987e99b008f8a5cac8100a7287aaa1e8c7cb3cbf4dd975bba65fe0df387",
+    "X-CHHT-Signature": "17c7ce782ca1bdeb70a934b7081854253e585e4500df406622a29fc6f2fe0a7a"
+  }
+}

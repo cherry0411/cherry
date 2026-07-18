@@ -1,343 +1,192 @@
-# Cherry DHT 搜索引擎 — 详细架构设计
+# Cherry 当前运行架构
 
-> 注意：本文保留了早期架构背景，其中关于 lock-free CuckooFilter、GZip 快照和“内存 Channel 即 ACK”的描述已不再代表当前正确性边界。去重权威、durable ACK、升级步骤和存储演进请以 [`storage-architecture.md`](./storage-architecture.md) 为准。
+本文只描述仓库当前可运行实现，不保存早期方案。存储取舍、容量基准和后续实验见
+[`storage-architecture.md`](./storage-architecture.md)，热度协议的推导与边界见
+[`heat-storage-design.md`](./heat-storage-design.md)，2C4G 存储机部署步骤见
+[`../deploy/storage/README.md`](../deploy/storage/README.md)。
 
-## 第一章：整体架构
+## 1. 系统边界
 
-### 系统定位
+Cherry 由三类节点组成：
 
-Cherry 是一个 DHT 磁力链接搜索引擎：从 BitTorrent DHT 网络实时抓取 torrent 元数据，提供全文搜索和浏览。
+- 一个或多个 Go 1.25 `cherry-picker`，从 BitTorrent DHT/BEP-9 获取 normalized
+  metadata，并独立采集经过身份缩减的 `get_peers` 活跃度。
+- 一个 .NET 10 API，负责协议校验、事务提交、精确去重状态、热度日结和异步搜索投影。
+- PostgreSQL 17 是 metadata 与 sealed heat 的权威存储；Meilisearch 1.45.1 只是可重建的
+  title/heat 搜索投影。Vue 前端只调用 API，不直连数据库或 Meili。
 
-### 设计优先级
+生产存储机不需要 Redis、Kafka、RabbitMQ、Elasticsearch 或 pgvector。未封日的精确
+actor-day 集合使用本地 SQLite；封日后压成 PostgreSQL frame，避免为每次 sighting
+制造 PG 行/WAL。Meili 损坏不等于数据丢失。
 
-1. **成本优先**：整个后端服务运行在单台 2C4G 云服务器上，爬虫独立部署
-2. **体验次之**：搜索低延迟，新种子尽快可搜
-3. **扩展性/稳定性**：自愈、自动化，最小化人工干预
+## 2. Metadata 正确性链路
 
-### 技术栈（全部保留，不引入新中间件）
-
-| 组件 | 技术 | 说明 |
-|------|------|------|
-| 爬虫 | Go 1.25，BEP-5/BEP-9 | 独立部署，可多实例 |
-| 后端 | .NET 10 ASP.NET Core Minimal API | Channel + IHostedService 流式消费 |
-| 数据库 | PostgreSQL 17（pgvector 镜像） | BINARY COPY 批量写入，pg_trgm fallback |
-| 全文搜索 | Meilisearch | 百万文档约 300MB 内存，中文 unicode 分词 |
-| 去重 | CuckooFilter（内存+GZip持久化） | 1亿容量约 200MB，lock-free CAS |
-| 前端 | Vue 3 + Vue Router（CDN） | 零构建工具，nginx 直接 serve |
-| 部署 | Docker Compose | 单机，无 k8s |
-
-**明确不引入**：Kafka、RabbitMQ、Redis、Elasticsearch（2C4G 内存预算不允许）
-
----
-
-## 第二章：数据流
-
-### 主数据流（端到端）
-
-```
-DHT网络 (BEP-5/BEP-9)
-  → Go爬虫（可多实例，独立网络）
-      ↓ 失败时写本地 WAL 文件，后台重放
-  → POST /api/v1/torrents/batch（X-API-Key 认证）
-      ↓ Channel 超 80% 返回 429，爬虫退避 30s
-  → IngestService Channel（10万容量）
-      → CuckooFilter 去重（1亿容量，0.0015% 误报率）
-      → 批次5000，PostgreSQL BINARY COPY（临时表+ON CONFLICT）
-      → [异步] MeiliSyncService Channel（5万容量）→ Meilisearch（2s内可搜）
-      → 内存原子计数器 +N
-  → Vue SPA 搜索展示
+```text
+DHT metadata
+  -> crawler 过滤/规范化
+  -> 本地 typed durable spool（stable crawler/epoch/sequence）
+  -> SSH tunnel
+  -> POST /api/v1/torrents/batch/durable + X-API-Key
+  -> 单个 PostgreSQL 事务
+       torrents + torrent_details + durable_batch_receipts
+       + metadata_decisions + search_outbox
+  -> 严格 committed receipt
+  -> crawler 才能推进 spool cursor
+  -> SearchOutboxWorker partial PUT Meili，并等待 task succeeded 后删 marker
 ```
 
-### Peer Count 反馈回路
+生产链路的 ACK 边界是 PostgreSQL commit，不是 API 内存 Channel，也不是 Meili 接收请求。
+同一 `(crawler_id, epoch, sequence range, payload digest)` 可安全重放；提交成功但 HTTP
+响应丢失时不会重复写权威 metadata。`/api/v1/torrents/batch` 仍是兼容端点，不具有上述
+receipt 语义，不能替代 durable 生产路径。
 
-```
-爬虫看到重复 infohash → 不重复下载元数据 → 累计 peerCounts map
-每60秒 POST /api/v1/torrents/peers → 更新 PG peer_count 字段
-→ [异步] MeiliSyncService 推送部分更新（infoHash + peerCount）
-→ Meilisearch 按 peerCount 排序更新
-```
+Crawler 在本地 spool durable 之前不得宣称数据已保存；中央端返回完整匹配的 committed
+receipt 之前不得删除记录。磁盘满、断网和 5xx 必须形成背压并保留待重放数据。
 
-### 统计数据路径
+## 3. PostgreSQL 当前结构
 
-```
-内存原子计数器（每次 BulkInsert 成功后 Interlocked.Add）
-+ PG reltuples 估算（启动时初始化，每小时精确刷新）
-→ GET /api/v1/stats → O(1) 读内存，无 DB 查询
-```
+### 3.1 Catalog
 
----
+`torrents` 是极窄目录表：
 
-## 第三章：爬虫→API 可靠传输
+| 字段 | 类型 | 含义 |
+|---|---|---|
+| `id` | `bigint identity` | PG、Meili 和 heat 共用的紧凑主键 |
+| `info_hash` | `bytea(20)` | 唯一 BTIH；API 边界才转 40 位 hex |
+| `name` | `text` | 搜索标题 |
+| `total_length` | `bigint` | 总字节数 |
+| `file_count` | `integer` | 文件数 |
+| `created_at` | `timestamptz` | 首次入库时间 |
 
-### 3.1 认证（零成本）
+`torrent_details(torrent_id, payload)` 每个 torrent 一行。`payload` 是 version 1 紧凑二进制：
+文件路径按排序后的 UTF-8 公共前缀压缩，数字使用 uvarint，并附扩展名汇总；PostgreSQL
+列再使用 LZ4 TOAST。详情读取时才解码。当前没有 `torrent_files` 行表，也不保存 raw
+bencode、raw metadata、`pieces` 或可重建 `.torrent` 的字节。
 
-静态 API Key via HTTP Header，只保护写入接口：
+`metadata_decisions(info_hash, decision_code)` 只保存没有 catalog 行的永久 processed
+结果。概率 Cuckoo filter 在进程启动时从 `torrents + metadata_decisions` 精确重建；它只
+是负查询快速路径，所有 positive 都回 PG 确认，因此不是去重权威。
 
-```
-爬虫: X-API-Key: ${CHERRY_API_KEY}
-API: 检查 /batch 和 /peers 端点的 X-API-Key header
-配置: ApiKey: ${API_KEY} 在 appsettings / docker-compose env
-空值 = 不验证（向后兼容）
-```
+已删除并禁止重新投影的 catalog 字段包括：`piece_length`、`is_private`、`source`、
+`region`、`policy_id`、`retained_level`、`needs_refetch` 和累计 `peer_count`。
 
-### 3.2 爬虫侧 WAL 本地缓冲
+### 3.2 交付状态
 
-**问题**：网络不稳定时（丢包/超时），失败的 batch 直接丢弃。
+- `durable_batch_receipts` 保存每个 crawler epoch 的最后提交序列、digest 和计数。
+- `search_outbox` 每个 torrent 只保留一个可合并 marker；generation fencing 防止旧
+  Meili task ACK 新一代更新。
+- `torrent_requests` 只服务用户提交的待抓取 hash，不属于 metadata 存档。
 
-**方案**：基于文件的 WAL，失败写文件，后台重放。
+导入当前 compact catalog 时使用 [`../scripts/import-remote.sh`](../scripts/import-remote.sh)。
+脚本只接受 `torrents + torrent_details` 的当前紧凑导出，并在同一事务内建立新的 surrogate
+ID、详情和 outbox marker；旧 `torrent_files.csv`/宽表导出不兼容。
 
-```
-文件格式：每行一个 JSON batch（JSONL 格式）
-文件轮转：按小时，wal_2026010215.jsonl
-重放频率：每 30s 扫描一次 WAL 目录
-过期清理：超过 24 小时的文件自动删除
-容量估算：最坏情况 ~20MB/小时（100% 失败率下）
-```
+## 4. Meilisearch 薄投影
 
-配置：`CHERRY_PICKER_WAL_DIR=/data/wal`（空 = 不启用 WAL）
-
-### 3.3 API 侧背压控制（防止雪崩）
-
-**问题**：Channel 满时 `WriteAsync` 阻塞，爬虫 HTTP 请求超时后重试，导致雪崩。
-
-**方案**：Channel 超 80% 时立即返回 429，爬虫触发退避。
-
-```csharp
-// IngestService.SubmitBatchAsync
-if (_channel.Reader.Count > 80_000)  // 100k 容量的 80%
-    return new BatchIngestResponse(Backpressure: true);
-
-// TorrentEndpoints.IngestBatchAsync
-if (result.Backpressure)
-    return Results.StatusCode(429);
-```
-
-```go
-// httpSink.WriteBatch
-if response.StatusCode == 429 {
-    time.Sleep(30 * time.Second)  // 退避，不计入重试次数
-    continue
-}
-```
-
-### 3.4 幂等性（现有三层）
-
-| 层次 | 机制 | 特点 |
-|------|------|------|
-| 第一层 | CuckooFilter | 纳秒级，内存，0.0015% 误报率 |
-| 第二层 | BatchSet 批内去重 | 同批次去重 |
-| 第三层 | `ON CONFLICT DO NOTHING` | 数据库唯一约束兜底 |
-
----
-
-## 第四章：数据入库管道
-
-### 4.1 批量写入（已是最优）
-
-`BulkInsertTorrentsAsync` 使用 PostgreSQL BINARY COPY + 临时表 + ON CONFLICT，是 PG 批量写入最优方案，不需要改变。
-
-### 4.2 Meilisearch 实时增量推送
-
-**问题**：现有方案依赖手动脚本全量同步，延迟高。
-
-**方案**：新增 `MeiliSyncService`（IHostedService），BulkInsert 后异步推送。
-
-```
-MeiliSyncService:
-  - 内部 Channel<TorrentMeiliDoc>（容量 5万，满时 DropOldest）
-  - PushLoop：积累500条或等2秒，批量推送到 Meilisearch
-  - 失败时重新入队，等5秒重试（不阻塞主路径）
-
-IngestService 改造：
-  var (inserted, hashToIdMap) = await repo.BulkInsertTorrentsAsync(...)
-  if (inserted > 0)
-  {
-      _counter.Add(inserted);
-      _meiliSync.Enqueue(newTorrents);  // 非 async，TryWrite 即返回
-  }
-```
-
-**Meilisearch 文档结构**（精简，不存文件列表）：
+索引 UID 固定为 `torrents`，primary key 固定为数值 `id`。metadata worker 使用 partial
+`PUT /indexes/torrents/documents` 写入：
 
 ```json
-{
-  "infoHash": "...",
-  "name": "...",
-  "totalLength": 1234567890,
-  "fileCount": 3,
-  "isPrivate": false,
-  "peerCount": 42,
-  "createdAt": 1746662400000
-}
+{"id": 42, "name": "example", "firstSeen": 1784304000000}
 ```
 
-不存文件列表原因：文件列表会使 Meili 内存翻倍，fileType 过滤通过 PG 二次查询实现。
+heat worker 对同一文档做独立 partial PUT：
 
-### 4.3 索引初始化（启动时幂等）
-
-```csharp
-// Program.cs 启动时调用一次
-await meiliClient.EnsureIndexConfiguredAsync();
-
-// 配置：
-searchableAttributes: ["name"]
-sortableAttributes: ["peerCount", "totalLength", "fileCount", "createdAt"]
-filterableAttributes: ["fileCount", "totalLength", "isPrivate", "peerCount"]
-rankingRules: ["words", "exactness", "proximity", "sort"]
-typoTolerance: { minWordSizeForTypos: { oneTypo: 5, twoTypos: 8 } }
+```json
+{"id": 42, "heat1d": 3, "heat7d": 17, "heat15d": 31, "heat30d": 66}
 ```
 
----
+两条链路都不发送对方字段，所以 metadata 重建不会清空 heat，heat 投影也不会复制标题。
+当前 settings 是：
 
-## 第五章：搜索服务
+- searchable: `name`
+- sortable: `firstSeen`, `heat1d`, `heat7d`, `heat15d`, `heat30d`
+- filterable: 空
+- ranking: `words`, `typo`, `proximity`, `attribute`, `exactness`, `sort`
 
-### 5.1 双引擎查询策略
+搜索请求先由 Meili 按所选 1d/7d/15d/30d heat 和 `firstSeen` 排序，只返回 `id` 与四个
+heat 值；API 再按 `id` 批量取 PG catalog 并恢复 Meili 顺序。详情页按 hex info hash 查
+PG 并按需解码 compact detail。Meili 请求非 2xx、超时或返回畸形响应时，搜索 API 明确
+返回 HTTP 503，不把基础设施故障伪装成“0 条结果”，也不伪装成等价的 PG 全文 fallback。
 
-```
-搜索请求
-  ├── 有 fileType 参数 → Meilisearch 多取候选（pageSize×5）
-  │       → PG JOIN torrent_files 过滤扩展名 → 取前 pageSize
-  │
-  └── 无 fileType 参数 → Meilisearch 直接搜索（快速路径）
-          → 按 infoHash 从 PG 批量取完整数据
-          → 按 Meilisearch 原始顺序返回（保留相关性）
+全量 metadata 重投必须调用受 API key 保护的 `POST /api/v1/search/outbox/rebuild`，或运行
+[`../scripts/sync-meilisearch.js`](../scripts/sync-meilisearch.js)。该脚本不删除索引、不直连
+PG/Meili，并可等待 durable outbox 清空。
 
-fallback（Meilisearch 不可用）：
-  CJK 查询 → EF.Functions.ILike(t.Name, $"%{query}%")
-  英文查询 → TrigramsSimilarityDistance < 0.7（原为0.95，太松）
-```
+Meili 丢卷后的干净恢复使用同一脚本的 `--recover-empty-index`。API 先暂停 metadata/heat
+投影，删除并重建物理索引、确认文档数为 0，再在同一 PG 事务中重投全部 metadata 并
+请求 full heat replay。启动时只在“PG 非空且 Meili 确认为空”时自动走该恢复；非空的部分
+索引不会被武断清空。full heat replay 以最新 retained sealed day 为目标，只依赖保留的
+31 日窗口，不依赖已被 GC 的 CoverageStart 历史。
 
-### 5.2 CJK 查询优化
+## 5. 近期热度链路
 
-```csharp
-matchingStrategy = isCjk ? "all" : "last"  // 已实现，保持
-typoTolerance = isCjk ? { enabled: false } : { enabled: true }  // 新增：中文不需要 typo
-```
-
-### 5.3 OutputCache（内存上限）
-
-```csharp
-builder.Services.AddOutputCache(options =>
-{
-    options.SizeLimit = 100 * 1024 * 1024;  // 100MB 上限
-});
-// /stats: 10s, /search: 15s, /recent: 30s, /{infoHash}: 60s, /check: 5s
-```
-
----
-
-## 第六章：统计和监控
-
-### 6.1 三层计数器（避免 COUNT(*) 全表扫描）
-
-| 层次 | 机制 | 精度 | 延迟 |
-|------|------|------|------|
-| 内存 | `Interlocked.Add`，写入时更新 | 精确 | O(1) |
-| 估算 | `SELECT reltuples FROM pg_class` | 误差 0.1-1% | ~1ms |
-| 精确 | `COUNT(*)`，每小时 cron 刷新 | 100% | 数百ms |
-
-`/stats` 接口直接读内存计数器，无 DB 查询。
-
-### 6.2 低成本监控
-
-不引入 Prometheus/Grafana，用以下方案：
-
-- **结构化日志**：每批处理打印 `accepted/inserted/queue_depth`
-- **`/health/detailed` 端点**：返回 total_torrents、today_new、dedup_fill_pct、ingest_queue_depth
-- **healthcheck.sh**：curl 该端点 + jq 判断阈值，超出时告警
-
----
-
-## 第七章：部署架构
-
-### 7.1 2C4G 资源分配
-
-| 服务 | CPU | 内存 | 说明 |
-|------|-----|------|------|
-| PostgreSQL | 1.0C | 800MB | shared_buffers=200MB, max_connections=50 |
-| ASP.NET API | 0.5C | 700MB | 200MB CuckooFilter + 300MB Channel + 200MB 运行时 |
-| Meilisearch | 0.3C | 500MB | 千万文档约 300MB 索引 |
-| Nginx | 0.1C | 30MB | 纯静态文件 |
-| 系统/Docker | — | 200MB | 系统预留 |
-| **合计** | **≈2C** | **≈2.2GB** | 4GB 的 55%，安全 |
-
-爬虫在独立服务器运行，不计入主机资源。
-
-### 7.2 Docker Compose 关键配置
-
-```yaml
-postgres:
-  command: postgres
-    -c shared_buffers=200MB
-    -c work_mem=4MB
-    -c max_connections=50
-    -c effective_cache_size=600MB
-    -c log_min_duration_statement=2000
-  deploy:
-    resources:
-      limits: { cpus: "1.0", memory: 800M }
-
-api:
-  environment:
-    ApiKey: ${API_KEY:-}          # 空 = 不验证
-    DOTNET_GCHeapHardLimit: 600000000  # GC 堆上限 600MB
-  deploy:
-    resources:
-      limits: { cpus: "0.5", memory: 700M }
-
-meilisearch:
-  image: getmeili/meilisearch:v1.9
-  deploy:
-    resources:
-      limits: { cpus: "0.3", memory: 500M }
+```text
+inbound get_peers observation
+  -> crawler 排除自身/已知 crawler/metadata fetch 等自反馈
+  -> (info_hash, daily keyed actor fingerprint)
+  -> 独立 CHHT v1 durable spool + HMAC/sequence/digest
+  -> POST /api/v1/heat/batches
+  -> 当日 SQLite exact actor-day set（WAL + synchronous FULL）
+  -> crawler writer barrier + contiguous receipt cursor
+  -> POST /api/v1/heat/completions（crawler 专属 HMAC、幂等）
+  -> UTC grace window 后按 64 shard 封成 immutable PG frames
+  -> manifest 标注 complete/partial coverage
+  -> HeatProjectionWorker 逐日、逐 shard、可恢复地 partial PUT Meili
 ```
 
-### 7.3 Volume 策略
+热度表示窗口内经去重的 actor-day observations 之和，不冒充唯一用户或唯一 peer。
+`Heat__ExpectedCrawlerIds` 决定每日覆盖完整性；缺少区域的日子以 partial 明示，不能静默
+补零。每个 expected crawler 必须配置独立 `Heat__CrawlerSecrets__{id}`；只有显式 completion
+与其 start/next 之间单 epoch receipt 链完全连续、且 crawler 本地没有 queue/drop/restart
+损失时才是 complete。其余情况一律 partial。搜索响应返回所选窗口的 `heatAsOfDay` 与实际
+complete coverage days。
 
-所有 volume 绑定到宿主机 `/opt/cherry/data/`（非匿名 volume），方便备份和迁移。
+PG 中 sealed heat 使用 `heat_day_manifests` 和 `heat_day_frames`；投影进度使用
+`heat_projection_watermarks` 与 `heat_projection_tasks`。首次构建或 index generation
+变化时做全量恢复，之后仅重算日窗口边界受影响的 ID。Redis 不在正确性链路中，也不
+需要保存长期 IP/node/hash 关系。
 
-**备份策略**：
-- PostgreSQL：每日凌晨3点 pg_dump + gzip，保留7天
-- Meilisearch：**不需要单独备份**。损坏后清空重启，API 启动时检测 Meili 文档数为0则触发一次性全量同步
-- CuckooFilter：随 PG 备份，或删除后重启自愈（PG 的 ON CONFLICT 兜底）
+## 6. 安全与部署
 
-### 7.4 Nginx 配置
+[`../deploy/storage/compose.yml`](../deploy/storage/compose.yml) 是当前 2C4G 起始配置：
 
-```nginx
-# /api/v1/torrents/batch 和 /peers 只允许内网 + 已认证请求
-# 所有其他 API 公开
-# SPA 路由：try_files $uri /index.html
-# 静态文件：expires 1d, Cache-Control: public, immutable
-```
+| 服务 | 内存硬限制 | CPU ceiling | 网络 |
+|---|---:|---:|---|
+| PostgreSQL 17.10 | 1408 MiB | 1.25 | Docker internal |
+| Meilisearch 1.45.1 | 1408 MiB | 1.0 | Docker internal |
+| API | 640 MiB | 0.75 | 仅 `127.0.0.1:5070` |
 
----
+三者 CPU ceiling 可以重叠调度；内存总硬限制为 3.375 GiB，给 kernel、Docker、SSH 和
+page cache 留约 640 MiB。Meili 限一个 indexing thread/768 MiB indexing arena。上述是
+保守基线，不是无需 benchmark 的最终参数。
 
-## 第八章：实施路线图
+PG、Meili 和 API 都不直接暴露公网。Crawler 用受限 SSH key 建 persistent local forward，
+metadata API key 与 CHHT HMAC secret 分离。Meili master key、PG 密码和 API key 只存在
+mode 0600 的部署环境文件中；脚本没有默认密码。
 
-按收益/风险比排序：
+## 7. 运维不变量
 
-| 步骤 | 改动范围 | 收益 | 风险 |
-|------|---------|------|------|
-| 1 | `CounterService` + `StatsRefreshService`，`GetStatsAsync` 读内存 | 统计 O(1) | 低 |
-| 2 | `MeiliSyncService` + `IngestService` 触发推送 | 新种子 2s 内可搜 | 中 |
-| 3 | Program.cs API Key 中间件 + docker env | 安全 | 低 |
-| 4 | IngestService 429 背压 + 爬虫处理 429 | 稳定性 | 低 |
-| 5 | 爬虫 WAL sink（~100行 Go） | 网络抖动数据不丢 | 低 |
-| 6 | fileType 过滤修正 + PG trigram 阈值 0.95→0.7 | 搜索质量 | 低 |
+- PostgreSQL + crawler 未 ACK spool 是 metadata authority；Meili 随时可删后重建。
+- 未封日 heat 的备份必须同时覆盖 SQLite 主文件、WAL 和 SHM，或停 API 后复制。
+- 对 metadata/heat/outbox 的成功必须以 durable commit 或 Meili task `succeeded` 为界，
+  不能以 HTTP request 已发送为界。
+- 直接 schema 导入必须生成 search outbox marker；禁止直接向 Meili 灌旧 fat document。
+- 新索引必须保持 numeric `id` primary key 和当前薄字段契约；任何 generation 切换必须
+  让 heat projection 从权威 frames 恢复。
+- PostgreSQL 需要独立备份/PITR；Meili snapshot 可选，不能代替 PG 备份。
+- 每次资源、schema、codec、ranking 或 crawler 参数变更都要保留 benchmark、推理和回滚
+  记录；历史证据不应被“清理”为当前文档。
 
----
+## 8. 关键实现入口
 
-## 附录：关键文件索引
-
-| 文件 | 说明 |
-|------|------|
-| `backend/src/Cherry.Api/Program.cs` | DI 注册、中间件、API Key 验证 |
-| `backend/src/Cherry.Api/Endpoints/TorrentEndpoints.cs` | HTTP 端点，含 429 返回 |
-| `backend/src/Cherry.Application/Services/IngestService.cs` | 核心消费管道，背压检测 |
-| `backend/src/Cherry.Application/Services/MeiliSyncService.cs` | [待创建] Meili 实时同步 |
-| `backend/src/Cherry.Application/Services/CounterService.cs` | [待创建] 内存原子计数器 |
-| `backend/src/Cherry.Infrastructure/Repositories/TorrentRepository.cs` | BINARY COPY，搜索双引擎 |
-| `backend/src/Cherry.Infrastructure/Search/MeiliSearchClient.cs` | Meilisearch HTTP 客户端 |
-| `go/cherry-picker/internal/export/exporter.go` | httpSink，含 WAL 包装和 429 处理 |
-| `go/cherry-picker/internal/export/wal_sink.go` | [待创建] WAL 本地缓冲 |
-| `scripts/sync-meilisearch.js` | 全量同步脚本（启动兜底用） |
+| 路径 | 职责 |
+|---|---|
+| `cherry-picker/internal/export/` | metadata spool、durable batch、receipt 重放 |
+| `cherry-picker/internal/heat/` | actor-day 缩减、CHHT spool/export |
+| `backend/src/Cherry.Infrastructure/Repositories/DurableIngestService.cs` | metadata 原子提交 |
+| `backend/src/Cherry.Infrastructure/Storage/TorrentDetailCodec.cs` | compact detail 编解码 |
+| `backend/src/Cherry.Infrastructure/Search/SearchOutboxWorker.cs` | durable metadata projection |
+| `backend/src/Cherry.Infrastructure/Heat/` | heat 累积、封日、frame 与投影 |
+| `backend/src/Cherry.Infrastructure/Search/MeiliSearchClient.cs` | thin index 契约 |
+| `deploy/storage/compose.yml` | 2C4G storage/search baseline |

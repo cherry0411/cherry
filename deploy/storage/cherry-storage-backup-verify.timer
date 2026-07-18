@@ -1,0 +1,12 @@
+[Unit]
+Description=Monthly Cherry storage backup restore drill
+
+[Timer]
+OnCalendar=*-*-02 04:30:00 UTC
+Persistent=true
+RandomizedDelaySec=2h
+AccuracySec=5m
+Unit=cherry-storage-backup-verify.service
+
+[Install]
+WantedBy=timers.target

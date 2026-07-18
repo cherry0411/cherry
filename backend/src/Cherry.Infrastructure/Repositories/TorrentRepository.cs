@@ -2,6 +2,7 @@ using System.Runtime.CompilerServices;
 using Cherry.Domain.Entities;
 using Cherry.Domain.Interfaces;
 using Cherry.Infrastructure.Data;
+using Cherry.Infrastructure.Heat;
 using Cherry.Infrastructure.Search;
 using Cherry.Infrastructure.Storage;
 using Microsoft.EntityFrameworkCore;
@@ -15,15 +16,21 @@ public class TorrentRepository : ITorrentRepository
     private readonly AppDbContext _db;
     private readonly MeiliSearchClient? _meiliClient;
     private readonly IProcessedHashFilter? _processedHashFilter;
+    private readonly HeatOptions _heatOptions;
+    private readonly HeatProjectionStatusCache _heatStatusCache;
 
     public TorrentRepository(
         AppDbContext db,
         MeiliSearchClient? meiliClient = null,
-        IProcessedHashFilter? processedHashFilter = null)
+        IProcessedHashFilter? processedHashFilter = null,
+        HeatOptions? heatOptions = null,
+        HeatProjectionStatusCache? heatStatusCache = null)
     {
         _db = db;
         _meiliClient = meiliClient;
         _processedHashFilter = processedHashFilter;
+        _heatOptions = heatOptions ?? new HeatOptions();
+        _heatStatusCache = heatStatusCache ?? new HeatProjectionStatusCache();
     }
 
     public async Task<IReadOnlySet<string>> BulkInsertTorrentsAsync(
@@ -237,15 +244,18 @@ public class TorrentRepository : ITorrentRepository
         return torrent;
     }
 
-    public async Task<(List<Torrent> Items, long Total)> SearchAsync(
-        string query, int page, int pageSize, CancellationToken ct = default)
+    public async Task<(List<Torrent> Items, long Total, DateOnly? HeatAsOfDay, int HeatCoverageDays)> SearchAsync(
+        string query, string heatWindow, int page, int pageSize, CancellationToken ct = default)
     {
         if (_meiliClient == null)
-            return ([], 0);
+            return ([], 0, null, 0);
 
-        var result = await _meiliClient.SearchAsync(query, page, pageSize, ct);
-        if (result is not { Hits.Count: > 0 })
-            return ([], result?.EstimatedTotalHits ?? 0);
+        var result = await _meiliClient.SearchAsync(query, heatWindow, page, pageSize, ct);
+        if (result.Hits.Count == 0)
+        {
+            var emptyStatus = await GetHeatStatusAsync(heatWindow, ct);
+            return ([], result.EstimatedTotalHits, emptyStatus.Day, emptyStatus.Coverage);
+        }
 
         var ids = result.Hits.Select(h => h.Id).ToList();
         var dbItems = await _db.Torrents
@@ -255,13 +265,43 @@ public class TorrentRepository : ITorrentRepository
 
         // O(n) dict-based reorder to preserve Meilisearch ranking.
         var byId = dbItems.ToDictionary(t => t.Id);
-        var ordered = ids
-            .Select(id => byId.GetValueOrDefault(id))
-            .Where(t => t != null)
-            .Cast<Torrent>()
-            .ToList();
+        var ordered = new List<Torrent>(ids.Count);
+        foreach (var hit in result.Hits)
+        {
+            if (!byId.TryGetValue(hit.Id, out var torrent)) continue;
+            torrent.Heat1d = hit.Heat1d;
+            torrent.Heat7d = hit.Heat7d;
+            torrent.Heat15d = hit.Heat15d;
+            torrent.Heat30d = hit.Heat30d;
+            ordered.Add(torrent);
+        }
 
-        return (ordered, result.EstimatedTotalHits);
+        var status = await GetHeatStatusAsync(heatWindow, ct);
+        return (ordered, result.EstimatedTotalHits, status.Day, status.Coverage);
+    }
+
+    private async Task<(DateOnly? Day, int Coverage)> GetHeatStatusAsync(string heatWindow, CancellationToken ct)
+    {
+        var windowDays = int.Parse(heatWindow[..^1], System.Globalization.CultureInfo.InvariantCulture);
+        var status = await _heatStatusCache.GetAsync(async cancellationToken =>
+        {
+            var connection = (NpgsqlConnection)_db.Database.GetDbConnection();
+            if (connection.State != System.Data.ConnectionState.Open)
+                await connection.OpenAsync(cancellationToken);
+            await using var command = new NpgsqlCommand(
+                """
+                SELECT projected_through,coverage_mask
+                  FROM heat_projection_watermarks
+                 WHERE index_generation=@generation
+                """,
+                connection);
+            command.Parameters.AddWithValue("generation", _heatOptions.IndexGeneration);
+            await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+            return await reader.ReadAsync(cancellationToken)
+                ? (reader.IsDBNull(0) ? null : reader.GetFieldValue<DateOnly>(0), reader.GetInt32(1))
+                : (null, 0);
+        }, ct);
+        return (status.Day, HeatCoverage.Count(status.CoverageMask, windowDays));
     }
 
     public async Task<List<string>> CheckExistsAsync(List<string> hashes, CancellationToken ct = default)

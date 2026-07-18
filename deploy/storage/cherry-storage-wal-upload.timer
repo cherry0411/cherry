@@ -1,0 +1,13 @@
+[Unit]
+Description=Upload Cherry PostgreSQL WAL every five minutes
+
+[Timer]
+OnBootSec=3m
+OnUnitInactiveSec=5m
+RandomizedDelaySec=30s
+AccuracySec=15s
+Persistent=true
+Unit=cherry-storage-wal-upload.service
+
+[Install]
+WantedBy=timers.target

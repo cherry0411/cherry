@@ -38,6 +38,7 @@ import (
 	dht "cherry-picker/internal/dht"
 	"cherry-picker/internal/export"
 	"cherry-picker/internal/filter"
+	"cherry-picker/internal/heat"
 	"cherry-picker/internal/pipeline"
 	"cherry-picker/internal/spool"
 	"cherry-picker/internal/storagepolicy"
@@ -98,6 +99,9 @@ type Application struct {
 	// oracleObserver is present only when the production durable path mirrors
 	// post-fsync hash+typed-action evidence to a separate experiment oracle.
 	oracleObserver *export.OracleObserver
+	// heatCollector is an independent inbound get_peers durability channel. It
+	// never shares metadata/oracle queues, spools, credentials or endpoints.
+	heatCollector *heat.Collector
 }
 
 // runtimeStats 运行时统计（原子计数器）。
@@ -225,6 +229,27 @@ type statsSnapshot struct {
 	oracleObservationHTTPFailures uint64
 	oracleObservationDepth        int
 	oracleObservationCapacity     int
+
+	heatObserved                 uint64
+	heatFiltered                 uint64
+	heatQueued                   uint64
+	heatQueueDropped             uint64
+	heatBatchDuplicates          uint64
+	heatDurable                  uint64
+	heatLostBeforeDurable        uint64
+	heatSpoolRetries             uint64
+	heatSpoolFatalErrors         uint64
+	heatExported                 uint64
+	heatExportBatches            uint64
+	heatExportRetries            uint64
+	heatExportPermanentFailures  uint64
+	heatClosedDayRejectedRecords uint64
+	heatClosedDayRejectedBatches uint64
+	heatQueueDepth               int
+	heatQueueCapacity            int
+	heatSpoolBytes               int64
+	heatSpoolMaxBytes            int64
+	heatSpoolRecords             uint64
 }
 
 const (
@@ -361,7 +386,42 @@ func (a *Application) Run(ctx context.Context) error {
 			}
 			closeCancel()
 		}
+		if a.heatCollector != nil {
+			closeCtx, closeCancel := context.WithTimeout(context.Background(), 10*time.Second)
+			if err := a.heatCollector.Close(closeCtx); err != nil {
+				a.logger.Printf("heat collector close (non-durable admissions are reflected by metrics): %v", err)
+			}
+			closeCancel()
+		}
 	}()
+
+	if a.cfg.Heat.Enabled {
+		collector, err := heat.New(heat.Options{
+			Endpoint: a.cfg.Heat.Endpoint, CrawlerID: a.cfg.Heat.CrawlerID,
+			SpoolDir: a.cfg.Heat.SpoolDir, SpoolMaxBytes: a.cfg.Heat.SpoolMaxBytes,
+			KnownCrawlers: a.cfg.Heat.KnownCrawlers, QueueCapacity: a.cfg.Heat.QueueCapacity,
+			BatchSize: a.cfg.Heat.BatchSize, FlushDelay: a.cfg.Heat.FlushInterval,
+			HTTPTimeout: a.cfg.Heat.HTTPTimeout, RetryBackoff: a.cfg.Heat.RetryBackoff,
+			MasterSecretFile: a.cfg.Heat.MasterSecretFile, HMACSecretFile: a.cfg.Heat.HMACSecretFile,
+		})
+		if err != nil {
+			return fmt.Errorf("start inbound get_peers heat collector: %w", err)
+		}
+		a.heatCollector = collector
+		go func() {
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case err := <-collector.Errors():
+					a.logger.Printf("heat pipeline: %v", err)
+				}
+			}
+		}()
+		a.logger.Printf("inbound get_peers heat enabled: endpoint=%s spool=%s queue=%d batch=%d max_bytes=%d wire=CHHT/1",
+			a.cfg.Heat.Endpoint, a.cfg.Heat.SpoolDir, a.cfg.Heat.QueueCapacity,
+			a.cfg.Heat.BatchSize, a.cfg.Heat.SpoolMaxBytes)
+	}
 
 	// Durable pre-send spool path: enabled for http export with a spool_dir.
 	// Metadata consumers submit directly to a short group fsync, bypassing the
@@ -469,6 +529,9 @@ func (a *Application) Run(ctx context.Context) error {
 	// 共享回调（所有 DHT 实例共用同一套 handler，共享下载器和 LRU）
 	onGetPeers := func(infoHash, ip string, port int) {
 		now := time.Now().UTC()
+		if a.heatCollector != nil {
+			a.heatCollector.Observe(infoHash, ip, now)
+		}
 		ihHex := hex.EncodeToString([]byte(infoHash))
 		if a.cfg.Role != "metadata" {
 			a.submitInfohashEvent(events, ihHex, ip, port, "get_peers", stats, now)
@@ -1409,6 +1472,10 @@ func (a *Application) emitStats(ctx context.Context, events chan<- pipeline.Even
 			if a.oracleObserver != nil {
 				oracleStats = a.oracleObserver.Snapshot()
 			}
+			var heatStats heat.Snapshot
+			if a.heatCollector != nil {
+				heatStats = a.heatCollector.Snapshot()
+			}
 			current := statsSnapshot{
 				infohashEventsSent:            stats.infohashEventsSent.Load(),
 				infohashEventsDropped:         stats.infohashEventsDropped.Load(),
@@ -1476,6 +1543,26 @@ func (a *Application) emitStats(ctx context.Context, events chan<- pipeline.Even
 				oracleObservationHTTPFailures: oracleStats.HTTPFailures,
 				oracleObservationDepth:        oracleStats.Depth,
 				oracleObservationCapacity:     oracleStats.Capacity,
+				heatObserved:                  heatStats.Observed,
+				heatFiltered:                  heatStats.Filtered,
+				heatQueued:                    heatStats.Queued,
+				heatQueueDropped:              heatStats.QueueDropped,
+				heatBatchDuplicates:           heatStats.BatchDuplicates,
+				heatDurable:                   heatStats.Durable,
+				heatLostBeforeDurable:         heatStats.LostBeforeDurable,
+				heatSpoolRetries:              heatStats.SpoolRetries,
+				heatSpoolFatalErrors:          heatStats.SpoolFatalErrors,
+				heatExported:                  heatStats.Exported,
+				heatExportBatches:             heatStats.ExportBatches,
+				heatExportRetries:             heatStats.ExportRetries,
+				heatExportPermanentFailures:   heatStats.ExportPermanentFailures,
+				heatClosedDayRejectedRecords:  heatStats.ClosedDayRejectedRecords,
+				heatClosedDayRejectedBatches:  heatStats.ClosedDayRejectedBatches,
+				heatQueueDepth:                heatStats.QueueDepth,
+				heatQueueCapacity:             heatStats.QueueCapacity,
+				heatSpoolBytes:                heatStats.SpoolBytes,
+				heatSpoolMaxBytes:             heatStats.SpoolMaxBytes,
+				heatSpoolRecords:              heatStats.SpoolRecords,
 			}
 			funnel := downloader.FunnelBySource()
 			announce := funnel[dht.PeerSourceAnnounce]
@@ -1580,6 +1667,26 @@ func (a *Application) emitStats(ctx context.Context, events chan<- pipeline.Even
 				"oracle_observation_http_failures":  current.oracleObservationHTTPFailures,
 				"oracle_observation_queue_depth":    uint64(current.oracleObservationDepth),
 				"oracle_observation_queue_capacity": uint64(current.oracleObservationCapacity),
+				"heat_observed":                     current.heatObserved,
+				"heat_filtered":                     current.heatFiltered,
+				"heat_queued":                       current.heatQueued,
+				"heat_queue_dropped":                current.heatQueueDropped,
+				"heat_batch_duplicates":             current.heatBatchDuplicates,
+				"heat_durable":                      current.heatDurable,
+				"heat_lost_before_durable":          current.heatLostBeforeDurable,
+				"heat_spool_retries":                current.heatSpoolRetries,
+				"heat_spool_fatal_errors":           current.heatSpoolFatalErrors,
+				"heat_exported":                     current.heatExported,
+				"heat_export_batches":               current.heatExportBatches,
+				"heat_export_retries":               current.heatExportRetries,
+				"heat_export_permanent_failures":    current.heatExportPermanentFailures,
+				"heat_closed_day_rejected_records":  current.heatClosedDayRejectedRecords,
+				"heat_closed_day_rejected_batches":  current.heatClosedDayRejectedBatches,
+				"heat_queue_depth":                  uint64(current.heatQueueDepth),
+				"heat_queue_capacity":               uint64(current.heatQueueCapacity),
+				"heat_spool_bytes":                  uint64(current.heatSpoolBytes),
+				"heat_spool_max_bytes":              uint64(current.heatSpoolMaxBytes),
+				"heat_spool_records":                current.heatSpoolRecords,
 			}
 			addLRUWorkerStats(workerStats, "infohash", current.infohashLRU)
 			addLRUWorkerStats(workerStats, "peer", current.peerLRU)
@@ -1673,7 +1780,7 @@ func (a *Application) logRuntimeDelta(current, previous statsSnapshot) {
 func formatRuntimeGauges(current, previous statsSnapshot) string {
 	var b strings.Builder
 	fmt.Fprintf(&b,
-		" wire_active=%d wire_max=%d wire_busy=%d wire_req_depth=%d wire_req_cap=%d wire_resp_depth=%d wire_resp_cap=%d dht_bl_size=%d dht_bl_max=%d dht_bl_reject=%d dht_bl_expired=%d oracle_obs_q=%d oracle_obs_sent=%d oracle_obs_drop=%d oracle_obs_http_fail=%d oracle_obs_depth=%d oracle_obs_cap=%d oracle_obs_invalid=%t",
+		" wire_active=%d wire_max=%d wire_busy=%d wire_req_depth=%d wire_req_cap=%d wire_resp_depth=%d wire_resp_cap=%d dht_bl_size=%d dht_bl_max=%d dht_bl_reject=%d dht_bl_expired=%d oracle_obs_q=%d oracle_obs_sent=%d oracle_obs_drop=%d oracle_obs_http_fail=%d oracle_obs_depth=%d oracle_obs_cap=%d oracle_obs_invalid=%t heat_q=%d heat_drop=%d heat_durable=%d heat_lost=%d heat_spool_retry=%d heat_export=%d heat_export_retry=%d heat_perm_fail=%d heat_closed_records=%d heat_closed_batches=%d heat_depth=%d heat_cap=%d heat_spool_bytes=%d heat_spool_max=%d heat_spool_records=%d",
 		current.wireActiveWorkers,
 		current.wireMaxWorkers,
 		current.wireBusyWorkers,
@@ -1692,6 +1799,21 @@ func formatRuntimeGauges(current, previous statsSnapshot) string {
 		current.oracleObservationDepth,
 		current.oracleObservationCapacity,
 		current.oracleObservationsDropped > 0 || current.oracleObservationHTTPFailures > 0,
+		current.heatQueued-previous.heatQueued,
+		current.heatQueueDropped-previous.heatQueueDropped,
+		current.heatDurable-previous.heatDurable,
+		current.heatLostBeforeDurable-previous.heatLostBeforeDurable,
+		current.heatSpoolRetries-previous.heatSpoolRetries,
+		current.heatExported-previous.heatExported,
+		current.heatExportRetries-previous.heatExportRetries,
+		current.heatExportPermanentFailures-previous.heatExportPermanentFailures,
+		current.heatClosedDayRejectedRecords-previous.heatClosedDayRejectedRecords,
+		current.heatClosedDayRejectedBatches-previous.heatClosedDayRejectedBatches,
+		current.heatQueueDepth,
+		current.heatQueueCapacity,
+		current.heatSpoolBytes,
+		current.heatSpoolMaxBytes,
+		current.heatSpoolRecords,
 	)
 	appendLRURuntimeFields(&b, "ih", current.infohashLRU, previous.infohashLRU)
 	appendLRURuntimeFields(&b, "peer", current.peerLRU, previous.peerLRU)
@@ -1886,12 +2008,6 @@ func buildStoragePolicy(cfg config.FilterConfig) (*storagepolicy.Policy, error) 
 	}
 	if cfg.MaxStoredNameBytes != 0 {
 		policyCfg.MaxNameBytes = cfg.MaxStoredNameBytes
-	}
-	if cfg.SummaryMaxAliases != 0 {
-		policyCfg.SummaryMaxAliases = cfg.SummaryMaxAliases
-	}
-	if cfg.SummaryAliasBytes != 0 {
-		policyCfg.SummaryAliasBytes = cfg.SummaryAliasBytes
 	}
 	if cfg.SummaryMaxExtensions != 0 {
 		policyCfg.SummaryMaxExtensions = cfg.SummaryMaxExtensions

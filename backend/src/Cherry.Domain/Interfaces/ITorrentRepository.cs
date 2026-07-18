@@ -9,8 +9,8 @@ public interface ITorrentRepository
         IReadOnlyCollection<string> infoHashes,
         CancellationToken ct = default);
     Task<Torrent?> GetByInfoHashAsync(string infoHash, CancellationToken ct = default);
-    Task<(List<Torrent> Items, long Total)> SearchAsync(
-        string query, int page, int pageSize, CancellationToken ct = default);
+    Task<(List<Torrent> Items, long Total, DateOnly? HeatAsOfDay, int HeatCoverageDays)> SearchAsync(
+        string query, string heatWindow, int page, int pageSize, CancellationToken ct = default);
     Task<List<Torrent>> GetRecentAsync(int count, CancellationToken ct = default);
     Task<List<string>> CheckExistsAsync(List<string> hashes, CancellationToken ct = default);
     Task<List<string>> CheckProcessedAsync(List<string> hashes, CancellationToken ct = default);

@@ -113,19 +113,22 @@ public sealed class SearchOutboxWorker : BackgroundService
     private readonly SearchOutboxOptions _options;
     private readonly SearchOutboxMetrics _metrics;
     private readonly ILogger<SearchOutboxWorker> _logger;
+    private readonly SearchRecoveryCoordinator _recoveryCoordinator;
 
     public SearchOutboxWorker(
         IServiceScopeFactory scopeFactory,
         MeiliSearchClient client,
         SearchOutboxOptions options,
         SearchOutboxMetrics metrics,
-        ILogger<SearchOutboxWorker> logger)
+        ILogger<SearchOutboxWorker> logger,
+        SearchRecoveryCoordinator? recoveryCoordinator = null)
     {
         _scopeFactory = scopeFactory;
         _client = client;
         _options = options.Normalize();
         _metrics = metrics;
         _logger = logger;
+        _recoveryCoordinator = recoveryCoordinator ?? new SearchRecoveryCoordinator();
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -152,6 +155,8 @@ public sealed class SearchOutboxWorker : BackgroundService
 
     public async Task<int> ProcessOnceAsync(CancellationToken cancellationToken = default)
     {
+        await using var projection =
+            await _recoveryCoordinator.EnterProjectionAsync(cancellationToken);
         var owner = Guid.NewGuid();
         List<SearchOutboxClaim> claims;
         List<Cherry.Domain.Entities.Torrent> documents;

@@ -1,0 +1,76 @@
+{
+  "schema": "cherry.storage-full-stack-s008.v1",
+  "recorded_at_utc": "2026-07-18T13:25:30.9095129+00:00",
+  "limits": {
+    "target": "2C4G",
+    "api": "0.75 CPU / 640 MiB",
+    "postgres": "1.25 CPU / 1408 MiB",
+    "meilisearch": "1 CPU / 1408 MiB; 768 MiB indexing arena; 1 indexing thread"
+  },
+  "corpus": {
+    "events": 20000,
+    "encoding": "normalized",
+    "files_per_event": 1,
+    "languages": ["Chinese", "English"],
+    "raw_bencode_bytes": 0
+  },
+  "durable_ingest": {
+    "batch_events": 1000,
+    "batches": 20,
+    "accepted": 20000,
+    "duplicates": 0,
+    "seconds": 5.361580099910498,
+    "events_per_second": 3730.2436273093945,
+    "receipt_errors": 0
+  },
+  "search_projection": {
+    "outbox_batch_size": 500,
+    "completed_documents": 20000,
+    "completed_tasks": 40,
+    "retries": 0,
+    "failed_tasks": 0,
+    "final_outbox_depth": 0,
+    "last_task_latency_seconds": 0.2668071,
+    "meili_documents": 20000,
+    "meili_raw_document_db_bytes": 1794048,
+    "meili_average_document_bytes": 81,
+    "cjk_query_passed": true,
+    "latin_query_passed": true,
+    "empty_query_hot_list_passed": true
+  },
+  "durable_storage": {
+    "postgres_database_bytes": 16111283,
+    "torrent_rows": 20000,
+    "detail_rows": 20000,
+    "encoded_detail_payload_bytes": 884642,
+    "outbox_rows_after_projection": 0,
+    "durable_receipt_rows": 1
+  },
+  "sampled_resource_peaks": {
+    "api_cpu_percent_of_one_cpu": 44.96,
+    "api_memory_mib": 108.5,
+    "postgres_cpu_percent_of_one_cpu": 67.09,
+    "postgres_memory_mib": 54.43,
+    "meilisearch_cpu_percent_of_one_cpu": 35.6,
+    "meilisearch_memory_mib": 127.5
+  },
+  "restart_recovery": {
+    "api_health_after_restart": true,
+    "processed_hash_filter_rebuilt_from_exact_postgres_rows": 20000,
+    "metadata_last_batch_replay_preserved_receipt": true,
+    "metadata_replay_accepted": 1000,
+    "metadata_replay_duplicates": 0,
+    "heat_first_batch_replay_preserved_receipt": true,
+    "heat_replay_received": 4096,
+    "heat_replay_inserted": 2048,
+    "heat_replay_ack_ms": 93.6294998973608,
+    "heat_sqlite_bytes_after_40960_source_records": 577536
+  },
+  "limitations": [
+    "Synthetic single-file metadata is smaller and easier than a production long-tail corpus.",
+    "Resource values are sampled peaks, not continuous cgroup or host pressure-stall traces.",
+    "The test validates restart/replay and search projection but does not cross a UTC seal boundary in real time.",
+    "The user-authorized final stability phase has not begun."
+  ],
+  "decision": "The final code path fits the conservative 2C4G resource envelope with large observed headroom; retain 500-document outbox tasks because production metadata arrival is far below measured capacity and smaller retry units reduce failure amplification."
+}

@@ -8,7 +8,6 @@ import (
 	"sort"
 	"strings"
 	"time"
-	"unicode"
 	"unicode/utf8"
 
 	"cherry-picker/internal/pipeline"
@@ -39,7 +38,6 @@ const (
 	maxWireNormalizedFiles = 10_000
 	maxWireNameBytes       = 16 << 10
 	maxWirePathBytes       = 16 << 10
-	maxWireSummaryAliases  = 64
 	maxWireSummaryExts     = 128
 )
 
@@ -52,8 +50,6 @@ type Config struct {
 	SummaryAbovePathBytes int `json:"summary_above_path_bytes"`
 	MaxFullPathBytes      int `json:"max_full_path_bytes"`
 	MaxNameBytes          int `json:"max_name_bytes"`
-	SummaryMaxAliases     int `json:"summary_max_aliases"`
-	SummaryAliasBytes     int `json:"summary_alias_bytes"`
 	SummaryMaxExtensions  int `json:"summary_max_extensions"`
 	HashOnlyAboveFiles    int `json:"hash_only_above_files"`
 	RejectAboveFiles      int `json:"reject_above_files"`
@@ -66,8 +62,6 @@ func DefaultConfig() Config {
 		SummaryAbovePathBytes: 512 << 10,
 		MaxFullPathBytes:      4096,
 		MaxNameBytes:          1024,
-		SummaryMaxAliases:     32,
-		SummaryAliasBytes:     4096,
 		SummaryMaxExtensions:  32,
 		// Irreversible/low-retention actions remain disabled until the corpus
 		// benchmark demonstrates a worthwhile storage/quality tradeoff.
@@ -83,15 +77,13 @@ type Policy struct {
 func New(config Config) (*Policy, error) {
 	if config.Version <= 0 || config.SummaryAboveFiles <= 0 ||
 		config.SummaryAbovePathBytes <= 0 || config.MaxFullPathBytes <= 0 ||
-		config.MaxNameBytes <= 0 || config.SummaryMaxAliases <= 0 ||
-		config.SummaryAliasBytes <= 0 || config.SummaryMaxExtensions <= 0 ||
+		config.MaxNameBytes <= 0 || config.SummaryMaxExtensions <= 0 ||
 		config.HashOnlyAboveFiles < 0 || config.RejectAboveFiles < 0 {
 		return nil, errors.New("storagepolicy: invalid non-positive budget")
 	}
 	if config.SummaryAboveFiles > maxWireNormalizedFiles ||
 		config.MaxNameBytes > maxWireNameBytes ||
 		config.MaxFullPathBytes > maxWirePathBytes ||
-		config.SummaryMaxAliases > maxWireSummaryAliases ||
 		config.SummaryMaxExtensions > maxWireSummaryExts {
 		return nil, errors.New("storagepolicy: budget exceeds durable wire schema")
 	}
@@ -208,11 +200,10 @@ func compactDecisionCode(action Action, reason string) spool.DecisionCode {
 
 func (p *Policy) makeSummary(name string, total uint64, files []projectedFile) *spool.SummaryMetadata {
 	return &spool.SummaryMetadata{
-		Name:                name,
-		TotalLength:         total,
-		FileCount:           uint32(len(files)),
-		RepresentativeFiles: representativeFiles(files, p.config.SummaryMaxAliases, p.config.SummaryAliasBytes),
-		Extensions:          extensionSummaries(files, p.config.SummaryMaxExtensions),
+		Name:        name,
+		TotalLength: total,
+		FileCount:   uint32(len(files)),
+		Extensions:  extensionSummaries(files, p.config.SummaryMaxExtensions),
 	}
 }
 
@@ -266,142 +257,6 @@ func normalizedPath(file pipeline.MetadataFile) string {
 		return "_"
 	}
 	return value
-}
-
-type aliasCandidate struct {
-	path   string
-	length uint64
-	score  int
-}
-
-func representativeFiles(files []projectedFile, maxCount, maxBytes int) []spool.File {
-	// Keep only a small oversampled top set. Building a map and sorting every
-	// unique path made a 10k-file summary allocate megabytes even though at most
-	// a few dozen aliases can ever be stored.
-	poolLimit := maxCount * 4
-	pool := make(aliasHeap, 0, poolLimit)
-	seenLengths := make(map[string]uint64, min(len(files), 1024))
-	for i := range files {
-		name := path.Base(files[i].path)
-		name = boundedText(name, 256)
-		if name == "" || name == "." {
-			continue
-		}
-		candidate := aliasCandidate{path: name, length: files[i].length, score: informationScore(name)}
-		identity := strings.ToLower(name)
-		if prior, exists := seenLengths[identity]; exists && prior >= candidate.length {
-			continue
-		}
-		seenLengths[identity] = candidate.length
-		if len(pool) < poolLimit {
-			aliasHeapPush(&pool, candidate)
-			continue
-		}
-		if aliasBetter(candidate, pool[0]) {
-			pool[0] = candidate
-			aliasHeapFix(pool, 0)
-		}
-	}
-	sort.Slice(pool, func(i, j int) bool {
-		return aliasBetter(pool[i], pool[j])
-	})
-	result := make([]spool.File, 0, min(maxCount, len(pool)))
-	used := 0
-	for _, candidate := range pool {
-		if len(result) >= maxCount || used+len(candidate.path) > maxBytes {
-			continue
-		}
-		duplicate := false
-		for _, selected := range result {
-			if strings.EqualFold(selected.Path, candidate.path) {
-				duplicate = true
-				break
-			}
-		}
-		if duplicate {
-			continue
-		}
-		result = append(result, spool.File{Path: candidate.path, Length: candidate.length})
-		used += len(candidate.path)
-	}
-	return result
-}
-
-type aliasHeap []aliasCandidate
-
-func aliasHeapPush(target *aliasHeap, candidate aliasCandidate) {
-	*target = append(*target, candidate)
-	aliasHeapUp(*target, len(*target)-1)
-}
-
-func aliasHeapFix(target aliasHeap, index int) {
-	if !aliasHeapDown(target, index) {
-		aliasHeapUp(target, index)
-	}
-}
-
-func aliasHeapUp(target aliasHeap, index int) {
-	for index > 0 {
-		parent := (index - 1) / 2
-		if !aliasBetter(target[parent], target[index]) {
-			return
-		}
-		target[parent], target[index] = target[index], target[parent]
-		index = parent
-	}
-}
-
-func aliasHeapDown(target aliasHeap, index int) bool {
-	original := index
-	for {
-		left := index*2 + 1
-		if left >= len(target) {
-			break
-		}
-		worst := left
-		right := left + 1
-		if right < len(target) && aliasBetter(target[left], target[right]) {
-			worst = right
-		}
-		if !aliasBetter(target[index], target[worst]) {
-			break
-		}
-		target[index], target[worst] = target[worst], target[index]
-		index = worst
-	}
-	return index != original
-}
-
-func aliasBetter(left, right aliasCandidate) bool {
-	if left.score != right.score {
-		return left.score > right.score
-	}
-	if left.length != right.length {
-		return left.length > right.length
-	}
-	return left.path < right.path
-}
-
-func informationScore(value string) int {
-	score := 0
-	// A tiny stack-resident bloom bitmap is sufficient for ranking aliases. It
-	// avoids allocating a map for every file name (tens of thousands of maps for
-	// a large torrent) while preserving the useful "character variety" signal.
-	var seen [2]uint64
-	for _, r := range value {
-		if unicode.IsLetter(r) {
-			score += 4
-		} else if unicode.IsDigit(r) {
-			score++
-		}
-		bucket := uint32(r) * 2654435761 >> 25
-		word, bit := bucket>>6, uint64(1)<<(bucket&63)
-		if seen[word]&bit == 0 {
-			seen[word] |= bit
-			score++
-		}
-	}
-	return score
 }
 
 func extensionSummaries(files []projectedFile, maxCount int) []spool.ExtensionSummary {

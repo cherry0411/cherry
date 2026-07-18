@@ -2,6 +2,7 @@ using System.Net;
 using System.Text;
 using Cherry.Domain.Entities;
 using Cherry.Infrastructure.Data;
+using Cherry.Infrastructure.Heat;
 using Cherry.Infrastructure.Repositories;
 using Cherry.Infrastructure.Search;
 using Microsoft.EntityFrameworkCore;
@@ -102,7 +103,7 @@ public sealed class SearchOutboxPostgresTests
             Assert.Single(claims);
             var documents = await store.LoadDocumentsAsync(claims);
             var client = new MeiliSearchClient(new HttpClient(new DelegateHandler(request =>
-                Task.FromResult(request.Method == HttpMethod.Post
+                Task.FromResult(request.Method == HttpMethod.Put
                     ? Json(HttpStatusCode.Accepted, "{\"taskUid\":88}")
                     : Json(HttpStatusCode.OK, "{\"status\":\"succeeded\"}"))))
             {
@@ -127,7 +128,7 @@ public sealed class SearchOutboxPostgresTests
         var replay = Worker(provider, new DelegateHandler(request =>
         {
             Interlocked.Increment(ref replayRequests);
-            return Task.FromResult(request.Method == HttpMethod.Post
+            return Task.FromResult(request.Method == HttpMethod.Put
                 ? Json(HttpStatusCode.Accepted, "{\"taskUid\":89}")
                 : Json(HttpStatusCode.OK, "{\"status\":\"succeeded\"}"));
         }));
@@ -153,7 +154,7 @@ public sealed class SearchOutboxPostgresTests
         var upgraded = false;
         var handler = new DelegateHandler(async request =>
         {
-            if (request.Method == HttpMethod.Post)
+            if (request.Method == HttpMethod.Put)
                 return Json(HttpStatusCode.Accepted, "{\"taskUid\":77}");
 
             if (!upgraded)
@@ -222,6 +223,64 @@ public sealed class SearchOutboxPostgresTests
             .ClaimAsync(Guid.NewGuid(), 1, TimeSpan.FromMinutes(1));
         Assert.Single(second);
         Assert.Equal(first[0].Generation, second[0].Generation);
+    }
+
+    [Fact]
+    public async Task StartupRecovery_RebuildsOnlyAProvablyEmptyIndexWithNonEmptyPostgres()
+    {
+        var fixture = await CreateFixtureAsync();
+        if (fixture is null)
+            return;
+        await using var provider = fixture.Provider;
+        var hash = HashFor(Guid.NewGuid());
+        await InsertLegacyAsync(provider, hash);
+
+        var requests = new List<string>();
+        var statsCalls = 0;
+        var nextTask = 300L;
+        var client = new MeiliSearchClient(new HttpClient(new DelegateHandler(request =>
+        {
+            requests.Add($"{request.Method} {request.RequestUri!.AbsolutePath}");
+            var path = request.RequestUri.AbsolutePath;
+            if (path.StartsWith("/tasks/", StringComparison.Ordinal))
+                return Task.FromResult(Json(HttpStatusCode.OK, "{\"status\":\"succeeded\"}"));
+            if (path == "/indexes/torrents/stats")
+            {
+                statsCalls++;
+                return Task.FromResult(Json(
+                    HttpStatusCode.OK,
+                    statsCalls <= 2
+                        ? "{\"numberOfDocuments\":0}"
+                        : "{\"numberOfDocuments\":1}"));
+            }
+            if (path == "/indexes/torrents" && request.Method == HttpMethod.Get)
+                return Task.FromResult(Json(HttpStatusCode.NotFound, "{}"));
+            return Task.FromResult(Json(
+                HttpStatusCode.Accepted,
+                $"{{\"taskUid\":{Interlocked.Increment(ref nextTask)}}}"));
+        }))
+        {
+            BaseAddress = new Uri("http://meili.test")
+        });
+
+        await using var scope = provider.CreateAsyncScope();
+        var service = new SearchRecoveryService(
+            scope.ServiceProvider.GetRequiredService<AppDbContext>(),
+            scope.ServiceProvider.GetRequiredService<SearchOutboxStore>(),
+            client,
+            new HeatOptions { Enabled = false },
+            new SearchRecoveryCoordinator());
+
+        var recovered = await service.RecoverIfProvablyEmptyAsync(CancellationToken.None);
+        Assert.NotNull(recovered);
+        Assert.True(recovered.MetadataRowsEnqueued >= 1);
+        Assert.Contains("DELETE /indexes/torrents", requests);
+        Assert.True(await scope.ServiceProvider.GetRequiredService<AppDbContext>()
+            .SearchOutbox.AnyAsync());
+
+        var deleteCount = requests.Count(request => request == "DELETE /indexes/torrents");
+        Assert.Null(await service.RecoverIfProvablyEmptyAsync(CancellationToken.None));
+        Assert.Equal(deleteCount, requests.Count(request => request == "DELETE /indexes/torrents"));
     }
 
     private static SearchOutboxWorker Worker(ServiceProvider provider, HttpMessageHandler handler)

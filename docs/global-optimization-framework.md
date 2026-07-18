@@ -57,6 +57,14 @@ SG-exclusive、JP-exclusive、intersection 和 exact union/time。
 ### 2.2 两区与持久化
 
 - 两区 loopback overlays 的和会重复计算 intersection；必须离线/在线 exact union。
+- 科学实验的 frozen baseline/private overlay 与生产持久化必须拆成两个通道：
+  `exporter_endpoint` 始终接收 policy 裁决后的 `full/summary/hash_only/reject` 并经
+  durable spool 提交；独立 `oracle_endpoint` 只接收/查询 `hash + action`。实验块
+  的 `/check` 只读 frozen baseline 加本块 overlay，不能因为中央 PG 持续增长而
+  改变后续 arm 的下载机会。这样优化期抓到的数据持续入库，同时不污染因果比较。
+- oracle 的主指标只把 `full + summary` 标为 searchable；`hash_only/reject` 仍须
+  进入生产 authority 防止重复成本，但不能虚增实验收益。oracle 写入失败不能阻塞
+  durable metadata ACK；两条通道分别记录 backlog/失败并以离线 receipt 对账。
 - remote `/check` 与昂贵 wire fetch 同时发生，通常来不及阻止首个重复下载。
 - backend outage 或 spool 高水位时，如果仍烧掉 seen/frontier，恢复后会永久损失
   当前发现机会；背压必须传播到 admission，而不是只阻塞最终 exporter。
@@ -92,6 +100,7 @@ SG-exclusive、JP-exclusive、intersection 和 exact union/time。
 | O5 | 拆 full/summary/hash_only/reject | 防止保留策略虚增吞吐 | 保留旧总数作诊断 |
 | O6 | softnet/nstat/sockstat/PPS/SYN retrans/TIME_WAIT/实际 socket buffer | 定位 OS/云边界 | 移除采样 |
 | O7 | shadow 统计 v2、metadata size 和失败原因 | 决定协议投资上界 | 关闭 shadow |
+| O8 | 分离 durable exporter 与 frozen experiment oracle | 持续入库且不污染实验机会 | `oracle_endpoint` 留空回退 exporter |
 
 ### P1 — 正确性与衰减根因
 
@@ -115,7 +124,10 @@ SG-exclusive、JP-exclusive、intersection 和 exact union/time。
 
 ### P3 — 发现面响应曲线
 
-10. lookup rate `300→600→900`。
+10. lookup rate：`300→600` 已完成且 600 被淘汰；第一次 `300→150` screen
+    虽完成，但新端口供给使其不能用于晋级。下一候选是 persistent-port supply
+    calibration，状态为 **candidate only / not started**；随后才在合格端口上重跑
+    300/150，225 仍为条件候选。
 11. lookup DHT redundancy `2→1`，固定初始 query budget，测 breadth vs redundancy。
 12. followups `8→4→2` 的 global-new/query 拐点。
 13. BEP 51 显式获得 `5%/10%/20%` 容量份额。
@@ -152,8 +164,12 @@ SG-exclusive、JP-exclusive、intersection 和 exact union/time。
 
 - 不用一个固定时长覆盖所有机制。窗口至少覆盖自适应预热、该机制预计状态周期
   的 1.5–2 倍，以及足以收窄置信区间的事件数。
-- lookup 等方向 screen 可用 10m warm-up + 5m measurement；cache/blacklist/cooldown
-  必须单臂观察 20–30m，覆盖容量和 TTL 稳态。
+- lookup 等方向 screen 只有在“当前端口/身份队列已证明可达且供给稳定”时才可用
+  10m warm-up + 5m measurement；cache/blacklist/cooldown 必须单臂观察
+  20–30m，覆盖容量和 TTL 稳态。
+- 新端口、轮换端口或重建身份必须先做独立的同臂资格校准：持续记录 passive
+  announce 供给、active lookup 暴露和 rolling global-new，在预注册稳定门槛
+  达成前不进入 A/B 计时窗口。端口轮换本身是 treatment，不能当作无成本重启。
 - per-hash queue/cooldown/source priority 优先建设进程内 deterministic interleaving：
   同一端口、身份、路由表和时间内按 hash 分 A/B，减少重启预热。
 - lookup rate、identity、OS 等全局旋钮使用 sequential cross-over；两台服务器可
