@@ -104,13 +104,26 @@ func (e *SpoolExporter) Deliver(ctx context.Context) error {
 			}
 			continue
 		}
+		prepared, err := prepareDurableBatch(batch)
+		if err != nil {
+			return err
+		}
+		// This fsync is the send barrier. No HTTP request may be attempted until
+		// the exact range/schema/digest can survive a process or machine crash.
+		if err := e.spool.EnsureExportCheckpoint(
+			batch, durableProtocolSchemaVersion, prepared.payloadSHA256); err != nil {
+			return fmt.Errorf("export: persist in-flight batch identity: %w", err)
+		}
 
 		for {
-			err = e.sendBatch(ctx, batch)
+			err = e.sendPreparedBatch(ctx, prepared)
 			switch {
 			case err == nil:
 				if err := e.spool.CommitBatch(batch); err != nil {
 					return fmt.Errorf("export: commit durable ACK cursor: %w", err)
+				}
+				if err := e.spool.ClearExportCheckpoint(batch); err != nil {
+					return fmt.Errorf("export: clear committed in-flight identity: %w", err)
 				}
 				goto nextBatch
 			case errors.Is(err, ErrConflict), errors.Is(err, ErrProtocol):
@@ -128,14 +141,24 @@ func (e *SpoolExporter) Deliver(ctx context.Context) error {
 	}
 }
 
-func (e *SpoolExporter) sendBatch(ctx context.Context, batch spool.Batch) error {
+type preparedDurableBatch struct {
+	body          []byte
+	crawlerID     string
+	epoch         uint64
+	startSequence uint64
+	endSequence   uint64
+	payloadSHA256 string
+	eventCount    int
+}
+
+func prepareDurableBatch(batch spool.Batch) (preparedDurableBatch, error) {
 	events := make([]DurableEvent, len(batch.Records))
 	for i := range batch.Records {
 		events[i] = durableEventFromRecord(batch.Records[i])
 	}
 	eventsJSON, err := json.Marshal(events)
 	if err != nil {
-		return fmt.Errorf("%w: encode events: %v", ErrProtocol, err)
+		return preparedDurableBatch{}, fmt.Errorf("%w: encode events: %v", ErrProtocol, err)
 	}
 	sum := sha256.Sum256(eventsJSON)
 	checksum := hex.EncodeToString(sum[:])
@@ -161,10 +184,21 @@ func (e *SpoolExporter) sendBatch(ctx context.Context, batch spool.Batch) error 
 	}
 	body, err := json.Marshal(wire)
 	if err != nil {
-		return fmt.Errorf("%w: encode envelope: %v", ErrProtocol, err)
+		return preparedDurableBatch{}, fmt.Errorf("%w: encode envelope: %v", ErrProtocol, err)
 	}
+	return preparedDurableBatch{
+		body:          body,
+		crawlerID:     wire.CrawlerID,
+		epoch:         wire.Epoch,
+		startSequence: wire.StartSequence,
+		endSequence:   wire.EndSequence,
+		payloadSHA256: wire.PayloadSHA256,
+		eventCount:    len(events),
+	}, nil
+}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, e.url, bytes.NewReader(body))
+func (e *SpoolExporter) sendPreparedBatch(ctx context.Context, prepared preparedDurableBatch) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, e.url, bytes.NewReader(prepared.body))
 	if err != nil {
 		return fmt.Errorf("%w: create request: %v", ErrProtocol, err)
 	}
@@ -196,15 +230,15 @@ func (e *SpoolExporter) sendBatch(ctx context.Context, batch spool.Batch) error 
 	if err := dec.Decode(&ack); err != nil {
 		return fmt.Errorf("%w: decode ACK: %v", ErrProtocol, err)
 	}
-	if ack.CrawlerID != wire.CrawlerID || ack.Epoch != wire.Epoch ||
-		ack.StartSequence != wire.StartSequence || ack.EndSequence != wire.EndSequence ||
-		ack.PayloadSHA256 != wire.PayloadSHA256 || !ack.Committed {
+	if ack.CrawlerID != prepared.crawlerID || ack.Epoch != prepared.epoch ||
+		ack.StartSequence != prepared.startSequence || ack.EndSequence != prepared.endSequence ||
+		ack.PayloadSHA256 != prepared.payloadSHA256 || !ack.Committed {
 		return fmt.Errorf("%w: ACK identity mismatch", ErrProtocol)
 	}
 	if ack.Accepted < 0 || ack.Duplicates < 0 || ack.Errors != 0 ||
-		ack.Accepted+ack.Duplicates != len(events) {
+		ack.Accepted+ack.Duplicates != prepared.eventCount {
 		return fmt.Errorf("%w: ACK counts accepted=%d duplicates=%d errors=%d events=%d",
-			ErrProtocol, ack.Accepted, ack.Duplicates, ack.Errors, len(events))
+			ErrProtocol, ack.Accepted, ack.Duplicates, ack.Errors, prepared.eventCount)
 	}
 	return nil
 }

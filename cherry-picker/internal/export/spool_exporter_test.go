@@ -1,6 +1,7 @@
 package export
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -10,7 +11,10 @@ import (
 	"log"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -153,6 +157,367 @@ func TestDeliverStopsOn409WithoutAdvancing(t *testing.T) {
 	if cursorErr != nil || acked != 0 {
 		t.Fatalf("acked=%d err=%v, want 0", acked, cursorErr)
 	}
+}
+
+func TestExporterReplaysPersistedPartialTailAfterCommitConnectionLossAndRestart(t *testing.T) {
+	type received struct {
+		req  rawBatchRequest
+		body []byte
+	}
+	var (
+		mu       sync.Mutex
+		receipts []received
+		last     rawBatchRequest
+		first    = make(chan struct{}, 1)
+	)
+	eventCount := func(raw json.RawMessage) int {
+		var events []json.RawMessage
+		if err := json.Unmarshal(raw, &events); err != nil {
+			t.Errorf("decode events: %v", err)
+		}
+		return len(events)
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read request: %v", err)
+			return
+		}
+		var req rawBatchRequest
+		if err := json.Unmarshal(body, &req); err != nil {
+			t.Errorf("decode request: %v", err)
+			return
+		}
+
+		mu.Lock()
+		receipts = append(receipts, received{req: req, body: append([]byte(nil), body...)})
+		call := len(receipts)
+		if call == 1 {
+			last = req // The authority commits before the connection is lost.
+		}
+		current := last
+		mu.Unlock()
+
+		if call == 1 {
+			if req.StartSequence != 1 || req.EndSequence != 56 {
+				t.Errorf("first range=%d..%d, want 1..56", req.StartSequence, req.EndSequence)
+			}
+			hijacker, ok := w.(http.Hijacker)
+			if !ok {
+				t.Error("server response does not support hijacking")
+				return
+			}
+			conn, _, err := hijacker.Hijack()
+			if err != nil {
+				t.Errorf("hijack committed response: %v", err)
+				return
+			}
+			_ = conn.Close() // ACK is lost after the server-side commit.
+			first <- struct{}{}
+			return
+		}
+
+		if req.StartSequence == current.StartSequence && req.EndSequence == current.EndSequence &&
+			req.PayloadSHA256 == current.PayloadSHA256 {
+			writeACK(w, req, eventCount(req.Events), 0)
+			return
+		}
+		if req.StartSequence != current.EndSequence+1 {
+			w.WriteHeader(http.StatusConflict)
+			_ = json.NewEncoder(w).Encode(DurableBatchResponse{ExpectedStart: current.EndSequence + 1})
+			return
+		}
+		mu.Lock()
+		last = req
+		mu.Unlock()
+		writeACK(w, req, eventCount(req.Events), 0)
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	sp1, err := spool.Open(spool.Options{Dir: dir, CrawlerID: "crawler-test", SyncEveryN: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	appendTestRecords(t, sp1, 56)
+	exp1, err := NewSpoolExporter(SpoolExporterOptions{
+		Logger: log.New(io.Discard, "", 0), Spool: sp1, URL: srv.URL, APIKey: testAPIKey,
+		BatchSize: 56, RetryBackoff: time.Hour,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx1, cancel1 := context.WithCancel(context.Background())
+	done1 := make(chan error, 1)
+	go func() { done1 <- exp1.Deliver(ctx1) }()
+	select {
+	case <-first:
+		cancel1()
+	case <-time.After(2 * time.Second):
+		t.Fatal("first committed request was not observed")
+	}
+	if err := <-done1; err != nil {
+		t.Fatalf("first exporter stop: %v", err)
+	}
+	_, acked, _, _, err := sp1.CursorPosition()
+	if err != nil || acked != 0 {
+		t.Fatalf("local ACK advanced after lost response: acked=%d err=%v", acked, err)
+	}
+	if err := sp1.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	sp2, err := spool.Open(spool.Options{Dir: dir, CrawlerID: "crawler-test", SyncEveryN: 1})
+	if err != nil {
+		t.Fatalf("reopen spool: %v", err)
+	}
+	defer sp2.Close()
+	// Producer progress and a larger exporter batch must not widen the batch
+	// which may already have committed remotely.
+	appendTestRecords(t, sp2, 456)
+	exp2, err := NewSpoolExporter(SpoolExporterOptions{
+		Logger: log.New(io.Discard, "", 0), Spool: sp2, URL: srv.URL, APIKey: testAPIKey,
+		BatchSize: 512, RetryBackoff: time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel2()
+	runDeliverUntilDrained(t, exp2, sp2, ctx2)
+
+	mu.Lock()
+	got := append([]received(nil), receipts...)
+	mu.Unlock()
+	if len(got) != 3 {
+		t.Fatalf("requests=%d, want lost-send, exact replay, suffix", len(got))
+	}
+	if got[1].req.StartSequence != 1 || got[1].req.EndSequence != 56 ||
+		!bytes.Equal(got[0].body, got[1].body) {
+		t.Fatalf("restart did not replay identical 1..56 body: first=%d..%d second=%d..%d",
+			got[0].req.StartSequence, got[0].req.EndSequence,
+			got[1].req.StartSequence, got[1].req.EndSequence)
+	}
+	if got[2].req.StartSequence != 57 || got[2].req.EndSequence != 512 {
+		t.Fatalf("suffix range=%d..%d, want 57..512", got[2].req.StartSequence, got[2].req.EndSequence)
+	}
+}
+
+func TestExportCheckpointSurvivesPreSendCrashProducerAppendAndBatchSizeChange(t *testing.T) {
+	dir := t.TempDir()
+	sp1, err := spool.Open(spool.Options{Dir: dir, CrawlerID: "crawler-test", SyncEveryN: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	appendTestRecords(t, sp1, 2)
+	b1, err := sp1.NextBatch(2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p1, err := prepareDurableBatch(b1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sp1.EnsureExportCheckpoint(b1, durableProtocolSchemaVersion, p1.payloadSHA256); err != nil {
+		t.Fatal(err)
+	}
+	appendTestRecords(t, sp1, 3)
+	if err := sp1.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	sp2, err := spool.Open(spool.Options{Dir: dir, CrawlerID: "crawler-test", SyncEveryN: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sp2.Close()
+	b2, err := sp2.NextBatch(512)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b2.StartSeq != 1 || b2.EndSeq != 2 || len(b2.Records) != 2 {
+		t.Fatalf("replayed range=%d..%d/%d, want 1..2/2", b2.StartSeq, b2.EndSeq, len(b2.Records))
+	}
+	p2, err := prepareDurableBatch(b2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p2.payloadSHA256 != p1.payloadSHA256 {
+		t.Fatalf("replayed digest=%s want %s", p2.payloadSHA256, p1.payloadSHA256)
+	}
+	if err := sp2.EnsureExportCheckpoint(b2, durableProtocolSchemaVersion, p2.payloadSHA256); err != nil {
+		t.Fatal(err)
+	}
+	if err := sp2.CommitBatch(b2); err != nil {
+		t.Fatal(err)
+	}
+	if err := sp2.ClearExportCheckpoint(b2); err != nil {
+		t.Fatal(err)
+	}
+	b3, err := sp2.NextBatch(512)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b3.StartSeq != 3 || b3.EndSeq != 5 {
+		t.Fatalf("post-replay suffix=%d..%d, want 3..5", b3.StartSeq, b3.EndSeq)
+	}
+}
+
+func TestInterruptedCheckpointTempIsNeverTreatedAsSendBarrier(t *testing.T) {
+	dir := t.TempDir()
+	sp1, err := spool.Open(spool.Options{Dir: dir, CrawlerID: "crawler-test", SyncEveryN: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	appendTestRecords(t, sp1, 2)
+	if err := sp1.Close(); err != nil {
+		t.Fatal(err)
+	}
+	tmp := filepath.Join(dir, "export-inflight.json.tmp")
+	if err := os.WriteFile(tmp, []byte("interrupted-write"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	sp2, err := spool.Open(spool.Options{Dir: dir, CrawlerID: "crawler-test", SyncEveryN: 1})
+	if err != nil {
+		t.Fatalf("orphan temp must not imply a request was sent: %v", err)
+	}
+	defer sp2.Close()
+	b, err := sp2.NextBatch(2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, err := prepareDurableBatch(b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sp2.EnsureExportCheckpoint(b, durableProtocolSchemaVersion, p.payloadSHA256); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "export-inflight.json")); err != nil {
+		t.Fatalf("durable checkpoint was not published: %v", err)
+	}
+	if _, err := os.Stat(tmp); !os.IsNotExist(err) {
+		t.Fatalf("orphan temp was not replaced: %v", err)
+	}
+}
+
+func TestCommittedCursorRecoversBeforeCheckpointCleanup(t *testing.T) {
+	dir := t.TempDir()
+	sp1, err := spool.Open(spool.Options{Dir: dir, CrawlerID: "crawler-test", SyncEveryN: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	appendTestRecords(t, sp1, 2)
+	b, err := sp1.NextBatch(2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, err := prepareDurableBatch(b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sp1.EnsureExportCheckpoint(b, durableProtocolSchemaVersion, p.payloadSHA256); err != nil {
+		t.Fatal(err)
+	}
+	if err := sp1.CommitBatch(b); err != nil {
+		t.Fatal(err)
+	}
+	// Simulate a crash after the cursor fsync and before checkpoint deletion.
+	if _, err := os.Stat(filepath.Join(dir, "export-inflight.json")); err != nil {
+		t.Fatalf("checkpoint missing before simulated crash: %v", err)
+	}
+	if err := sp1.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	sp2, err := spool.Open(spool.Options{Dir: dir, CrawlerID: "crawler-test", SyncEveryN: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sp2.Close()
+	if _, err := os.Stat(filepath.Join(dir, "export-inflight.json")); !os.IsNotExist(err) {
+		t.Fatalf("stale committed checkpoint was not removed: %v", err)
+	}
+	_, acked, _, _, err := sp2.CursorPosition()
+	if err != nil || acked != 2 {
+		t.Fatalf("recovered ack=%d err=%v, want 2", acked, err)
+	}
+}
+
+func TestCorruptExportCheckpointFailsClosedWithoutMutation(t *testing.T) {
+	dir := t.TempDir()
+	sp1, err := spool.Open(spool.Options{Dir: dir, CrawlerID: "crawler-test", SyncEveryN: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	appendTestRecords(t, sp1, 1)
+	b, err := sp1.NextBatch(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, err := prepareDurableBatch(b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sp1.EnsureExportCheckpoint(b, durableProtocolSchemaVersion, p.payloadSHA256); err != nil {
+		t.Fatal(err)
+	}
+	if err := sp1.Close(); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "export-inflight.json")
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	corrupt := append(append([]byte(nil), before...), byte('x'))
+	if err := os.WriteFile(path, corrupt, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if reopened, err := spool.Open(spool.Options{Dir: dir, CrawlerID: "crawler-test", SyncEveryN: 1}); err == nil {
+		reopened.Close()
+		t.Fatal("corrupt checkpoint unexpectedly opened")
+	} else if !errors.Is(err, spool.ErrCorruption) {
+		t.Fatalf("open error=%v, want ErrCorruption", err)
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(after, corrupt) {
+		t.Fatal("failed Open mutated corrupt checkpoint")
+	}
+}
+
+func TestReplayDigestMismatchPoisonsBeforeNetwork(t *testing.T) {
+	dir := t.TempDir()
+	sp1, err := spool.Open(spool.Options{Dir: dir, CrawlerID: "crawler-test", SyncEveryN: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	appendTestRecords(t, sp1, 1)
+	b1, _ := sp1.NextBatch(1)
+	p1, _ := prepareDurableBatch(b1)
+	if err := sp1.EnsureExportCheckpoint(b1, durableProtocolSchemaVersion, p1.payloadSHA256); err != nil {
+		t.Fatal(err)
+	}
+	if err := sp1.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	sp2, err := spool.Open(spool.Options{Dir: dir, CrawlerID: "crawler-test", SyncEveryN: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	b2, err := sp2.NextBatch(512)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sp2.EnsureExportCheckpoint(b2, durableProtocolSchemaVersion, strings.Repeat("0", 64)); !errors.Is(err, spool.ErrPoisoned) {
+		t.Fatalf("digest mismatch error=%v, want ErrPoisoned", err)
+	}
+	_ = sp2.Close()
 }
 
 func TestDeliverRejectsInvalidACKs(t *testing.T) {

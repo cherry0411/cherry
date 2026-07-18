@@ -153,22 +153,23 @@ type Spool struct {
 	opts     Options
 	lockFile *os.File
 
-	mu              sync.Mutex
-	activeID        segmentID
-	activePath      string
-	activeFile      segmentFile
-	activeSize      int64
-	unsynced        int
-	needsSync       bool
-	lastSync        time.Time
-	durableSequence uint64
-	cursor          cursorState
-	atCapacity      bool
-	closed          bool
-	poisonErr       error
-	batchLoading    bool
-	inflight        *inflightBatch
-	nextBatchToken  uint64
+	mu               sync.Mutex
+	activeID         segmentID
+	activePath       string
+	activeFile       segmentFile
+	activeSize       int64
+	unsynced         int
+	needsSync        bool
+	lastSync         time.Time
+	durableSequence  uint64
+	cursor           cursorState
+	atCapacity       bool
+	closed           bool
+	poisonErr        error
+	batchLoading     bool
+	inflight         *inflightBatch
+	nextBatchToken   uint64
+	exportCheckpoint *exportCheckpointState
 
 	syncStop chan struct{}
 	syncDone chan struct{}
@@ -207,6 +208,9 @@ func Open(opts Options) (*Spool, error) {
 	cursorExists, err := s.loadCursor()
 	if err == nil {
 		err = s.recover(cursorExists)
+	}
+	if err == nil {
+		err = s.loadExportCheckpointLocked()
 	}
 	if err == nil {
 		err = s.updateCapacityLocked()

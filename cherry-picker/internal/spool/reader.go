@@ -69,6 +69,15 @@ func (s *Spool) NextBatch(maxRecords int) (Batch, error) {
 	epoch := s.cursor.Epoch
 	durable := s.durableSequence
 	crawlerID := s.cursor.CrawlerID
+	replayEnd, replayCount, replaying := s.exportReplayBoundaryLocked()
+	batchByteLimit := s.opts.MaxBatchBytes
+	if replaying {
+		// A new process/configuration must reproduce the exact range that may
+		// already have reached the receipt authority, even if maxRecords became
+		// larger or the durable producer tail grew after the original send.
+		maxRecords = replayCount
+		batchByteLimit = exportReplayMaxPayloadBytes
+	}
 	s.mu.Unlock()
 
 	batch := Batch{CrawlerID: crawlerID, Epoch: epoch}
@@ -101,7 +110,7 @@ func (s *Spool) NextBatch(maxRecords int) (Batch, error) {
 				return fmt.Errorf("%w: sequence gap have=%d want=%d", ErrCorruption, rec.Sequence, want)
 			}
 			if len(batch.Records) >= maxRecords ||
-				(len(batch.Records) > 0 && payloadBytes+int64(len(payload)) > s.opts.MaxBatchBytes) {
+				(len(batch.Records) > 0 && payloadBytes+int64(len(payload)) > batchByteLimit) {
 				limited = true
 				return errStopScan
 			}
@@ -119,7 +128,7 @@ func (s *Spool) NextBatch(maxRecords int) (Batch, error) {
 				reachedDurable = true
 				return errStopScan
 			}
-			if len(batch.Records) >= maxRecords || payloadBytes >= s.opts.MaxBatchBytes {
+			if len(batch.Records) >= maxRecords || payloadBytes >= batchByteLimit {
 				limited = true
 				return errStopScan
 			}
@@ -129,7 +138,7 @@ func (s *Spool) NextBatch(maxRecords int) (Batch, error) {
 		if result.TornTail && !result.Stopped {
 			scanErr = fmt.Errorf("%w: torn tail encountered while spool is open in %s", ErrCorruption, segmentName(id))
 		}
-		if scanErr != nil || len(batch.Records) >= maxRecords || payloadBytes >= s.opts.MaxBatchBytes {
+		if scanErr != nil || len(batch.Records) >= maxRecords || payloadBytes >= batchByteLimit {
 			break
 		}
 		if stopped || batch.EndSeq >= durable {
@@ -138,6 +147,10 @@ func (s *Spool) NextBatch(maxRecords int) (Batch, error) {
 	}
 	if scanErr == nil && !limited && !reachedDurable && want <= durable {
 		scanErr = fmt.Errorf("%w: retained log ended at %d before durable boundary %d", ErrCorruption, want-1, durable)
+	}
+	if scanErr == nil && replaying && (batch.StartSeq != acked+1 || batch.EndSeq != replayEnd || len(batch.Records) != replayCount) {
+		scanErr = fmt.Errorf("%w: export replay range regenerated as %d..%d/%d, want %d..%d/%d",
+			ErrCorruption, batch.StartSeq, batch.EndSeq, len(batch.Records), acked+1, replayEnd, replayCount)
 	}
 
 	s.mu.Lock()
