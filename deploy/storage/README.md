@@ -26,14 +26,23 @@ SG/JP crawler durable spool
   -> asynchronous Meili task (delete marker only after task succeeded)
 
 SG/JP identity-reduced heat spool
-  -> POST /api/v1/heat/batches (canonical CHHT v1 + HMAC)
+  -> POST /api/v1/heat/batches (canonical CHHT v2 + UTC hour + HMAC)
   -> /srv/cherry/api/heat/heat-YYYY-MM-DD.sqlite3 (WAL, synchronous FULL)
+  -> disposable /srv/cherry/api/heat/heat-rolling-24h.sqlite3
+  -> hourly exact-unique Meili partial PUT (heat24h, previous complete hour)
   -> 64 immutable compressed PostgreSQL frames after the UTC grace window
-  -> resumable daily Meili partial PUT (heat1d/7d/15d/30d only)
+  -> resumable daily Meili partial PUT (heat3d/7d/15d only)
 ```
 
-The heat body can represent only `info_hash` and a daily keyed actor
-fingerprint; raw IPs, ports, node IDs and raw metadata are not accepted.
+The heat body can represent only `info_hash`, UTC hour and a stable rolling actor
+fingerprint; raw IPs, ports, node IDs and raw metadata are not accepted. The
+storage API re-HMACs the actor with a storage-only daily key before writing the
+daily file. The stable rolling token exists only in the disposable rolling DB
+for at most 24 hours; backup and restore verification fail if that DB appears.
+The rolling authority has independent fail-closed watermarks: 5 GiB maximum by
+default and 2 GiB minimum filesystem free space. Ingest over either watermark
+returns HTTP 507 without advancing the crawler spool; metadata ingest remains
+independent.
 `Heat__ExpectedCrawlerIds` is a completeness gate: a day missing either SG or
 JP is sealed `partial`. Its observations are excluded, projection advances it
 as explicitly unknown, and each search reports the actual complete-day count
@@ -42,7 +51,8 @@ for the selected window.
 ## Bootstrap
 
 Clone the repository at `/opt/cherry`. Before running the bootstrap, configure
-an off-host rclone destination. The exposed remote must be `type = crypt`; its
+an off-host rclone destination or select the exact audited no-backup opt-out
+documented below. The exposed remote must be `type = crypt`; its
 underlying remote must live in another provider account, region, or failure
 domain. A second directory on the same server does not satisfy the gate.
 
@@ -80,11 +90,11 @@ sudo REPO_DIR=/opt/cherry bash /opt/cherry/scripts/setup-storage-server.sh
 The script creates `/opt/cherry/deploy/storage/.env` with mode `0600`, random
 PostgreSQL/API/Meili credentials, and two independent crawler transport keys.
 It separately creates the raw 32-byte mode-`0600` files
-`/etc/cherry-secrets/heat-actor-master`, `heat-hmac-sg`, and `heat-hmac-jp`.
-Install a byte-identical copy of `heat-actor-master` on both crawlers so the
+`/etc/cherry-secrets/heat-hmac-sg`, `heat-hmac-jp`, and `heat-storage-daily`.
+Generate `heat-actor-master` outside storage and install a byte-identical copy on both crawlers so the
 same actor merges across regions. Install only `heat-hmac-sg` on SG and only
 `heat-hmac-jp` on JP; sharing them would let one crawler forge the other's
-daily completion proof. The actor key is never configured on the backend,
+daily completion proof. The actor key is never created or configured on the backend,
 while its environment contains the Base64 encodings of both transport keys.
 The script initializes the
 coverage start to the current UTC date and the crawler IDs to
@@ -93,6 +103,12 @@ the crawler configuration uses different stable values. Do not copy the whole
 environment file into logs, Git, or a crawler host. Verify only the actor
 master's SHA-256 matches across SG/JP; the transport-key hashes must differ.
 Never substitute the Base64 text or metadata API key for a raw crawler secret.
+The setup fails closed if an actor master is found on storage. Backups contain
+only an allowlisted `.env` and `cherry-backup.env`, never the raw
+`cherry-secrets` directory. The `.env` retains the storage-only daily re-HMAC
+key so an in-progress daily SQLite source resumes without double counting; in
+the absence of the crawler master and rolling DB, it cannot link daily
+pseudonyms back to stable actors or source IPs.
 Validate without printing secrets:
 
 ```bash
@@ -152,12 +168,13 @@ records/batch as explicit coverage loss.
 
 The initial 2C4G caps deliberately leave OS page-cache and failure headroom:
 
-- PostgreSQL: 1.375 GiB container, 384 MiB shared buffers, synchronous durable commit.
-- Meili: 1.375 GiB container, 768 MiB indexing limit, one indexing thread.
-- API/dedupe/outbox/heat accumulator: 640 MiB container.
+- PostgreSQL: 1280 MiB container, 384 MiB shared buffers, synchronous durable commit.
+- Meili: 1152 MiB container, 640 MiB indexing limit, one indexing thread.
+- API/dedupe/outbox/heat accumulator: 576 MiB container.
 
-The 3.375 GiB combined hard ceiling leaves roughly 640 MiB of a 4 GiB host for
-the kernel, Docker, SSH, page cache, and short-lived work. The ceilings are not
+The 3008 MiB combined hard ceiling leaves roughly 652 MiB of this host's measured
+3659.9 MiB `MemTotal` for the kernel, Docker, SSH, page cache, and short-lived
+work. The ceilings are not
 an invitation to fill every cgroup; real RSS/page-cache and pressure-stall data
 decide subsequent reallocations.
 
@@ -169,9 +186,18 @@ index bytes per document, and query quality. Meili compaction requires free
 temporary space near the index size, so do not fill the data disk past the
 pre-registered high-water mark.
 
-PostgreSQL backup/PITR and off-host retention are hard-gated by the bootstrap.
+PostgreSQL backup/PITR and off-host retention are hard-gated by default.
 Meili snapshots are intentionally omitted because the index can be rebuilt
 from PostgreSQL; duplicating it wastes disk.
+
+For the explicitly accepted short-lived experiment where all data may be lost,
+run bootstrap with
+`CHERRY_ALLOW_UNBACKED_AUTHORITY=I_ACCEPT_DATA_LOSS`. The exact opt-out disables
+base-backup, restore-drill, and WAL-upload timers, starts PostgreSQL with
+`archive_mode=off`, and writes
+`/var/lib/cherry-backup/UNBACKED_AUTHORITY`. PostgreSQL and heat are then single
+copies: loss of this host means starting collection from zero. No archive or
+backup package is produced. Any other value fails closed.
 
 ## Backup and PITR policy
 
@@ -291,6 +317,17 @@ recovery only when PostgreSQL is non-empty and Meili is provably empty. A
 non-empty partial index is never reset automatically. Any startup check or
 recovery failure aborts startup rather than silently serving zero results.
 
+`Heat__IndexGeneration` fences PostgreSQL projection state; it does not migrate
+or clear physical Meili documents. First heat-v2 bootstrap therefore requires
+empty PostgreSQL, Meili, and API heat directories and writes
+`${CHERRY_DATA_ROOT}/.heat-v2-empty-bootstrap`; setup fails closed if data exists
+without that marker. A future non-empty upgrade must coordinate ingest pause,
+run destructive recovery (physical delete/create), replay the full catalog and
+retained daily plus rolling heat, and verify metadata counts, daily watermark,
+pending tasks, `rollingProjectedThroughUtc`, and
+`rollingRebuildRequired=false` before resuming. Changing only the generation
+can leave old heat fields permanently stale and is forbidden.
+
 For an operator-requested clean recovery, run this from the repository root:
 
 ```bash
@@ -301,12 +338,18 @@ This destructive path pauses both projection workers in the single API process,
 waits for Meili index deletion, creation, and settings tasks, verifies that the
 new physical index has zero documents, then atomically queues all PostgreSQL
 metadata and marks heat for full replay. The heat replay targets the latest
-retained sealed day and needs only its retained 31-day source window; garbage
+retained sealed day and needs only its retained 16-day source window; garbage
 collection of the original `CoverageStartDay` history does not prevent recovery.
 The script waits for the metadata outbox and heat projection, then verifies that
 Meili and PostgreSQL document counts match. The current deployment intentionally
 runs one API replica; add a distributed recovery lock before scaling that service
 horizontally.
+
+The recovery status is incomplete while `rollingRebuildRequired=true`, even if
+the daily watermark and metadata outbox are finished. Rolling coverage remains
+reported as zero/unknown until authenticated per-crawler hourly closure proofs
+are implemented; a numeric 24h projection must not be presented as complete
+coverage merely because the storage process stayed up.
 
 A routine metadata refresh remains non-destructive:
 

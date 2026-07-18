@@ -26,8 +26,8 @@ func TestActorIdentityPrivacyAndDaySemantics(t *testing.T) {
 		t.Fatal("IPv4-mapped form did not canonicalize to IPv4")
 	}
 	v4NextDay, _ := identity.observation(hash, "8.8.8.8", day2)
-	if v4NextDay.Actor == v4a.Actor || v4NextDay.Day == v4a.Day {
-		t.Fatal("UTC-day key did not rotate")
+	if v4NextDay.Actor != v4a.Actor || v4NextDay.Day == v4a.Day {
+		t.Fatal("rolling actor was not stable across the UTC-day boundary")
 	}
 
 	v6a, ok := identity.observation(hash, "2606:4700:4700:1234::1", day1)

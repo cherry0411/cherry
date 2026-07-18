@@ -13,7 +13,7 @@ services:
     image: postgres:17.10-alpine@sha256:742f40ea20b9ff2ff31db5458d127452988a2164df9e17441e191f3b72252193
     restart: unless-stopped
     shm_size: 256m
-    mem_limit: 1408m
+    mem_limit: 1280m
     cpus: "1.25"
     environment:
       POSTGRES_DB: ${POSTGRES_DB:?set POSTGRES_DB}
@@ -45,7 +45,7 @@ services:
       - -c
       - effective_io_concurrency=200
       - -c
-      - archive_mode=on
+      - archive_mode=${CHERRY_PG_ARCHIVE_MODE:-on}
       - -c
       - archive_timeout=300s
       - -c
@@ -67,14 +67,14 @@ services:
   meilisearch:
     image: getmeili/meilisearch:v1.45.1@sha256:ac40212f9e5a7526d8007586e3e46fb0441d29dd36c7b02fa2341d2c9a1f6493
     restart: unless-stopped
-    mem_limit: 1408m
+    mem_limit: 1152m
     cpus: "1.0"
     environment:
       MEILI_ENV: production
       MEILI_MASTER_KEY: ${MEILI_MASTER_KEY:?set MEILI_MASTER_KEY}
       MEILI_NO_ANALYTICS: "true"
       # One indexing worker and a bounded arena preserve query/PG headroom on 2C4G.
-      MEILI_MAX_INDEXING_MEMORY: 768MiB
+      MEILI_MAX_INDEXING_MEMORY: 640MiB
       MEILI_MAX_INDEXING_THREADS: "1"
       MEILI_LOG_LEVEL: INFO
     volumes:
@@ -93,7 +93,7 @@ services:
       context: ../../backend
       dockerfile: Dockerfile
     restart: unless-stopped
-    mem_limit: 640m
+    mem_limit: 576m
     cpus: "0.75"
     depends_on:
       postgres:
@@ -116,6 +116,8 @@ services:
       - Ingest__DedupCapacity=${CHERRY_DEDUP_CAPACITY:-30000000}
       - Heat__Enabled=true
       - Heat__DataDirectory=/app/data/heat
+      - Heat__IndexGeneration=torrents-heat-v2
+      - Heat__DailyActorSecret=${CHERRY_HEAT_DAILY_ACTOR_SECRET_BASE64:?set CHERRY_HEAT_DAILY_ACTOR_SECRET_BASE64}
       - Heat__CoverageStartDay=${CHERRY_HEAT_COVERAGE_START_DAY:?set CHERRY_HEAT_COVERAGE_START_DAY}
       - Heat__ExpectedCrawlerIds__0=${CHERRY_HEAT_CRAWLER_0:?set CHERRY_HEAT_CRAWLER_0}
       - Heat__ExpectedCrawlerIds__1=${CHERRY_HEAT_CRAWLER_1:?set CHERRY_HEAT_CRAWLER_1}
@@ -124,6 +126,8 @@ services:
       - Heat__LateGraceMinutes=${CHERRY_HEAT_LATE_GRACE_MINUTES:-30}
       - Heat__CommitBatchRequests=${CHERRY_HEAT_COMMIT_BATCH_REQUESTS:-8}
       - Heat__ProjectionBatchSize=${CHERRY_HEAT_PROJECTION_BATCH_SIZE:-500}
+      - Heat__RollingMaxBytes=${CHERRY_HEAT_ROLLING_MAX_BYTES:-5368709120}
+      - Heat__RollingMinFreeBytes=${CHERRY_HEAT_ROLLING_MIN_FREE_BYTES:-2147483648}
     volumes:
       - ${CHERRY_DATA_ROOT:?set CHERRY_DATA_ROOT}/api:/app/data
     # Deliberately loopback-only. Crawlers reach this through persistent SSH

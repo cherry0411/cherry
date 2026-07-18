@@ -1,6 +1,7 @@
 package heat
 
 import (
+	"bytes"
 	"errors"
 	"os"
 	"path/filepath"
@@ -173,6 +174,33 @@ func TestSpoolFailsOnInteriorCorruption(t *testing.T) {
 		t.Fatal("interior corruption was silently recovered")
 	} else if !errors.Is(err, ErrCorruptSpool) {
 		t.Fatalf("wrong corruption error: %v", err)
+	}
+}
+
+func TestLegacyV1SpoolFailsActionablyWithoutMutation(t *testing.T) {
+	dir := t.TempDir()
+	path := segmentPath(dir, 1)
+	header := make([]byte, spoolHeaderSize)
+	copy(header[:4], spoolMagic[:])
+	header[4] = 1
+	if err := os.WriteFile(path, header, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := openHeatSpool(spoolOptions{dir: dir, maxBytes: 1 << 20})
+	if reopened != nil {
+		_ = reopened.close()
+	}
+	if !errors.Is(err, ErrLegacySpool) {
+		t.Fatalf("legacy spool error=%v", err)
+	}
+	unchanged, readErr := os.ReadFile(path)
+	if readErr != nil || !bytes.Equal(unchanged, header) {
+		t.Fatalf("legacy spool was mutated: err=%v bytes=%x", readErr, unchanged)
+	}
+	paths, globErr := filepath.Glob(filepath.Join(dir, "heat-*.spool"))
+	if globErr != nil || len(paths) != 1 || paths[0] != path {
+		t.Fatalf("legacy preflight created or removed segments: %v %v", paths, globErr)
 	}
 }
 

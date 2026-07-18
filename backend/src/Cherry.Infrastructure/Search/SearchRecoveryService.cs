@@ -10,14 +10,19 @@ public sealed record SearchRecoveryResult(
     long MetadataRowsEnqueued,
     long VerifiedEmptyDocuments,
     bool HeatRebuildRequested,
-    DateOnly? HeatTargetDay);
+    DateOnly? HeatTargetDay,
+    bool RollingHeatRebuildRequested,
+    DateTime? RollingTargetThroughUtc);
 
 public sealed record SearchRecoveryHeatStatus(
     bool Enabled,
     string IndexGeneration,
     DateOnly? ProjectedThrough,
     bool RebuildRequired,
-    long PendingTasks);
+    long PendingTasks,
+    DateTime? RollingProjectedThroughUtc,
+    int RollingCoverageHours,
+    bool RollingRebuildRequired);
 
 public sealed record SearchRecoveryStatus(
     long? AuthoritativeDocuments,
@@ -39,19 +44,22 @@ public sealed class SearchRecoveryService
     private readonly MeiliSearchClient _meili;
     private readonly HeatOptions _heat;
     private readonly SearchRecoveryCoordinator _coordinator;
+    private readonly HeatRollingStore? _rolling;
 
     public SearchRecoveryService(
         AppDbContext db,
         SearchOutboxStore outbox,
         MeiliSearchClient meili,
         HeatOptions heat,
-        SearchRecoveryCoordinator coordinator)
+        SearchRecoveryCoordinator coordinator,
+        HeatRollingStore? rolling = null)
     {
         _db = db;
         _outbox = outbox;
         _meili = meili;
         _heat = heat;
         _coordinator = coordinator;
+        _rolling = rolling;
     }
 
     public async Task<SearchRecoveryResult> RecoverAsync(
@@ -126,7 +134,27 @@ public sealed class SearchRecoveryService
         }
 
         await transaction.CommitAsync(cancellationToken);
-        return new SearchRecoveryResult(enqueued, emptyDocuments, heatRequested, heatTarget);
+        var rollingRequested = false;
+        DateTime? rollingTargetThrough = null;
+        if (_heat.Enabled && _rolling is { } rolling)
+        {
+            await rolling.ResetProjectionAsync(cancellationToken);
+            rollingRequested = true;
+            // Bind recovery to the hour that was already closed when the reset
+            // completed. A moving "latest hour" target can otherwise outrun a
+            // healthy projector forever while the script is polling.
+            var currentHour = HeatRollingStore.UnixHour(DateTime.UtcNow);
+            rollingTargetThrough = DateTimeOffset
+                .FromUnixTimeSeconds(checked(currentHour * 3600))
+                .UtcDateTime;
+        }
+        return new SearchRecoveryResult(
+            enqueued,
+            emptyDocuments,
+            heatRequested,
+            heatTarget,
+            rollingRequested,
+            rollingTargetThrough);
     }
 
     public async Task<SearchRecoveryStatus> GetStatusAsync(
@@ -144,7 +172,17 @@ public sealed class SearchRecoveryService
             return new SearchRecoveryStatus(
                 authoritativeDocuments,
                 meiliDocuments,
-                new SearchRecoveryHeatStatus(false, _heat.IndexGeneration, null, false, 0));
+                new SearchRecoveryHeatStatus(
+                    false, _heat.IndexGeneration, null, false, 0, null, 0, false));
+
+        var rolling = _rolling is null
+            ? (ProjectedHour: (long?)null, CoverageHours: 0)
+            : await _rolling.GetStatusAsync(cancellationToken);
+        var rollingThrough = rolling.ProjectedHour is null
+            ? (DateTime?)null
+            : DateTimeOffset.FromUnixTimeSeconds(
+                checked((rolling.ProjectedHour.Value + 1) * 3600)).UtcDateTime;
+        var rollingRebuildRequired = _rolling is not null && rolling.ProjectedHour is null;
 
         var connection = (NpgsqlConnection)_db.Database.GetDbConnection();
         if (connection.State != System.Data.ConnectionState.Open)
@@ -165,7 +203,15 @@ public sealed class SearchRecoveryService
             return new SearchRecoveryStatus(
                 authoritativeDocuments,
                 meiliDocuments,
-                new SearchRecoveryHeatStatus(true, _heat.IndexGeneration, null, false, 0));
+                new SearchRecoveryHeatStatus(
+                    true,
+                    _heat.IndexGeneration,
+                    null,
+                    false,
+                    0,
+                    rollingThrough,
+                    rolling.CoverageHours,
+                    rollingRebuildRequired));
         return new SearchRecoveryStatus(
             authoritativeDocuments,
             meiliDocuments,
@@ -174,7 +220,10 @@ public sealed class SearchRecoveryService
                 _heat.IndexGeneration,
                 reader.IsDBNull(0) ? null : reader.GetFieldValue<DateOnly>(0),
                 reader.GetBoolean(1),
-                reader.GetInt64(2)));
+                reader.GetInt64(2),
+                rollingThrough,
+                rolling.CoverageHours,
+                rollingRebuildRequired));
     }
 
     private static async Task<DateOnly?> LatestSealedDayAsync(

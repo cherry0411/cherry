@@ -514,8 +514,8 @@ public static class TorrentEndpoints
     {
         q = q?.Trim() ?? string.Empty;
         heatWindow = string.IsNullOrWhiteSpace(heatWindow) ? "7d" : heatWindow.Trim().ToLowerInvariant();
-        if (heatWindow is not ("1d" or "7d" or "15d" or "30d"))
-            return Results.BadRequest(new { error = "heatWindow must be 1d, 7d, 15d, or 30d" });
+        if (heatWindow is not ("24h" or "3d" or "7d" or "15d"))
+            return Results.BadRequest(new { error = "heatWindow must be 24h, 3d, 7d, or 15d" });
 
         page = Math.Max(1, page);
         size = Math.Clamp(size == 0 ? 20 : size, 1, 100);

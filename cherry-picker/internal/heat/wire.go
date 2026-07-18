@@ -9,8 +9,8 @@ import (
 )
 
 const (
-	wireVersion          = byte(1)
-	wireHeaderSize       = 9
+	wireVersion          = byte(2)
+	wireHeaderSize       = 10
 	MaxWireBytes         = 64 << 20
 	MaxWireGroups        = 1_000_000
 	MaxWireActorsPerHash = 10_000_000
@@ -22,6 +22,7 @@ var wireMagic = [4]byte{'C', 'H', 'H', 'T'}
 // It cannot represent an IP address, port, node ID, region or metadata body.
 type Observation struct {
 	Day      uint32
+	Hour     uint8
 	InfoHash [20]byte
 	Actor    uint64
 }
@@ -33,20 +34,21 @@ type WireGroup struct {
 
 type WireBatch struct {
 	Day    uint32
+	Hour   uint8
 	Groups []WireGroup
 }
 
 // BuildWireBatch sorts by raw authority infohash and actor, removing exact
 // duplicates within this delivery batch. Cross-batch idempotence belongs to
 // the receiver's daily exact set.
-func BuildWireBatch(day uint32, observations []Observation) (WireBatch, error) {
-	if day == 0 || len(observations) == 0 {
-		return WireBatch{}, errors.New("heat: wire batch requires a day and observations")
+func BuildWireBatch(day uint32, hour uint8, observations []Observation) (WireBatch, error) {
+	if day == 0 || hour > 23 || len(observations) == 0 {
+		return WireBatch{}, errors.New("heat: wire batch requires a day, hour and observations")
 	}
 	rows := append([]Observation(nil), observations...)
 	for _, row := range rows {
-		if row.Day != day {
-			return WireBatch{}, errors.New("heat: wire batch mixes UTC days")
+		if row.Day != day || row.Hour != hour {
+			return WireBatch{}, errors.New("heat: wire batch mixes UTC hour buckets")
 		}
 	}
 	slices.SortFunc(rows, compareObservation)
@@ -75,7 +77,7 @@ func BuildWireBatch(day uint32, observations []Observation) (WireBatch, error) {
 		actors = append(actors, row.Actor)
 		group.Actors = actors[start:]
 	}
-	return WireBatch{Day: day, Groups: groups}, nil
+	return WireBatch{Day: day, Hour: hour, Groups: groups}, nil
 }
 
 func compareObservation(a, b Observation) int {
@@ -109,6 +111,7 @@ func EncodeWire(batch WireBatch) ([]byte, error) {
 	var day [4]byte
 	binary.BigEndian.PutUint32(day[:], batch.Day)
 	out = append(out, day[:]...)
+	out = append(out, batch.Hour)
 	out = binary.AppendUvarint(out, uint64(len(batch.Groups)))
 	for _, group := range batch.Groups {
 		out = append(out, group.InfoHash[:]...)
@@ -133,9 +136,9 @@ func DecodeWire(data []byte) (WireBatch, error) {
 	if data[4] != wireVersion {
 		return WireBatch{}, fmt.Errorf("heat: unsupported wire version %d", data[4])
 	}
-	batch := WireBatch{Day: binary.BigEndian.Uint32(data[5:9])}
-	if batch.Day == 0 {
-		return WireBatch{}, errors.New("heat: invalid UTC day")
+	batch := WireBatch{Day: binary.BigEndian.Uint32(data[5:9]), Hour: data[9]}
+	if batch.Day == 0 || batch.Hour > 23 {
+		return WireBatch{}, errors.New("heat: invalid UTC hour bucket")
 	}
 	offset := wireHeaderSize
 	groupCount, n, err := readCanonicalUvarint(data[offset:])
@@ -182,7 +185,7 @@ func DecodeWire(data []byte) (WireBatch, error) {
 }
 
 func validateWireBatch(batch WireBatch) error {
-	if batch.Day == 0 || len(batch.Groups) == 0 || len(batch.Groups) > MaxWireGroups {
+	if batch.Day == 0 || batch.Hour > 23 || len(batch.Groups) == 0 || len(batch.Groups) > MaxWireGroups {
 		return errors.New("heat: invalid wire batch bounds")
 	}
 	for groupIdx, group := range batch.Groups {

@@ -6,14 +6,12 @@ Permanent raw bencode retention remains **0%**.
 
 ## Required semantics
 
-- Search must expose independent `heatWindow=1d|7d|15d|30d` and optional
+- Search must expose independent `heatWindow=24h|3d|7d|15d` and optional
   discovery-age filtering; the heat window must not be confused with first-seen
   time.
-- Within one UTC day, repeated observations from the same network actor must
-  contribute exactly once after a port/node-ID change, LRU eviction, crawler
-  restart, HTTP replay, or observation in both regions. Reappearance on a later
-  day deliberately contributes again, so the measure rewards sustained recent
-  activity instead of claiming to count unique people or seeders.
+- The 24h product value is exact unique actor/hash across the latest 24 complete
+  UTC hours. The 3/7/15-day values remain sums of exact actor-days. Port/node-ID
+  changes, HTTP replay and observation in both regions must not inflate either.
 - Raw IP addresses, DHT node IDs and peer endpoints must not be retained in
   PostgreSQL, Meilisearch, archives or backups.
 - Inbound `get_peers`, direct `announce_peer`, and peers repeated by an active
@@ -226,3 +224,60 @@ records through the day's exclusive end were durably receipted. Queue drop,
 writer loss, negative day-closed receipt, first partial startup, clock jump,
 abnormal restart, or any same-day graceful stop/restart marks the day dirty.
 This intentionally permits false `partial` and forbids false `complete`.
+
+## H-003 decision: exact rolling 24h plus compressed daily 3/7/15d
+
+CHHT v2 adds the UTC hour and carries a stable rolling actor fingerprint. The
+backend rejects any authenticated bucket newer than its current UTC hour. The
+hourly projector targets `currentHour - 1`, so a partial current hour never
+appears in search. A repeated actor across any number of those 24 buckets counts
+once, rather than once per actor-hour.
+
+The stable actor is written only to host-local `heat-rolling-24h.sqlite3`. Its
+rows expire outside the rolling window, the database is disposable, and both
+backup creation and restore verification reject archives containing it. Before
+the daily SQLite write, the backend re-HMACs that stable token with a distinct
+storage-only per-day key. PostgreSQL receives only sealed compressed daily
+counts; Meili receives only final integers.
+
+Every rolling connection enables SQLite `secure_delete=ON`, so expired actor
+cells are overwritten rather than left on the freelist. Every completed expiry
+transaction performs a checked `wal_checkpoint(TRUNCATE)`; a busy checkpoint is
+a retryable failure, never a successful privacy claim. Once per 24 projected
+hours, a freelist/size gate may additionally run `VACUUM`; this bounds peak
+pages without paying a full-file rewrite every poll on 2C/4G.
+The rolling database and its WAL remain excluded from every backup. Physical
+privacy verification checks secure-delete, zero freelist after forced
+maintenance, page reclamation, and a truncated WAL.
+
+The rolling file is also bounded independently from the daily authority: the
+default hard maximum is 5 GiB and ingest requires at least 2 GiB free on its
+filesystem. Expiration and WAL truncation run before the admission check;
+crossing either watermark yields a non-ACKed capacity failure so crawler spools
+retain the batch for retry rather than filling the storage host.
+
+Rolling freshness is reported as `HeatAsOfUtc` at the end of the latest complete
+projected hour plus `HeatCoverageHours`. Storage uptime cannot prove crawler or
+tunnel completeness, so the current safe phase reports rolling coverage as
+unknown/`0`; it never regrows coverage from storage runtime alone.
+Daily 3/7/15-day coverage remains complete-day coverage multiplied by 24. Redis
+is not required: it adds a durability/memory component without improving exact
+deduplication or the compressed daily authority.
+
+The next coverage phase requires a crawler-specific authenticated hour closure,
+including zero-event hours. Each closure binds crawler ID, spool epoch, UTC
+hour, start sequence, and exclusive end sequence, and is emitted only after the
+ordinary spool cursor proves every range through that hour is ACKed. Backend
+acceptance must be replay-idempotent, reject conflicts/epoch changes/gaps and
+future/current incomplete hours, and retain a 24-bit completeness mask only
+where every `ExpectedCrawlerId` closed the same hour. Tunnel backlog or crawler
+restart may delay/lose coverage but can never fabricate it. Numeric heat may
+continue updating independently while coverage remains zero.
+
+An authenticated late batch for the already projected complete target hour is
+reprojected immediately only when its exact count differs from the last Meili
+value. Dirty state caused solely by the current incomplete hour compares equal
+and therefore does not create a 30-second projection loop. Hashes not yet in the
+PostgreSQL catalog enter an hourly deferred retry set; they are mapped at most
+once per target hour and their active/deferred/dirty/dictionary rows are removed
+after rolling expiry. This bounds CPU rescans without dropping pre-metadata heat.

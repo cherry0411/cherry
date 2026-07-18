@@ -9,6 +9,7 @@ User=cherry-picker
 Group=cherry-picker
 WorkingDirectory=/opt/cherry-picker
 Environment=CHERRY_PICKER_CONFIG=/etc/cherry-picker/metadata.json
+ExecStartPre=/opt/cherry-picker/preflight-heat-spool-v2.sh --config /etc/cherry-picker/metadata.json
 ExecStart=/opt/cherry-picker/cherry-picker
 Restart=always
 RestartSec=5

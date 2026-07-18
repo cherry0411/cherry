@@ -286,7 +286,8 @@ func TestSpoolRestartReconstructsIdenticalBodyAndReceipt(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	beforeWire, err := BuildWireBatch(before.Observations[0].Day, before.Observations)
+	beforeWire, err := BuildWireBatch(
+		before.Observations[0].Day, before.Observations[0].Hour, before.Observations)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -308,7 +309,8 @@ func TestSpoolRestartReconstructsIdenticalBodyAndReceipt(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	afterWire, err := BuildWireBatch(after.Observations[0].Day, after.Observations)
+	afterWire, err := BuildWireBatch(
+		after.Observations[0].Day, after.Observations[0].Hour, after.Observations)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -546,6 +548,101 @@ func TestCompletionResponseLossReplaysIdenticalIdentity(t *testing.T) {
 	}
 }
 
+func TestTooEarlyBatchNeverAdvancesSpoolUntilAuthenticatedACK(t *testing.T) {
+	var allow atomic.Bool
+	var attempts atomic.Uint64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		attempts.Add(1)
+		if !allow.Load() {
+			w.WriteHeader(http.StatusTooEarly)
+			_, _ = w.Write([]byte(`{"code":"clock_skew","retryable":true}`))
+			return
+		}
+		writeAcceptedACK(t, w, r, body)
+	}))
+	defer server.Close()
+	day := uint32(20_654)
+	now := time.Unix(int64(day)*86_400+3600, 0).UTC()
+	collector, err := New(Options{
+		Endpoint: server.URL + "/api/v1/heat/batches", CrawlerID: "jp-crawler-01",
+		SpoolDir: t.TempDir(), SpoolMaxBytes: 1 << 20, QueueCapacity: 8, BatchSize: 8,
+		RetryBackoff: 5 * time.Millisecond, Now: func() time.Time { return now },
+		MasterSecret: testMasterSecret, HMACSecret: testMasterSecret, LocalAddresses: []netip.Addr{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !collector.Observe(string(bytes.Repeat([]byte{0x61}, 20)), "8.8.8.8", now) {
+		t.Fatal("observation not admitted")
+	}
+	waitFor(t, time.Second, func() bool { return attempts.Load() >= 2 })
+	blocked := collector.Snapshot()
+	if blocked.SpoolRecords != 1 || blocked.Exported != 0 {
+		t.Fatalf("425 advanced durable head: %+v", blocked)
+	}
+	allow.Store(true)
+	waitFor(t, time.Second, func() bool { return collector.Snapshot().Exported == 1 })
+	if got := collector.Snapshot().SpoolRecords; got != 0 {
+		t.Fatalf("ACK did not advance spool: records=%d", got)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := collector.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestTooEarlyCompletionRemainsPendingUntilStorageDayCloses(t *testing.T) {
+	var allow atomic.Bool
+	var attempts atomic.Uint64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasSuffix(r.URL.Path, "/completions") {
+			http.Error(w, "unexpected batch", http.StatusBadRequest)
+			return
+		}
+		attempts.Add(1)
+		if !allow.Load() {
+			w.WriteHeader(http.StatusTooEarly)
+			_, _ = w.Write([]byte(`{"code":"clock_skew","retryable":true}`))
+			return
+		}
+		writeCompletionACK(t, w, r, false)
+	}))
+	defer server.Close()
+	day := uint32(20_654)
+	now := time.Unix(int64(day)*86_400+3600, 0).UTC()
+	collector, err := New(Options{
+		Endpoint: server.URL + "/api/v1/heat/batches", CrawlerID: "jp-crawler-01",
+		SpoolDir: t.TempDir(), SpoolMaxBytes: 1 << 20, QueueCapacity: 8, BatchSize: 8,
+		RetryBackoff: 5 * time.Millisecond, Now: func() time.Time { return now },
+		MasterSecret: testMasterSecret, HMACSecret: testMasterSecret, LocalAddresses: []netip.Addr{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The startup day is conservatively dirty. The following zero-event day
+	// is nevertheless a valid closure and must remain pending across 425s.
+	if !collector.advanceTo(day+1) || !collector.advanceTo(day+2) {
+		t.Fatal("completion boundary failed")
+	}
+	waitFor(t, time.Second, func() bool { return attempts.Load() >= 2 })
+	_, _, cursor, err := collector.spool.sequenceState()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pending := collector.completion.ready(cursor); len(pending) != 1 {
+		t.Fatalf("425 consumed completion: pending=%d", len(pending))
+	}
+	allow.Store(true)
+	waitFor(t, time.Second, func() bool { return len(collector.completion.ready(cursor)) == 0 })
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := collector.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestCompletionStateCrashAndGracefulRestartBothPoisonActiveDay(t *testing.T) {
 	dir := t.TempDir()
 	spool, err := openHeatSpool(spoolOptions{dir: dir, maxBytes: 1 << 20})
@@ -637,12 +734,12 @@ func TestGoldenDeliveryVector(t *testing.T) {
 		b[idx] = byte(0xff - idx)
 	}
 	rows := []Observation{
-		{Day: 20_654, InfoHash: b, Actor: 42},
-		{Day: 20_654, InfoHash: a, Actor: 2},
-		{Day: 20_654, InfoHash: a, Actor: 1},
-		{Day: 20_654, InfoHash: a, Actor: 1},
+		{Day: 20_654, Hour: 12, InfoHash: b, Actor: 42},
+		{Day: 20_654, Hour: 12, InfoHash: a, Actor: 2},
+		{Day: 20_654, Hour: 12, InfoHash: a, Actor: 1},
+		{Day: 20_654, Hour: 12, InfoHash: a, Actor: 1},
 	}
-	wireBatch, err := BuildWireBatch(20_654, rows)
+	wireBatch, err := BuildWireBatch(20_654, 12, rows)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -653,9 +750,9 @@ func TestGoldenDeliveryVector(t *testing.T) {
 	receipt := buildDeliveryReceipt("jp-crawler-01", string(testMasterSecret), spoolBatch{
 		Epoch: 0x0102030405060708, StartSequence: 100, EndSequence: 103,
 	}, payload)
-	const wantPayload = "4348485401000050ae02000102030405060708090a0b0c0d0e0f101112130200000000000000010000000000000002fffefdfcfbfaf9f8f7f6f5f4f3f2f1f0efeeedec01000000000000002a"
-	const wantDigest = "2f260987e99b008f8a5cac8100a7287aaa1e8c7cb3cbf4dd975bba65fe0df387"
-	const wantSignature = "17c7ce782ca1bdeb70a934b7081854253e585e4500df406622a29fc6f2fe0a7a"
+	const wantPayload = "4348485402000050ae0c02000102030405060708090a0b0c0d0e0f101112130200000000000000010000000000000002fffefdfcfbfaf9f8f7f6f5f4f3f2f1f0efeeedec01000000000000002a"
+	const wantDigest = "f9677f7b639d9e92f4a4d1710ca5aec8da298618ba8c5c27ae0274bb549f1369"
+	const wantSignature = "f412c893652e24aa3999b4d42db2417764b17fc737a45675a502c0c8c8700a7e"
 	if got := hex.EncodeToString(payload); got != wantPayload ||
 		receipt.PayloadSHA256 != wantDigest || receipt.Signature != wantSignature {
 		t.Fatalf("golden vector drift:\npayload=%s\ndigest=%s\nsignature=%s", got, receipt.PayloadSHA256, receipt.Signature)
@@ -665,7 +762,7 @@ func TestGoldenDeliveryVector(t *testing.T) {
 		Digest     string `json:"payload_sha256_lower_hex"`
 		Signature  string `json:"signature_hmac_sha256_lower_hex"`
 	}
-	fixtureBytes, err := os.ReadFile(filepath.Join("testdata", "chht_v1_golden.json"))
+	fixtureBytes, err := os.ReadFile(filepath.Join("testdata", "chht_v2_golden.json"))
 	if err != nil {
 		t.Fatal(err)
 	}

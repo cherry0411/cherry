@@ -10,13 +10,15 @@ public sealed class HeatOptions
     private static readonly byte[] UnknownCrawlerKey =
         SHA256.HashData(Encoding.UTF8.GetBytes("cherry/heat/unknown-crawler/fail-closed/v1"));
     private byte[]? _decodedSecret;
+    private byte[]? _decodedDailyActorSecret;
     private readonly ConcurrentDictionary<string, byte[]> _decodedCrawlerSecrets = new(StringComparer.Ordinal);
     public bool Enabled { get; init; }
     public string SharedSecret { get; init; } = string.Empty;
+    public string DailyActorSecret { get; init; } = string.Empty;
     public Dictionary<string, string> CrawlerSecrets { get; init; } = new(StringComparer.Ordinal);
     public string DataDirectory { get; init; } = "data/heat";
     public string IndexUid { get; init; } = "torrents";
-    public string IndexGeneration { get; init; } = "torrents-v1";
+    public string IndexGeneration { get; init; } = "torrents-heat-v2";
     public string? CoverageStartDay { get; init; }
     public string[] ExpectedCrawlerIds { get; init; } = [];
     public int LateGraceMinutes { get; init; } = 30;
@@ -26,6 +28,8 @@ public sealed class HeatOptions
     public int CommitBatchRequests { get; init; } = 8;
     public int ProjectionBatchSize { get; init; } = 500;
     public int LifecyclePollSeconds { get; init; } = 30;
+    public long RollingMaxBytes { get; init; } = 5L * 1024 * 1024 * 1024;
+    public long RollingMinFreeBytes { get; init; } = 2L * 1024 * 1024 * 1024;
 
     public DateOnly? ParsedCoverageStartDay =>
         DateOnly.TryParseExact(
@@ -46,13 +50,14 @@ public sealed class HeatOptions
         {
             Enabled = Enabled,
             SharedSecret = SharedSecret,
+            DailyActorSecret = DailyActorSecret,
             CrawlerSecrets = CrawlerSecrets
                 .Where(pair => !string.IsNullOrWhiteSpace(pair.Key) && !string.IsNullOrWhiteSpace(pair.Value))
                 .ToDictionary(pair => pair.Key.Trim(), pair => pair.Value.Trim(), StringComparer.Ordinal),
             DataDirectory = path,
             IndexUid = string.IsNullOrWhiteSpace(IndexUid) ? "torrents" : IndexUid.Trim(),
             IndexGeneration = string.IsNullOrWhiteSpace(IndexGeneration)
-                ? "torrents-v1"
+                ? "torrents-heat-v2"
                 : IndexGeneration.Trim(),
             CoverageStartDay = CoverageStartDay,
             ExpectedCrawlerIds = ExpectedCrawlerIds
@@ -66,7 +71,9 @@ public sealed class HeatOptions
             ChannelCapacity = Math.Clamp(ChannelCapacity, 1, 4096),
             CommitBatchRequests = Math.Clamp(CommitBatchRequests, 1, 64),
             ProjectionBatchSize = Math.Clamp(ProjectionBatchSize, 1, 5000),
-            LifecyclePollSeconds = Math.Clamp(LifecyclePollSeconds, 5, 3600)
+            LifecyclePollSeconds = Math.Clamp(LifecyclePollSeconds, 5, 3600),
+            RollingMaxBytes = Math.Clamp(RollingMaxBytes, 64L * 1024 * 1024, 64L * 1024 * 1024 * 1024),
+            RollingMinFreeBytes = Math.Clamp(RollingMinFreeBytes, 256L * 1024 * 1024, 32L * 1024 * 1024 * 1024)
         };
     }
 
@@ -86,6 +93,15 @@ public sealed class HeatOptions
         {
             throw new InvalidOperationException("Heat:SharedSecret must be base64", exception);
         }
+    }
+
+    public byte[] DecodeDailyActorSecret()
+    {
+        if (!Enabled) return [];
+        var cached = Volatile.Read(ref _decodedDailyActorSecret);
+        if (cached is not null) return cached;
+        var secret = DecodeBase64Secret(DailyActorSecret, "Heat:DailyActorSecret");
+        return Interlocked.CompareExchange(ref _decodedDailyActorSecret, secret, null) ?? secret;
     }
 
     public byte[] DecodeSecret(string crawlerId)
@@ -119,6 +135,17 @@ public sealed class HeatOptions
                 throw new InvalidOperationException(
                     "Heat:CrawlerSecrets values must be distinct for every expected crawler");
         }
+    }
+
+    public void ValidateDailyActorSecretIsolation()
+    {
+        var dailyDigest = SHA256.HashData(DecodeDailyActorSecret());
+        foreach (var crawlerId in ExpectedCrawlerIds)
+            if (CryptographicOperations.FixedTimeEquals(
+                    dailyDigest,
+                    SHA256.HashData(DecodeSecret(crawlerId))))
+                throw new InvalidOperationException(
+                    "Heat:DailyActorSecret must be distinct from every crawler transport key");
     }
 
     private static byte[] DecodeBase64Secret(string encoded, string name)

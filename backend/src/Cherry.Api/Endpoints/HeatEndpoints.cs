@@ -9,7 +9,7 @@ public static class HeatEndpoints
     {
         app.MapPost("/api/v1/heat/batches", AcceptAsync)
             .WithTags("Heat")
-            .WithSummary("Durably accept a canonical CHHT v1 heat batch")
+            .WithSummary("Durably accept a canonical CHHT v2 hourly heat batch")
             .Produces(StatusCodes.Status200OK)
             .Produces(StatusCodes.Status400BadRequest)
             .Produces(StatusCodes.Status401Unauthorized)
@@ -36,9 +36,9 @@ public static class HeatEndpoints
     {
         if (!options.Enabled || accumulator is null)
             return Results.Json(new { error = "Heat ingestion is disabled" }, statusCode: 503);
-        if (!string.Equals(request.ContentType?.Split(';', 2)[0].Trim(), ChhtV1Protocol.MediaType,
+        if (!string.Equals(request.ContentType?.Split(';', 2)[0].Trim(), ChhtProtocol.MediaType,
                 StringComparison.OrdinalIgnoreCase))
-            return Results.BadRequest(new { error = $"Content-Type must be {ChhtV1Protocol.MediaType}" });
+            return Results.BadRequest(new { error = $"Content-Type must be {ChhtProtocol.MediaType}" });
         if (request.ContentLength is > 0 && request.ContentLength > options.MaxRequestBytes)
             return Results.Json(new { error = "CHHT request is too large" }, statusCode: 413);
 
@@ -51,7 +51,7 @@ public static class HeatEndpoints
             var signature = RequiredHeader(request, "X-CHHT-Signature");
             var digest = RequiredHeader(request, "X-CHHT-Payload-SHA256");
             var payload = await ReadBoundedAsync(request.Body, options.MaxRequestBytes, cancellationToken);
-            var batch = ChhtV1Protocol.ParseAndAuthenticate(
+            var batch = ChhtProtocol.ParseAndAuthenticate(
                 payload, crawler, epoch, sequence, endSequence, signature, digest,
                 options.DecodeSecret(crawler), options, DateTime.UtcNow);
             var result = await accumulator.SubmitAsync(batch, cancellationToken);
@@ -77,6 +77,8 @@ public static class HeatEndpoints
                     Results.Json(response, statusCode: 410),
                 HeatAcceptStatus.Conflict => Results.Json(response, statusCode: 409),
                 HeatAcceptStatus.Backpressure => Results.Json(response, statusCode: 429),
+                HeatAcceptStatus.Failed when result.Error == "Heat storage capacity exhausted" =>
+                    Results.Json(response, statusCode: 507),
                 HeatAcceptStatus.Failed when result.Error == "Heat storage unavailable" =>
                     Results.Json(response, statusCode: 507),
                 _ => Results.Json(response, statusCode: 503)
@@ -105,6 +107,9 @@ public static class HeatEndpoints
                     }, statusCode: 410),
                 ChhtProtocolError.Authentication => Results.Json(
                     new { error = "Invalid CHHT authentication" }, statusCode: 401),
+                ChhtProtocolError.Future => Results.Json(
+                    new { code = "clock_skew", retryable = true, error = exception.Message },
+                    statusCode: StatusCodes.Status425TooEarly),
                 _ => Results.BadRequest(new { error = "Invalid CHHT request" })
             };
         }
@@ -122,9 +127,9 @@ public static class HeatEndpoints
     {
         if (!options.Enabled || accumulator is null)
             return Results.Json(new { error = "Heat ingestion is disabled" }, statusCode: 503);
-        if (!string.Equals(request.ContentType?.Split(';', 2)[0].Trim(), ChhtV1Protocol.CompletionMediaType,
+        if (!string.Equals(request.ContentType?.Split(';', 2)[0].Trim(), ChhtProtocol.CompletionMediaType,
                 StringComparison.OrdinalIgnoreCase))
-            return Results.BadRequest(new { error = $"Content-Type must be {ChhtV1Protocol.CompletionMediaType}" });
+            return Results.BadRequest(new { error = $"Content-Type must be {ChhtProtocol.CompletionMediaType}" });
         try
         {
             var crawler = RequiredHeader(request, "X-CHHT-Crawler");
@@ -136,7 +141,7 @@ public static class HeatEndpoints
             var signature = RequiredHeader(request, "X-CHHT-Signature");
             if ((await ReadBoundedAsync(request.Body, 1, cancellationToken)).Length != 0)
                 return Results.BadRequest(new { error = "CHHT completion body must be empty" });
-            var completion = ChhtV1Protocol.ParseAndAuthenticateCompletion(
+            var completion = ChhtProtocol.ParseAndAuthenticateCompletion(
                 crawler, day, epoch, startSequence, nextSequence, clean, signature,
                 options.DecodeSecret(crawler), options, DateTime.UtcNow);
             var result = await accumulator.SubmitCompletionAsync(completion, cancellationToken);
@@ -188,6 +193,9 @@ public static class HeatEndpoints
                     }, statusCode: 410),
                 ChhtProtocolError.Authentication => Results.Json(
                     new { error = "Invalid CHHT authentication" }, statusCode: 401),
+                ChhtProtocolError.Future => Results.Json(
+                    new { code = "clock_skew", retryable = true, error = exception.Message },
+                    statusCode: StatusCodes.Status425TooEarly),
                 _ => Results.BadRequest(new { error = "Invalid CHHT completion" })
             };
         }

@@ -93,18 +93,18 @@ ID、详情和 outbox marker；旧 `torrent_files.csv`/宽表导出不兼容。
 heat worker 对同一文档做独立 partial PUT：
 
 ```json
-{"id": 42, "heat1d": 3, "heat7d": 17, "heat15d": 31, "heat30d": 66}
+{"id": 42, "heat24h": 3, "heat3d": 9, "heat7d": 17, "heat15d": 31}
 ```
 
 两条链路都不发送对方字段，所以 metadata 重建不会清空 heat，heat 投影也不会复制标题。
 当前 settings 是：
 
 - searchable: `name`
-- sortable: `firstSeen`, `heat1d`, `heat7d`, `heat15d`, `heat30d`
+- sortable: `firstSeen`, `heat24h`, `heat3d`, `heat7d`, `heat15d`
 - filterable: 空
 - ranking: `words`, `typo`, `proximity`, `attribute`, `exactness`, `sort`
 
-搜索请求先由 Meili 按所选 1d/7d/15d/30d heat 和 `firstSeen` 排序，只返回 `id` 与四个
+搜索请求先由 Meili 按所选 24h/3d/7d/15d heat 和 `firstSeen` 排序，只返回 `id` 与四个
 heat 值；API 再按 `id` 批量取 PG catalog 并恢复 Meili 顺序。详情页按 hex info hash 查
 PG 并按需解码 compact detail。Meili 请求非 2xx、超时或返回畸形响应时，搜索 API 明确
 返回 HTTP 503，不把基础设施故障伪装成“0 条结果”，也不伪装成等价的 PG 全文 fallback。
@@ -117,35 +117,44 @@ Meili 丢卷后的干净恢复使用同一脚本的 `--recover-empty-index`。AP
 投影，删除并重建物理索引、确认文档数为 0，再在同一 PG 事务中重投全部 metadata 并
 请求 full heat replay。启动时只在“PG 非空且 Meili 确认为空”时自动走该恢复；非空的部分
 索引不会被武断清空。full heat replay 以最新 retained sealed day 为目标，只依赖保留的
-31 日窗口，不依赖已被 GC 的 CoverageStart 历史。
+16 日（15 日窗口加一个出窗边界）source window，不依赖已被 GC 的 CoverageStart 历史。
 
 ## 5. 近期热度链路
 
 ```text
 inbound get_peers observation
   -> crawler 排除自身/已知 crawler/metadata fetch 等自反馈
-  -> (info_hash, daily keyed actor fingerprint)
-  -> 独立 CHHT v1 durable spool + HMAC/sequence/digest
+  -> (info_hash, UTC hour, stable rolling actor fingerprint)
+  -> 独立 CHHT v2 durable spool + HMAC/sequence/digest
   -> POST /api/v1/heat/batches
-  -> 当日 SQLite exact actor-day set（WAL + synchronous FULL）
+  -> storage-side 日密钥重 HMAC -> 当日 SQLite exact actor-day set
+  -> host-local disposable rolling SQLite exact 24h set
+  -> 每个 UTC 小时仅投影上一完整小时 -> Meili heat24h
   -> crawler writer barrier + contiguous receipt cursor
   -> POST /api/v1/heat/completions（crawler 专属 HMAC、幂等）
   -> UTC grace window 后按 64 shard 封成 immutable PG frames
   -> manifest 标注 complete/partial coverage
-  -> HeatProjectionWorker 逐日、逐 shard、可恢复地 partial PUT Meili
+  -> HeatProjectionWorker 逐日、逐 shard、可恢复地 partial PUT Meili heat3d/7d/15d
 ```
 
-热度表示窗口内经去重的 actor-day observations 之和，不冒充唯一用户或唯一 peer。
+`heat24h` 是最近 24 个完整 UTC 小时内的 exact unique actor 数；同一 actor 跨小时、跨区域、
+重试或重启仍只计一次。`heat3d/7d/15d` 是各完整日 exact actor-day 的窗口和。两者都不冒充
+唯一用户或唯一 peer。
 `Heat__ExpectedCrawlerIds` 决定每日覆盖完整性；缺少区域的日子以 partial 明示，不能静默
 补零。每个 expected crawler 必须配置独立 `Heat__CrawlerSecrets__{id}`；只有显式 completion
 与其 start/next 之间单 epoch receipt 链完全连续、且 crawler 本地没有 queue/drop/restart
-损失时才是 complete。其余情况一律 partial。搜索响应返回所选窗口的 `heatAsOfDay` 与实际
-complete coverage days。
+损失时才是 complete。其余情况一律 partial。搜索响应返回 `heatAsOfUtc` 与
+`heatCoverageHours`；日窗口覆盖以完整日数乘 24，24h 覆盖在进程启动/重启后从 0 逐小时
+增长到 24。
 
 PG 中 sealed heat 使用 `heat_day_manifests` 和 `heat_day_frames`；投影进度使用
 `heat_projection_watermarks` 与 `heat_projection_tasks`。首次构建或 index generation
-变化时做全量恢复，之后仅重算日窗口边界受影响的 ID。Redis 不在正确性链路中，也不
-需要保存长期 IP/node/hash 关系。
+变化时做全量恢复，之后仅重算日窗口边界受影响的 ID。rolling SQLite 中的稳定 actor 最多
+保留 24h，明确排除在备份和恢复校验之外；PG 只接收日密钥重 HMAC 后的当日集合及压缩帧。
+Redis 不在正确性链路中，也不需要保存长期 IP/node/hash 关系。
+尚未进入 PG catalog 的 rolling hash 最多每个 target hour 重试映射一次，过期后连同
+dirty/deferred/dictionary 状态一起 GC；已投影 target hour 的迟到批次仅在 exact count
+确实变化时立即补投，当前未完整小时不会形成 30 秒重投循环。
 
 ## 6. 安全与部署
 
@@ -153,12 +162,13 @@ PG 中 sealed heat 使用 `heat_day_manifests` 和 `heat_day_frames`；投影进
 
 | 服务 | 内存硬限制 | CPU ceiling | 网络 |
 |---|---:|---:|---|
-| PostgreSQL 17.10 | 1408 MiB | 1.25 | Docker internal |
-| Meilisearch 1.45.1 | 1408 MiB | 1.0 | Docker internal |
-| API | 640 MiB | 0.75 | 仅 `127.0.0.1:5070` |
+| PostgreSQL 17.10 | 1280 MiB | 1.25 | Docker internal |
+| Meilisearch 1.45.1 | 1152 MiB | 1.0 | Docker internal |
+| API | 576 MiB | 0.75 | 仅 `127.0.0.1:5070` |
 
-三者 CPU ceiling 可以重叠调度；内存总硬限制为 3.375 GiB，给 kernel、Docker、SSH 和
-page cache 留约 640 MiB。Meili 限一个 indexing thread/768 MiB indexing arena。上述是
+三者 CPU ceiling 可以重叠调度；内存总硬限制为 3008 MiB。按存储机实测
+`MemTotal=3659.9 MiB`，给 kernel、Docker、SSH 和 page cache 留约 652 MiB。Meili 限一个
+indexing thread/640 MiB indexing arena。上述是
 保守基线，不是无需 benchmark 的最终参数。
 
 PG、Meili 和 API 都不直接暴露公网。Crawler 用受限 SSH key 建 persistent local forward，

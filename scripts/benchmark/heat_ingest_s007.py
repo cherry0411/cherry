@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Reproducible CHHT/1 end-to-end ingest benchmark.
+"""Reproducible CHHT/2 end-to-end ingest benchmark.
 
 The target is a running Cherry API with heat enabled.  Each crawler stream is
 strictly sequential, while independent crawler streams run concurrently so the
@@ -25,7 +25,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-MEDIA_TYPE = "application/vnd.cherry.heat-v1"
+MEDIA_TYPE = "application/vnd.cherry.heat-v2"
 
 
 def uvarint(value: int) -> bytes:
@@ -60,11 +60,13 @@ def deterministic_rows(crawler_index: int, batch_index: int, count: int) -> list
     return rows
 
 
-def encode_payload(unix_day: int, rows: list[tuple[bytes, int]]) -> tuple[bytes, int]:
+def encode_payload(unix_day: int, utc_hour: int, rows: list[tuple[bytes, int]]) -> tuple[bytes, int]:
     groups: dict[bytes, set[int]] = {}
     for info_hash, actor in rows:
         groups.setdefault(info_hash, set()).add(actor)
-    body = bytearray(b"CHHT\x01" + struct.pack(">I", unix_day))
+    if not 0 <= utc_hour <= 23:
+        raise ValueError("UTC hour must be in [0, 23]")
+    body = bytearray(b"CHHT\x02" + struct.pack(">IB", unix_day, utc_hour))
     body += uvarint(len(groups))
     record_count = 0
     for info_hash in sorted(groups):
@@ -96,16 +98,17 @@ def build_delivery(
     batch_index: int,
     records: int,
     unix_day: int,
+    utc_hour: int,
     day_text: str,
     epoch: int,
     secret: bytes,
 ) -> Delivery:
     rows = deterministic_rows(crawler_index, batch_index, records)
-    payload, canonical_records = encode_payload(unix_day, rows)
+    payload, canonical_records = encode_payload(unix_day, utc_hour, rows)
     start = batch_index * records + 1
     end = start + records - 1
     digest = hashlib.sha256(payload).hexdigest()
-    prefix = f"CHHT/1\n{crawler}\n{epoch}\n{start}\n{end}\n{digest}\n".encode()
+    prefix = f"CHHT/2\n{crawler}\n{epoch}\n{start}\n{end}\n{digest}\n".encode()
     signature = hmac.new(secret, prefix + payload, hashlib.sha256).hexdigest()
     return Delivery(crawler, day_text, epoch, start, end, digest, signature, payload, canonical_records)
 
@@ -160,6 +163,7 @@ def run_stream(
     batches: int,
     records: int,
     unix_day: int,
+    utc_hour: int,
     day_text: str,
     epoch: int,
     secret: bytes,
@@ -171,7 +175,7 @@ def run_stream(
     first_inserted: int | None = None
     for batch_index in range(batches):
         delivery = build_delivery(
-            crawler, crawler_index, batch_index, records, unix_day, day_text, epoch, secret
+            crawler, crawler_index, batch_index, records, unix_day, utc_hour, day_text, epoch, secret
         )
         first = first or delivery
         result, latency = post(url, delivery, timeout)
@@ -204,7 +208,9 @@ def main() -> int:
     crawlers = [value.strip() for value in args.crawler_ids.split(",") if value.strip()]
     if not crawlers or any(len(value) > 64 for value in crawlers):
         raise SystemExit("crawler IDs must contain 1..64 characters")
-    today = dt.datetime.now(dt.timezone.utc).date()
+    benchmark_now = dt.datetime.now(dt.timezone.utc)
+    today = benchmark_now.date()
+    utc_hour = benchmark_now.hour
     unix_day = (today - dt.date(1970, 1, 1)).days
     epoch = int.from_bytes(hashlib.sha256(f"s007-{today}".encode()).digest()[:8], "big") or 1
 
@@ -219,6 +225,7 @@ def main() -> int:
                 args.batches,
                 args.records,
                 unix_day,
+                utc_hour,
                 today.isoformat(),
                 epoch + index,
                 secret,
@@ -245,6 +252,7 @@ def main() -> int:
             "batches_per_crawler": args.batches,
             "source_records_per_batch": args.records,
             "unix_day": unix_day,
+            "utc_hour": utc_hour,
         },
         "results": {
             "wall_seconds": wall,

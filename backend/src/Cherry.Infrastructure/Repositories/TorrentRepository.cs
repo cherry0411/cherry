@@ -18,19 +18,22 @@ public class TorrentRepository : ITorrentRepository
     private readonly IProcessedHashFilter? _processedHashFilter;
     private readonly HeatOptions _heatOptions;
     private readonly HeatProjectionStatusCache _heatStatusCache;
+    private readonly HeatRollingStore? _rollingHeat;
 
     public TorrentRepository(
         AppDbContext db,
         MeiliSearchClient? meiliClient = null,
         IProcessedHashFilter? processedHashFilter = null,
         HeatOptions? heatOptions = null,
-        HeatProjectionStatusCache? heatStatusCache = null)
+        HeatProjectionStatusCache? heatStatusCache = null,
+        HeatRollingStore? rollingHeat = null)
     {
         _db = db;
         _meiliClient = meiliClient;
         _processedHashFilter = processedHashFilter;
         _heatOptions = heatOptions ?? new HeatOptions();
         _heatStatusCache = heatStatusCache ?? new HeatProjectionStatusCache();
+        _rollingHeat = rollingHeat;
     }
 
     public async Task<IReadOnlySet<string>> BulkInsertTorrentsAsync(
@@ -244,7 +247,7 @@ public class TorrentRepository : ITorrentRepository
         return torrent;
     }
 
-    public async Task<(List<Torrent> Items, long Total, DateOnly? HeatAsOfDay, int HeatCoverageDays)> SearchAsync(
+    public async Task<(List<Torrent> Items, long Total, DateTime? HeatAsOfUtc, int HeatCoverageHours)> SearchAsync(
         string query, string heatWindow, int page, int pageSize, CancellationToken ct = default)
     {
         if (_meiliClient == null)
@@ -254,7 +257,7 @@ public class TorrentRepository : ITorrentRepository
         if (result.Hits.Count == 0)
         {
             var emptyStatus = await GetHeatStatusAsync(heatWindow, ct);
-            return ([], result.EstimatedTotalHits, emptyStatus.Day, emptyStatus.Coverage);
+            return ([], result.EstimatedTotalHits, emptyStatus.AsOfUtc, emptyStatus.CoverageHours);
         }
 
         var ids = result.Hits.Select(h => h.Id).ToList();
@@ -269,20 +272,32 @@ public class TorrentRepository : ITorrentRepository
         foreach (var hit in result.Hits)
         {
             if (!byId.TryGetValue(hit.Id, out var torrent)) continue;
-            torrent.Heat1d = hit.Heat1d;
+            torrent.Heat24h = hit.Heat24h;
+            torrent.Heat3d = hit.Heat3d;
             torrent.Heat7d = hit.Heat7d;
             torrent.Heat15d = hit.Heat15d;
-            torrent.Heat30d = hit.Heat30d;
             ordered.Add(torrent);
         }
 
         var status = await GetHeatStatusAsync(heatWindow, ct);
-        return (ordered, result.EstimatedTotalHits, status.Day, status.Coverage);
+        return (ordered, result.EstimatedTotalHits, status.AsOfUtc, status.CoverageHours);
     }
 
-    private async Task<(DateOnly? Day, int Coverage)> GetHeatStatusAsync(string heatWindow, CancellationToken ct)
+    private async Task<(DateTime? AsOfUtc, int CoverageHours)> GetHeatStatusAsync(
+        string heatWindow,
+        CancellationToken ct)
     {
-        var windowDays = int.Parse(heatWindow[..^1], System.Globalization.CultureInfo.InvariantCulture);
+        if (heatWindow == "24h")
+        {
+            if (_rollingHeat is null) return (null, 0);
+            var rolling = await _rollingHeat.GetStatusAsync(ct);
+            if (rolling.ProjectedHour is null) return (null, 0);
+            var rollingAsOf = DateTimeOffset.FromUnixTimeSeconds(
+                checked((rolling.ProjectedHour.Value + 1) * 3600)).UtcDateTime;
+            return (rollingAsOf, rolling.CoverageHours);
+        }
+        var windowDays = int.Parse(
+            heatWindow[..^1], System.Globalization.CultureInfo.InvariantCulture);
         var status = await _heatStatusCache.GetAsync(async cancellationToken =>
         {
             var connection = (NpgsqlConnection)_db.Database.GetDbConnection();
@@ -301,7 +316,8 @@ public class TorrentRepository : ITorrentRepository
                 ? (reader.IsDBNull(0) ? null : reader.GetFieldValue<DateOnly>(0), reader.GetInt32(1))
                 : (null, 0);
         }, ct);
-        return (status.Day, HeatCoverage.Count(status.CoverageMask, windowDays));
+        var dailyAsOf = status.Day?.AddDays(1).ToDateTime(TimeOnly.MinValue, DateTimeKind.Utc);
+        return (dailyAsOf, HeatCoverage.Count(status.CoverageMask, windowDays) * 24);
     }
 
     public async Task<List<string>> CheckExistsAsync(List<string> hashes, CancellationToken ct = default)

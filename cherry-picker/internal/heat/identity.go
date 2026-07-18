@@ -11,11 +11,10 @@ import (
 	"net/netip"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 )
 
-const dayKeyDomain = "cherry/heat/day/v1\x00"
+const actorKeyDomain = "cherry/heat/rolling-actor/v2\x00"
 
 var reservedPrefixes = mustPrefixes(
 	"0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8",
@@ -26,12 +25,6 @@ var reservedPrefixes = mustPrefixes(
 	"2001:10::/28", "fc00::/7", "fe80::/10", "ff00::/8",
 )
 
-type dayHMAC struct {
-	day  uint32
-	key  [sha256.Size]byte
-	pool sync.Pool
-}
-
 type actorHMACState struct {
 	mac       hash.Hash
 	canonical [9]byte
@@ -41,8 +34,7 @@ type actorHMACState struct {
 type actorIdentity struct {
 	master   [sha256.Size]byte
 	excluded []netip.Prefix
-	current  atomic.Pointer[dayHMAC]
-	mu       sync.Mutex
+	pool     sync.Pool
 }
 
 func newActorIdentity(masterSecret []byte, knownCrawlerRanges string, local []netip.Addr) (*actorIdentity, error) {
@@ -50,6 +42,11 @@ func newActorIdentity(masterSecret []byte, knownCrawlerRanges string, local []ne
 		return nil, errors.New("heat: master secret must contain at least 32 bytes")
 	}
 	i := &actorIdentity{master: sha256.Sum256(masterSecret)}
+	derive := hmac.New(sha256.New, i.master[:])
+	_, _ = derive.Write([]byte(actorKeyDomain))
+	var key [sha256.Size]byte
+	derive.Sum(key[:0])
+	i.pool.New = func() any { return &actorHMACState{mac: hmac.New(sha256.New, key[:])} }
 	i.excluded = append(i.excluded, reservedPrefixes...)
 	known, err := parsePrefixes(knownCrawlerRanges)
 	if err != nil {
@@ -104,8 +101,7 @@ func (i *actorIdentity) observation(infoHash, rawIP string, now time.Time) (Obse
 	if !ok {
 		return Observation{}, false
 	}
-	h := i.hasher(day)
-	state := h.pool.Get().(*actorHMACState)
+	state := i.pool.Get().(*actorHMACState)
 	var actorBytes []byte
 	if addr.Is4() {
 		state.canonical[0] = 4
@@ -118,7 +114,7 @@ func (i *actorIdentity) observation(infoHash, rawIP string, now time.Time) (Obse
 		copy(state.canonical[1:9], v6[:8])
 		actorBytes = state.canonical[:9]
 	} else {
-		h.pool.Put(state)
+		i.pool.Put(state)
 		return Observation{}, false
 	}
 
@@ -126,10 +122,11 @@ func (i *actorIdentity) observation(infoHash, rawIP string, now time.Time) (Obse
 	_, _ = state.mac.Write(actorBytes)
 	state.mac.Sum(state.digest[:0])
 	actor := binary.BigEndian.Uint64(state.digest[:8])
-	h.pool.Put(state)
+	i.pool.Put(state)
 
 	var obs Observation
 	obs.Day = day
+	obs.Hour = uint8(now.UTC().Hour())
 	copy(obs.InfoHash[:], infoHash)
 	obs.Actor = actor
 	return obs, true
@@ -146,30 +143,6 @@ func (i *actorIdentity) isPublic(addr netip.Addr) bool {
 		}
 	}
 	return true
-}
-
-func (i *actorIdentity) hasher(day uint32) *dayHMAC {
-	if current := i.current.Load(); current != nil && current.day == day {
-		return current
-	}
-	i.mu.Lock()
-	defer i.mu.Unlock()
-	if current := i.current.Load(); current != nil && current.day == day {
-		return current
-	}
-	var raw [len(dayKeyDomain) + 4]byte
-	copy(raw[:], dayKeyDomain)
-	binary.BigEndian.PutUint32(raw[len(dayKeyDomain):], day)
-	derive := hmac.New(sha256.New, i.master[:])
-	_, _ = derive.Write(raw[:])
-	next := &dayHMAC{day: day}
-	derive.Sum(next.key[:0])
-	key := next.key
-	next.pool.New = func() any {
-		return &actorHMACState{mac: hmac.New(sha256.New, key[:])}
-	}
-	i.current.Store(next)
-	return next
 }
 
 func utcDay(now time.Time) (uint32, bool) {

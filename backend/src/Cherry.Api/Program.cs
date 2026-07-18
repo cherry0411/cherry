@@ -19,12 +19,14 @@ if (heatOptions.Enabled)
     if (heatOptions.ExpectedCrawlerIds.Length == 0)
         throw new InvalidOperationException("Heat:ExpectedCrawlerIds must list every required crawler when heat is enabled");
     heatOptions.ValidateExpectedCrawlerSecrets();
+    heatOptions.ValidateDailyActorSecretIsolation();
     if (!string.Equals(heatOptions.IndexUid, "torrents", StringComparison.Ordinal))
         throw new InvalidOperationException("Heat:IndexUid must be 'torrents' for the current thin search index");
 }
 builder.Services.AddSingleton(heatOptions);
 builder.Services.AddSingleton<HeatRuntimeMetrics>();
 builder.Services.AddSingleton<HeatProjectionStatusCache>();
+builder.Services.AddSingleton<HeatRollingStore>();
 builder.Services.AddSingleton<Cherry.Infrastructure.Search.SearchRecoveryCoordinator>();
 builder.Services.AddSingleton<HeatAccumulatorService>();
 if (heatOptions.Enabled)
@@ -94,7 +96,10 @@ if (!string.IsNullOrWhiteSpace(meiliUrl))
     builder.Services.AddHostedService<Cherry.Infrastructure.Search.SearchOutboxWorker>();
     builder.Services.AddScoped<Cherry.Infrastructure.Search.SearchRecoveryService>();
     if (heatOptions.Enabled)
+    {
         builder.Services.AddHostedService<HeatProjectionWorker>();
+        builder.Services.AddHostedService<HeatRollingProjectionWorker>();
+    }
 }
 builder.Services.AddSingleton<Cherry.Infrastructure.Search.SearchOutboxMetrics>();
 builder.Services.AddScoped<Cherry.Infrastructure.Search.SearchOutboxStore>();
@@ -227,9 +232,10 @@ if (!string.IsNullOrWhiteSpace(meiliUrl))
     if (recovered is not null)
     {
         app.Logger.LogWarning(
-            "Detected an empty Meilisearch index with a non-empty PostgreSQL catalog; queued {MetadataRows} metadata rows and heat rebuild={HeatRebuild}",
+            "Detected an empty Meilisearch index with a non-empty PostgreSQL catalog; queued {MetadataRows} metadata rows, daily heat rebuild={HeatRebuild}, rolling heat rebuild={RollingHeatRebuild}",
             recovered.MetadataRowsEnqueued,
-            recovered.HeatRebuildRequested);
+            recovered.HeatRebuildRequested,
+            recovered.RollingHeatRebuildRequested);
     }
 }
 
@@ -289,11 +295,15 @@ SearchOutboxEndpoints.Map(app);
 HeatEndpoints.Map(app);
 
 // Health check
-app.MapGet("/health", (IProcessedHashFilter processedHashFilter, HeatOptions heat, HeatRuntimeMetrics heatMetrics) => Results.Ok(new
+app.MapGet("/health", async (IProcessedHashFilter processedHashFilter, HeatOptions heat,
+    HeatRuntimeMetrics heatMetrics, HeatRollingStore rolling, CancellationToken cancellationToken) => Results.Ok(new
     {
         status = "healthy",
         processed_hash_fast_path_ready = processedHashFilter.IsReady,
         heat = heatMetrics.Snapshot(heat.Enabled),
+        rolling_heat_capacity = heat.Enabled
+            ? await rolling.GetCapacityStatusAsync(cancellationToken)
+            : null,
         time = DateTime.UtcNow
     }))
     .WithTags("Health");

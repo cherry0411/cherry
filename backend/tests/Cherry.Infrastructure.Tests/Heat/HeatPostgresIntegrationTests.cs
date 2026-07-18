@@ -22,7 +22,9 @@ public sealed class HeatPostgresIntegrationTests
         var fixture = await CreateFixtureAsync();
         if (fixture is null) return;
         await using var provider = fixture.Provider;
-        var day = RandomDay();
+        var observedAt = DateTime.UtcNow.AddHours(-1);
+        var day = DateOnly.FromDateTime(observedAt);
+        var observedHour = (byte)observedAt.Hour;
         var directory = Path.Combine(Path.GetTempPath(), $"cherry-heat-pg-{Guid.NewGuid():N}");
         var knownHash = HashFor(Guid.NewGuid());
         var unknownHash = HashFor(Guid.NewGuid());
@@ -33,6 +35,7 @@ public sealed class HeatPostgresIntegrationTests
         {
             Enabled = true,
             DataDirectory = directory,
+            DailyActorSecret = Convert.ToBase64String(Enumerable.Repeat((byte)11, 32).ToArray()),
             CoverageStartDay = day.ToString("yyyy-MM-dd"),
             ExpectedCrawlerIds = ["sg-crawler-01", "jp-crawler-01"],
             ChannelCapacity = 8,
@@ -45,14 +48,14 @@ public sealed class HeatPostgresIntegrationTests
         try
         {
             var first = new ChhtBatch(
-                "sg-crawler-01", day, 7, 1, 1,
+                "sg-crawler-01", day, observedHour, 7, 1, 1,
                 [
                     new ChhtHashGroup(Convert.FromHexString(knownHash), [1, 2]),
                     new ChhtHashGroup(Convert.FromHexString(unknownHash), [9])
                 ],
                 Enumerable.Repeat((byte)1, 32).ToArray());
             var second = new ChhtBatch(
-                "sg-crawler-01", day, 7, 2, 2,
+                "sg-crawler-01", day, observedHour, 7, 2, 2,
                 [new ChhtHashGroup(Convert.FromHexString(knownHash), [2, 3])],
                 Enumerable.Repeat((byte)2, 32).ToArray());
             Assert.Equal(HeatAcceptStatus.Accepted,
@@ -62,7 +65,7 @@ public sealed class HeatPostgresIntegrationTests
             // Both expected crawlers have receipts. Coverage must still remain
             // partial until each one explicitly commits an exact completion.
             var jpReceiptOnly = new ChhtBatch(
-                "jp-crawler-01", day, 8, 50, 50,
+                "jp-crawler-01", day, observedHour, 8, 50, 50,
                 [new ChhtHashGroup(Convert.FromHexString(knownHash), [1])],
                 Enumerable.Repeat((byte)3, 32).ToArray());
             Assert.Equal(HeatAcceptStatus.Accepted,
@@ -159,14 +162,12 @@ public sealed class HeatPostgresIntegrationTests
             await AdvanceToAsync(provider, worker, generation, recovered);
             var status = await ReadWatermarkAsync(provider, generation);
             Assert.Equal(5, status.Mask); // D and D-2 complete; D-1 explicitly partial.
-            Assert.Equal(2, HeatCoverage.Count(status.Mask, 30));
+            Assert.Equal(2, HeatCoverage.Count(status.Mask, 15));
 
-            Assert.Equal(3, documents.Count);
-            Assert.Contains("\"heat1d\":5", documents[0]);
-            Assert.Contains("\"heat1d\":0", documents[1]);
-            Assert.Contains("\"heat7d\":5", documents[1]);
-            Assert.Contains("\"heat1d\":2", documents[2]);
-            Assert.Contains("\"heat7d\":7", documents[2]);
+            Assert.Equal(2, documents.Count);
+            Assert.Contains("\"heat3d\":5", documents[0]);
+            Assert.Contains("\"heat3d\":7", documents[1]);
+            Assert.Contains("\"heat7d\":7", documents[1]);
             Assert.DoesNotContain("999", string.Concat(documents));
 
             await using var scope = provider.CreateAsyncScope();
@@ -183,18 +184,18 @@ public sealed class HeatPostgresIntegrationTests
                 heatStatusCache: new HeatProjectionStatusCache());
             var (_, _, asOf, sevenDayCoverage) =
                 await repository.SearchAsync("", "7d", 1, 20);
-            Assert.Equal(recovered, asOf);
-            Assert.Equal(2, sevenDayCoverage);
+            Assert.Equal(recovered.AddDays(1).ToDateTime(TimeOnly.MinValue, DateTimeKind.Utc), asOf);
+            Assert.Equal(48, sevenDayCoverage);
 
-            await SetCoverageMaskAsync(provider, generation, (1 << 29) | 1);
+            await SetCoverageMaskAsync(provider, generation, (1 << 14) | 1);
             var highMaskRepository = new TorrentRepository(
                 db,
                 new MeiliSearchClient(searchClient),
                 heatOptions: options,
                 heatStatusCache: new HeatProjectionStatusCache());
-            var (_, _, _, thirtyDayCoverage) =
-                await highMaskRepository.SearchAsync("", "30d", 1, 20);
-            Assert.Equal(2, thirtyDayCoverage); // Exercises PostgreSQL integer/GetInt32 and D-29.
+            var (_, _, _, fifteenDayCoverage) =
+                await highMaskRepository.SearchAsync("", "15d", 1, 20);
+            Assert.Equal(48, fifteenDayCoverage); // Exercises PostgreSQL integer/GetInt32 and D-14.
         }
         finally
         {
@@ -210,7 +211,7 @@ public sealed class HeatPostgresIntegrationTests
         if (fixture is null) return;
         await using var provider = fixture.Provider;
         var target = RandomDay();
-        var old = target.AddDays(-31);
+        var old = target.AddDays(-16);
         var generation = $"heat-task-{Guid.NewGuid():N}";
         var torrentId = await InsertTorrentAsync(provider, HashFor(Guid.NewGuid()));
         await DeleteDaysAsync(provider, [old, target]);
@@ -314,10 +315,10 @@ public sealed class HeatPostgresIntegrationTests
 
             var status = await ReadWatermarkAsync(provider, generation);
             Assert.Equal(target, status.Day);
-            Assert.Equal(30, HeatCoverage.Count(status.Mask, 30));
+            Assert.Equal(15, HeatCoverage.Count(status.Mask, 15));
             var payload = Assert.Single(documents);
             Assert.Contains($"\"id\":{torrentId}", payload);
-            Assert.Contains("\"heat1d\":9", payload);
+            Assert.Contains("\"heat3d\":9", payload);
         }
         finally
         {
@@ -564,7 +565,7 @@ public sealed class HeatPostgresIntegrationTests
     }
 
     private static DateOnly RandomDay() =>
-        new DateOnly(2200, 1, 1).AddDays(Random.Shared.Next(0, 40_000));
+        DateOnly.FromDateTime(DateTime.UtcNow).AddDays(-Random.Shared.Next(60, 7_000));
 
     private static string HashFor(Guid value) =>
         Convert.ToHexString(System.Security.Cryptography.SHA1.HashData(value.ToByteArray()))

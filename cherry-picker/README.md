@@ -86,11 +86,11 @@ responses, announces, sampling and active outbound lookups never feed it.
 Private, local, reserved and configured crawler addresses are rejected. Public
 IPv4 addresses retain the complete address for pseudonymization; public IPv6
 addresses are reduced to `/64`. The source address is immediately converted to
-a UTC-day-scoped 64-bit HMAC actor and is never written to disk or exported.
+a stable rolling 64-bit HMAC actor and is never written to disk or exported.
 Ports, node IDs and regions are not collected.
 
 - `CHERRY_PICKER_HEAT_ENABLED`: enable the channel; default `false`.
-- `CHERRY_PICKER_HEAT_ENDPOINT`: HTTPS CHHT v1 ingestion endpoint. Plain HTTP is accepted only for loopback tests.
+- `CHERRY_PICKER_HEAT_ENDPOINT`: HTTPS CHHT v2 ingestion endpoint. Plain HTTP is accepted only for loopback tests.
 - `CHERRY_PICKER_HEAT_CRAWLER_ID`: stable 1-64 byte receipt identity using ASCII letters, digits, `.`, `_` or `-`.
 - `CHERRY_PICKER_HEAT_MASTER_SECRET_FILE`: shared actor-pseudonym master secret file.
 - `CHERRY_PICKER_HEAT_HMAC_SECRET_FILE`: raw CHHT HMAC signing secret file.
@@ -109,16 +109,16 @@ raw transport key; every expected crawler must have a different key. The
 legacy single `Heat__SharedSecret` remains only for tests/migration and does not
 satisfy production startup validation. The Base64 text itself is not the HMAC
 key. Transport keys only derive `X-CHHT-Signature` and are never sent. The actor
-master secret is shared across regions so actor-day identities deduplicate, but
+master secret is shared across regions so rolling identities deduplicate, but
 it is separate from every transport key and never reaches storage.
 
-The compact body starts with `CHHT`, version 1 and the UTC day, followed by
+The compact body starts with `CHHT`, version 2, the UTC day and UTC hour, followed by
 strictly sorted raw 20-byte infohash groups and sorted unique big-endian
 64-bit actors. Delivery sends decimal `X-CHHT-Epoch`, `X-CHHT-Sequence` and
 `X-CHHT-End-Sequence`, plus lowercase SHA-256 and HMAC headers. The HMAC input
-is exactly `CHHT/1\n{crawler}\n{epoch}\n{start}\n{end}\n{payloadSha256}\n`
+is exactly `CHHT/2\n{crawler}\n{epoch}\n{start}\n{end}\n{payloadSha256}\n`
 followed by the raw request body. The interoperable fixed vector is
-`internal/heat/testdata/chht_v1_golden.json`.
+`internal/heat/testdata/chht_v2_golden.json`.
 
 At a proven UTC boundary the crawler also sends an empty-body
 `POST /api/v1/heat/completions`. Its signature input is exactly
@@ -148,6 +148,15 @@ segments are reclaimed during continuous production. Metadata delivery, its
 spool, and the experiment oracle remain independent. The crash/directory-sync
 guarantees target Linux; Windows support is for development and cannot provide
 the same power-loss directory semantics.
+
+CHHT v1 heat spool bytes are not wire-compatible with v2. Before deploying this
+unit, install `scripts/preflight-heat-spool-v2.sh` beside the binary and run its
+default `--check` mode while the service is stopped. An absent/empty spool is
+safe for this first deployment. v1, mixed, or unknown headers stop deployment
+without deletion. After explicit review, `--archive-v1` atomically renames an
+all-v1 directory and creates an empty v2 directory; it never imports or silently
+counts old observations. The checked-in metadata systemd unit executes this
+gate for `/var/lib/cherry-picker/heat` before every start.
 
 The crawler's `heat.completion.json` is a small fsync/rename ledger bound to the
 spool epoch. A writer barrier prevents a new UTC day from overtaking earlier

@@ -79,7 +79,19 @@ if [[ -n "$("${COMPOSE[@]}" ps --status running -q api)" ]]; then
   api_was_running=1
   "${COMPOSE[@]}" stop -t 30 api
 fi
-ZSTD_CLEVEL=1 tar --zstd -C "${DATA_ROOT}/api" -cpf "${stage}/heat.tar.zst" heat
+# The rolling database contains a stable 64-bit actor token for at most 24h.
+# It is deliberately disposable and must never become long-lived through a
+# backup. Daily files contain only storage-side day-repseudonymized actors.
+ZSTD_CLEVEL=1 tar --zstd -C "${DATA_ROOT}/api" \
+  --exclude='heat/heat-rolling-24h.sqlite3' \
+  --exclude='heat/heat-rolling-24h.sqlite3-*' \
+  -cpf "${stage}/heat.tar.zst" heat
+# Do not use grep -q under pipefail here: an early match can SIGPIPE tar and
+# turn the true branch into status 141, silently bypassing this privacy gate.
+if tar --zstd -tf "${stage}/heat.tar.zst" | grep 'heat-rolling-24h\.sqlite3' >/dev/null; then
+  echo "privacy gate failed: rolling actor database entered heat backup" >&2
+  exit 1
+fi
 if [[ "${api_was_running}" -eq 1 ]]; then
   "${COMPOSE[@]}" start api >/dev/null
   api_was_running=0
@@ -98,10 +110,15 @@ heat_snapshot_at="$(date -u +%FT%TZ)"
 ZSTD_CLEVEL=1 tar --zstd -C "${pg_plain}" -cpf "${stage}/postgres.tar.zst" .
 rm -rf -- "${pg_plain}"
 
-# Credentials are required for a complete recovery. They are safe here only
-# because the hard-gated destination is an independently configured crypt remote.
+# Restore credentials remain encrypted off-host. Archive an explicit allowlist:
+# storage .env includes the daily re-HMAC key needed to continue an in-progress
+# daily SQLite source without double counting, but not the crawler-only actor
+# master. Without that master or rolling DB, daily pseudonyms cannot be linked
+# back to stable rolling actors or source IPs.
 ZSTD_CLEVEL=1 tar --zstd -cpf "${stage}/secrets.tar.zst" \
-  -C "${REPO_DIR}/deploy/storage" .env -C /etc cherry-secrets cherry-backup.env
+  -C "${REPO_DIR}/deploy/storage" .env -C /etc cherry-backup.env
+tar --zstd -tf "${stage}/secrets.tar.zst" | \
+  /usr/local/sbin/cherry-storage-secret-privacy-gate
 pg_lsn="$("${COMPOSE[@]}" exec -T postgres psql -U "${POSTGRES_USER}" -d "${POSTGRES_DB}" -Atc 'SELECT pg_current_wal_lsn()')"
 cat >"${stage}/backup.meta" <<EOF
 format=cherry-storage-backup-v1

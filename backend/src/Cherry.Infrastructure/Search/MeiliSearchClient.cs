@@ -39,7 +39,7 @@ public class MeiliSearchClient
         var settings = JsonSerializer.Serialize(new
         {
             searchableAttributes = new[] { "name" },
-            sortableAttributes = new[] { "firstSeen", "heat1d", "heat7d", "heat15d", "heat30d" },
+            sortableAttributes = new[] { "firstSeen", "heat24h", "heat3d", "heat7d", "heat15d" },
             filterableAttributes = Array.Empty<string>(),
             rankingRules = new[] { "words", "typo", "proximity", "attribute", "exactness", "sort" },
             typoTolerance = new
@@ -175,22 +175,21 @@ public class MeiliSearchClient
         return new MeiliTaskState(status, error);
     }
 
-    public async Task<long> SubmitHeatDocumentsAsync(
-        IReadOnlyCollection<Cherry.Infrastructure.Heat.HeatProjectionDocument> documents,
+    public async Task<long> SubmitDailyHeatDocumentsAsync(
+        IReadOnlyCollection<Cherry.Infrastructure.Heat.DailyHeatProjectionDocument> documents,
         string indexUid,
         CancellationToken ct)
     {
         if (documents.Any(document =>
-                document.Id < 0 || document.Heat1d < 0 || document.Heat7d < 0 ||
-                document.Heat15d < 0 || document.Heat30d < 0))
+                document.Id < 0 || document.Heat3d < 0 || document.Heat7d < 0 ||
+                document.Heat15d < 0))
             throw new InvalidDataException("Heat projection documents cannot contain negative values");
         var body = JsonSerializer.Serialize(documents.Select(document => new
         {
             id = document.Id,
-            heat1d = document.Heat1d,
+            heat3d = document.Heat3d,
             heat7d = document.Heat7d,
-            heat15d = document.Heat15d,
-            heat30d = document.Heat30d
+            heat15d = document.Heat15d
         }));
         using var request = new HttpRequestMessage(HttpMethod.Put, $"/indexes/{indexUid}/documents")
         {
@@ -206,6 +205,33 @@ public class MeiliSearchClient
         throw new InvalidOperationException("Meilisearch heat response omitted taskUid");
     }
 
+    public async Task<long> SubmitHourlyHeatDocumentsAsync(
+        IReadOnlyCollection<Cherry.Infrastructure.Heat.HourlyHeatProjectionDocument> documents,
+        string indexUid,
+        CancellationToken ct)
+    {
+        if (documents.Any(document => document.Id < 0 || document.Heat24h < 0))
+            throw new InvalidDataException("Hourly heat projection documents cannot contain negative values");
+        var body = JsonSerializer.Serialize(documents.Select(document => new
+        {
+            id = document.Id,
+            heat24h = document.Heat24h
+        }));
+        using var request = new HttpRequestMessage(HttpMethod.Put, $"/indexes/{indexUid}/documents")
+        {
+            Content = new StringContent(body, Encoding.UTF8, "application/json")
+        };
+        using var response = await _http.SendAsync(request, ct);
+        var responseBody = await response.Content.ReadAsStringAsync(ct);
+        if (!response.IsSuccessStatusCode)
+            throw new HttpRequestException(
+                $"Meilisearch hourly heat submission returned {(int)response.StatusCode}: {Bound(responseBody)}");
+        using var json = JsonDocument.Parse(responseBody);
+        if (json.RootElement.TryGetProperty("taskUid", out var uid) && uid.TryGetInt64(out var value))
+            return value;
+        throw new InvalidOperationException("Meilisearch hourly heat response omitted taskUid");
+    }
+
     public async Task<MeiliSearchResult> SearchAsync(
         string query, string heatWindow, int page, int pageSize, CancellationToken ct)
     {
@@ -215,7 +241,7 @@ public class MeiliSearchClient
             offset = (page - 1) * pageSize,
             limit = pageSize,
             sort = new[] { $"heat{heatWindow}:desc", "firstSeen:desc" },
-            attributesToRetrieve = new[] { "id", "heat1d", "heat7d", "heat15d", "heat30d" },
+            attributesToRetrieve = new[] { "id", "heat24h", "heat3d", "heat7d", "heat15d" },
             matchingStrategy = string.IsNullOrWhiteSpace(query)
                 ? "last"
                 : SearchHelper.IsCjkQuery(query) ? "all" : "last"
@@ -273,10 +299,10 @@ public class MeiliHit
 {
     [JsonPropertyName("id")]
     public long Id { get; set; }
-    [JsonPropertyName("heat1d")] public long Heat1d { get; set; }
+    [JsonPropertyName("heat24h")] public long Heat24h { get; set; }
+    [JsonPropertyName("heat3d")] public long Heat3d { get; set; }
     [JsonPropertyName("heat7d")] public long Heat7d { get; set; }
     [JsonPropertyName("heat15d")] public long Heat15d { get; set; }
-    [JsonPropertyName("heat30d")] public long Heat30d { get; set; }
 }
 
 public static class SearchHelper

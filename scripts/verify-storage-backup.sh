@@ -23,7 +23,11 @@ install -d -m 0700 "${drill}/download" "${drill}/postgres"
   cd "${drill}/download"
   sha256sum -c SHA256SUMS
   tar --zstd -tf heat.tar.zst >/dev/null
-  tar --zstd -tf secrets.tar.zst >/dev/null
+  if tar --zstd -tf heat.tar.zst | grep 'heat-rolling-24h\.sqlite3' >/dev/null; then
+    echo "privacy gate failed: rolling actor database exists in backup" >&2
+    exit 1
+  fi
+  tar --zstd -tf secrets.tar.zst | /usr/local/sbin/cherry-storage-secret-privacy-gate
 )
 tar --zstd -C "${drill}/postgres" -xpf "${drill}/download/postgres.tar.zst"
 docker run --rm --network none --entrypoint pg_verifybackup \

@@ -17,7 +17,7 @@ import (
 )
 
 const (
-	spoolVersion        = byte(1)
+	spoolVersion        = byte(2)
 	spoolHeaderSize     = int64(32)
 	spoolPayloadSize    = 32
 	spoolFrameSize      = int64(4 + spoolPayloadSize + 4)
@@ -31,6 +31,7 @@ var (
 	cursorMagic     = [4]byte{'C', 'H', 'H', 'C'}
 	ErrAtCapacity   = errors.New("heat: spool at capacity")
 	ErrCorruptSpool = errors.New("heat: corrupt spool")
+	ErrLegacySpool  = errors.New("heat: CHHT v1 spool requires controlled archival before v2 startup")
 )
 
 type spoolOptions struct {
@@ -258,6 +259,9 @@ func openSegment(dir string, id uint64, allowTornTail bool) (*heatSegment, uint6
 		return fail(err)
 	}
 	epoch, headerID, base, err := decodeSegmentHeader(header)
+	if errors.Is(err, ErrLegacySpool) {
+		return fail(fmt.Errorf("%w: run preflight-heat-spool-v2.sh on %s", err, dir))
+	}
 	if err != nil || headerID != id {
 		return fail(fmt.Errorf("%w: invalid segment header", ErrCorruptSpool))
 	}
@@ -384,7 +388,10 @@ func (s *heatSpool) appendDurable(observations []Observation) error {
 	buf := make([]byte, 0, bytesNeeded)
 	for _, obs := range observations {
 		var payload [spoolPayloadSize]byte
-		binary.BigEndian.PutUint32(payload[:4], obs.Day)
+		if obs.Hour > 23 || obs.Day > (^uint32(0)>>5) {
+			return errors.New("heat: observation UTC bucket is outside spool bounds")
+		}
+		binary.BigEndian.PutUint32(payload[:4], obs.Day<<5|uint32(obs.Hour))
 		copy(payload[4:24], obs.InfoHash[:])
 		binary.BigEndian.PutUint64(payload[24:32], obs.Actor)
 		buf = binary.BigEndian.AppendUint32(buf, spoolPayloadSize)
@@ -443,18 +450,24 @@ func (s *heatSpool) readBatch(maxRecords int) (spoolBatch, error) {
 	offset := s.cursorOffset
 	frame := make([]byte, spoolFrameSize)
 	var firstDay uint32
+	var firstHour uint8
 	for len(result.Observations) < maxRecords && offset+spoolFrameSize <= segment.size {
 		if _, err := segment.file.ReadAt(frame, offset); err != nil {
 			return spoolBatch{}, err
 		}
 		payload := frame[4 : 4+spoolPayloadSize]
 		var obs Observation
-		obs.Day = binary.BigEndian.Uint32(payload[:4])
+		bucket := binary.BigEndian.Uint32(payload[:4])
+		obs.Day = bucket >> 5
+		obs.Hour = uint8(bucket & 31)
+		if obs.Day == 0 || obs.Hour > 23 {
+			return spoolBatch{}, fmt.Errorf("%w: invalid observation UTC bucket", ErrCorruptSpool)
+		}
 		copy(obs.InfoHash[:], payload[4:24])
 		obs.Actor = binary.BigEndian.Uint64(payload[24:32])
 		if len(result.Observations) == 0 {
-			firstDay = obs.Day
-		} else if obs.Day != firstDay {
+			firstDay, firstHour = obs.Day, obs.Hour
+		} else if obs.Day != firstDay || obs.Hour != firstHour {
 			break
 		}
 		result.Observations = append(result.Observations, obs)
@@ -579,6 +592,9 @@ func readCursor(path string) (spoolCursor, bool, error) {
 	if err != nil {
 		return spoolCursor{}, false, fmt.Errorf("heat: read cursor: %w", err)
 	}
+	if len(data) >= 5 && bytes.Equal(data[:4], cursorMagic[:]) && data[4] == 1 {
+		return spoolCursor{}, false, fmt.Errorf("%w: legacy cursor %s", ErrLegacySpool, path)
+	}
 	if len(data) != cursorSize || !bytes.Equal(data[:4], cursorMagic[:]) || data[4] != spoolVersion ||
 		!bytes.Equal(data[5:8], []byte{0, 0, 0}) ||
 		binary.BigEndian.Uint32(data[32:36]) != crc32.ChecksumIEEE(data[:32]) {
@@ -605,6 +621,9 @@ func encodeSegmentHeader(epoch, id, baseSequence uint64) []byte {
 }
 
 func decodeSegmentHeader(header []byte) (epoch, id, base uint64, err error) {
+	if len(header) >= 5 && bytes.Equal(header[:4], spoolMagic[:]) && header[4] == 1 {
+		return 0, 0, 0, ErrLegacySpool
+	}
 	if len(header) != int(spoolHeaderSize) || !bytes.Equal(header[:4], spoolMagic[:]) ||
 		header[4] != spoolVersion || !bytes.Equal(header[5:8], []byte{0, 0, 0}) {
 		return 0, 0, 0, errors.New("invalid segment header")

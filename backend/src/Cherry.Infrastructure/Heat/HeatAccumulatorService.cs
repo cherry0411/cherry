@@ -1,4 +1,5 @@
 using System.Buffers.Binary;
+using System.Security.Cryptography;
 using System.Threading.Channels;
 using Microsoft.Data.Sqlite;
 using Microsoft.Extensions.Hosting;
@@ -41,6 +42,7 @@ public sealed class HeatAccumulatorService : BackgroundService
     private readonly HeatOptions _options;
     private readonly HeatRuntimeMetrics _metrics;
     private readonly ILogger<HeatAccumulatorService> _logger;
+    private readonly HeatRollingStore _rolling;
     private readonly Channel<HeatAccumulatorCommand> _channel;
     private readonly HashSet<DateOnly> _sealingDays = [];
     private readonly object _gate = new();
@@ -48,11 +50,13 @@ public sealed class HeatAccumulatorService : BackgroundService
     public HeatAccumulatorService(
         HeatOptions options,
         HeatRuntimeMetrics metrics,
-        ILogger<HeatAccumulatorService> logger)
+        ILogger<HeatAccumulatorService> logger,
+        HeatRollingStore? rolling = null)
     {
         _options = options;
         _metrics = metrics;
         _logger = logger;
+        _rolling = rolling ?? new HeatRollingStore(options);
         _channel = Channel.CreateBounded<HeatAccumulatorCommand>(new BoundedChannelOptions(options.ChannelCapacity)
         {
             SingleReader = true,
@@ -214,6 +218,10 @@ public sealed class HeatAccumulatorService : BackgroundService
     {
         try
         {
+            // Expire and reclaim first, then enforce the rolling-store and
+            // filesystem watermarks before the daily authority is extended.
+            // A rejected batch receives no durable ACK and is safe to retry.
+            await _rolling.PrepareForIngestAsync(stoppingToken);
             await using var connection = await OpenAsync(PathForDay(commands[0].Batch.Day), stoppingToken);
             await using var transaction =
                 (SqliteTransaction)await connection.BeginTransactionAsync(stoppingToken);
@@ -223,6 +231,15 @@ public sealed class HeatAccumulatorService : BackgroundService
 
             // synchronous=FULL makes this group commit the durable ACK boundary.
             await transaction.CommitAsync(stoppingToken);
+            // The crawler is ACKed only after both authorities are durable.
+            // A crash between commits yields a daily receipt replay; replaying
+            // the idempotent MAX(last_seen_hour) upsert closes that gap.
+            await _rolling.ApplyAsync(
+                commands.Select((command, index) => (command, results[index]))
+                    .Where(pair => pair.Item2.Status is HeatAcceptStatus.Accepted or HeatAcceptStatus.Replay)
+                    .Select(pair => pair.command.Batch)
+                    .ToArray(),
+                stoppingToken);
             _metrics.ClearFailure();
             for (var index = 0; index < commands.Count; index++)
             {
@@ -244,11 +261,13 @@ public sealed class HeatAccumulatorService : BackgroundService
                     command.Batch.RecordCount,
                     0,
                     command.Batch.Sequence,
-                    IsStorageFailure(exception) ? "Heat storage unavailable" : "Heat commit failed"));
+                    exception is HeatRollingCapacityException
+                        ? "Heat storage capacity exhausted"
+                        : IsStorageFailure(exception) ? "Heat storage unavailable" : "Heat commit failed"));
         }
     }
 
-    private static async Task<HeatAcceptResult> PersistAsync(
+    private async Task<HeatAcceptResult> PersistAsync(
         SqliteConnection connection,
         SqliteTransaction transaction,
         ChhtBatch batch,
@@ -257,6 +276,7 @@ public sealed class HeatAccumulatorService : BackgroundService
         var epoch = UInt64Bytes(batch.Epoch);
         var start = UInt64Bytes(batch.Sequence);
         var end = UInt64Bytes(batch.EndSequence);
+        var dailyActorKey = DeriveDailyActorKey(_options.DecodeDailyActorSecret(), batch.Day);
 
         await using (var replay = connection.CreateCommand())
         {
@@ -316,7 +336,8 @@ public sealed class HeatAccumulatorService : BackgroundService
         var findHashParameter = findHash.Parameters.Add("$hash", SqliteType.Blob);
         await using var insertSeen = connection.CreateCommand();
         insertSeen.Transaction = transaction;
-        insertSeen.CommandText = "INSERT OR IGNORE INTO seen(hash_id, actor) VALUES ($hash_id, $actor)";
+        insertSeen.CommandText =
+            "INSERT OR IGNORE INTO seen(hash_id,actor) VALUES($hash_id,$actor)";
         var seenHashParameter = insertSeen.Parameters.Add("$hash_id", SqliteType.Integer);
         var seenActorParameter = insertSeen.Parameters.Add("$actor", SqliteType.Integer);
 
@@ -330,7 +351,7 @@ public sealed class HeatAccumulatorService : BackgroundService
             seenHashParameter.Value = hashId;
             foreach (var actor in group.ActorFingerprints)
             {
-                seenActorParameter.Value = actor;
+                seenActorParameter.Value = DailyActorFingerprint(dailyActorKey, actor);
                 insertedCount += await insertSeen.ExecuteNonQueryAsync(cancellationToken);
             }
         }
@@ -516,6 +537,23 @@ public sealed class HeatAccumulatorService : BackgroundService
         var bytes = new byte[8];
         BinaryPrimitives.WriteUInt64BigEndian(bytes, value);
         return bytes;
+    }
+
+    private static byte[] DeriveDailyActorKey(ReadOnlySpan<byte> secret, DateOnly day)
+    {
+        Span<byte> context = stackalloc byte["cherry/heat/storage-day/v2\0"u8.Length + 4];
+        "cherry/heat/storage-day/v2\0"u8.CopyTo(context);
+        BinaryPrimitives.WriteInt32BigEndian(context[^4..], day.DayNumber);
+        return HMACSHA256.HashData(secret, context);
+    }
+
+    private static long DailyActorFingerprint(ReadOnlySpan<byte> dailyKey, long rollingActor)
+    {
+        Span<byte> actor = stackalloc byte[8];
+        Span<byte> digest = stackalloc byte[32];
+        BinaryPrimitives.WriteUInt64BigEndian(actor, unchecked((ulong)rollingActor));
+        HMACSHA256.HashData(dailyKey, actor, digest);
+        return unchecked((long)BinaryPrimitives.ReadUInt64BigEndian(digest));
     }
 
     private static ulong ReadUInt64(byte[] value)

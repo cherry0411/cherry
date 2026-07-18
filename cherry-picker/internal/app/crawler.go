@@ -418,7 +418,7 @@ func (a *Application) Run(ctx context.Context) error {
 				}
 			}
 		}()
-		a.logger.Printf("inbound get_peers heat enabled: endpoint=%s spool=%s queue=%d batch=%d max_bytes=%d wire=CHHT/1",
+		a.logger.Printf("inbound get_peers heat enabled: endpoint=%s spool=%s queue=%d batch=%d max_bytes=%d wire=CHHT/2",
 			a.cfg.Heat.Endpoint, a.cfg.Heat.SpoolDir, a.cfg.Heat.QueueCapacity,
 			a.cfg.Heat.BatchSize, a.cfg.Heat.SpoolMaxBytes)
 	}

@@ -7,8 +7,8 @@ public record SearchResponse(
     long Total,
     int Page,
     int PageSize,
-    DateOnly? HeatAsOfDay,
-    int HeatCoverageDays
+    DateTime? HeatAsOfUtc,
+    int HeatCoverageHours
 );
 
 public record TorrentDto(
@@ -19,10 +19,10 @@ public record TorrentDto(
     int FileCount,
     DateTime CreatedAt,
     List<TorrentFileDto>? Files,
-    long Heat1d,
+    long Heat24h,
+    long Heat3d,
     long Heat7d,
-    long Heat15d,
-    long Heat30d
+    long Heat15d
 );
 
 public record TorrentFileDto(

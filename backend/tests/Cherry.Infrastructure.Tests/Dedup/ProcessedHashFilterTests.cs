@@ -217,7 +217,7 @@ public sealed class ProcessedHashFilterTests
         public Task<Torrent?> GetByInfoHashAsync(string infoHash, CancellationToken ct = default) =>
             throw new NotSupportedException();
 
-        public Task<(List<Torrent> Items, long Total, DateOnly? HeatAsOfDay, int HeatCoverageDays)> SearchAsync(
+        public Task<(List<Torrent> Items, long Total, DateTime? HeatAsOfUtc, int HeatCoverageHours)> SearchAsync(
             string query,
             string heatWindow,
             int page,

@@ -562,7 +562,8 @@ func (c *Collector) runExporter() {
 			}
 			continue
 		}
-		wireBatch, err := BuildWireBatch(batch.Observations[0].Day, batch.Observations)
+		wireBatch, err := BuildWireBatch(
+			batch.Observations[0].Day, batch.Observations[0].Hour, batch.Observations)
 		if err != nil {
 			c.spoolFatalErrors.Add(1)
 			c.report(err)
@@ -784,7 +785,7 @@ func (c *Collector) send(payload []byte, receipt deliveryReceipt) (deliveryOutco
 	if err != nil {
 		return deliveryAccepted, err
 	}
-	req.Header.Set("Content-Type", "application/vnd.cherry.heat-v1")
+	req.Header.Set("Content-Type", "application/vnd.cherry.heat-v2")
 	req.Header.Set("X-CHHT-Crawler", receipt.Crawler)
 	req.Header.Set("X-CHHT-Epoch", strconv.FormatUint(receipt.Epoch, 10))
 	req.Header.Set("X-CHHT-Sequence", strconv.FormatUint(receipt.StartSequence, 10))
@@ -826,7 +827,7 @@ type deliveryReceipt struct {
 func buildDeliveryReceipt(crawlerID, hmacSecret string, batch spoolBatch, payload []byte) deliveryReceipt {
 	digest := sha256.Sum256(payload)
 	digestHex := hex.EncodeToString(digest[:])
-	prefix := fmt.Sprintf("CHHT/1\n%s\n%d\n%d\n%d\n%s\n",
+	prefix := fmt.Sprintf("CHHT/2\n%s\n%d\n%d\n%d\n%s\n",
 		crawlerID, batch.Epoch, batch.StartSequence, batch.EndSequence, digestHex)
 	mac := hmac.New(sha256.New, []byte(hmacSecret))
 	_, _ = mac.Write([]byte(prefix))

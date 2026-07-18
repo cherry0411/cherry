@@ -10,6 +10,7 @@ public sealed record ChhtHashGroup(byte[] InfoHash, IReadOnlyList<long> ActorFin
 public sealed record ChhtBatch(
     string CrawlerId,
     DateOnly Day,
+    byte Hour,
     ulong Epoch,
     ulong Sequence,
     ulong EndSequence,
@@ -27,7 +28,7 @@ public sealed record ChhtCompletion(
     ulong NextSequence,
     bool Clean);
 
-public enum ChhtProtocolError { Malformed, Authentication, Expired }
+public enum ChhtProtocolError { Malformed, Authentication, Expired, Future }
 public sealed record ChhtClosedReceipt(
     string Crawler,
     DateOnly Day,
@@ -54,18 +55,19 @@ public sealed class ChhtProtocolException(
     public ChhtClosedCompletion? ClosedCompletion { get; } = closedCompletion;
 }
 
-public static partial class ChhtV1Protocol
+public static partial class ChhtProtocol
 {
-    public const string MediaType = "application/vnd.cherry.heat-v1";
+    public const string MediaType = "application/vnd.cherry.heat-v2";
     public const string CompletionMediaType = "application/vnd.cherry.heat-completion-v1";
-    public const int HeaderBytes = 9;
+    public const int HeaderBytes = 10;
     private static readonly byte[] Magic = "CHHT"u8.ToArray();
 
     [GeneratedRegex("^[A-Za-z0-9._-]{1,64}$", RegexOptions.CultureInvariant)]
     private static partial Regex CrawlerIdPattern();
 
-    // CHHT v1 wire is shared with the Go crawler:
-    // magic[4] | version[1] | unix UTC day u32be | group count canonical uvarint |
+    // CHHT v2 wire is shared with the Go crawler:
+    // magic[4] | version[1] | unix UTC day u32be | UTC hour u8 |
+    // group count canonical uvarint |
     // repeated strictly sorted (hash20 | actor count canonical uvarint |
     // strictly sorted unique actor u64be).
     public static ChhtBatch ParseAndAuthenticate(
@@ -86,7 +88,7 @@ public static partial class ChhtV1Protocol
             throw new ChhtProtocolException("Invalid CHHT epoch or sequence range");
         if (payload.Length < HeaderBytes + 1 || payload.Length > options.MaxRequestBytes)
             throw new ChhtProtocolException("CHHT payload size is outside configured bounds");
-        if (!payload[..4].SequenceEqual(Magic) || payload[4] != 1)
+        if (!payload[..4].SequenceEqual(Magic) || payload[4] != 2)
             throw new ChhtProtocolException("Invalid CHHT magic or version");
 
         var unixDay = BinaryPrimitives.ReadUInt32BigEndian(payload[5..9]);
@@ -99,6 +101,8 @@ public static partial class ChhtV1Protocol
         {
             throw new ChhtProtocolException("CHHT day is outside supported range");
         }
+        var hour = payload[9];
+        if (hour > 23) throw new ChhtProtocolException("CHHT UTC hour is outside supported range");
         var payloadDigest = SHA256.HashData(payload);
         ValidatePayloadDigest(payloadDigest, payloadSha256Hex);
         Authenticate(payload, crawlerId, epoch, sequence, endSequence, payloadSha256Hex, signatureHex, secret);
@@ -146,7 +150,16 @@ public static partial class ChhtV1Protocol
         if (offset != payload.Length)
             throw new ChhtProtocolException("CHHT payload has trailing bytes");
 
-        var batch = new ChhtBatch(crawlerId, day, epoch, sequence, endSequence, groups, payloadDigest);
+        var batch = new ChhtBatch(crawlerId, day, hour, epoch, sequence, endSequence, groups, payloadDigest);
+        var observedHour = new DateTimeOffset(day.ToDateTime(new TimeOnly(hour, 0), DateTimeKind.Utc))
+            .ToUnixTimeSeconds() / 3600;
+        var serverHour = new DateTimeOffset(
+            utcNow.Kind == DateTimeKind.Utc ? utcNow : utcNow.ToUniversalTime())
+            .ToUnixTimeSeconds() / 3600;
+        if (observedHour > serverHour)
+            throw new ChhtProtocolException(
+                "CHHT observation is from a future UTC hour; retry after clock convergence",
+                ChhtProtocolError.Future);
         if (!IsDayOpen(day, utcNow, options.LateGraceMinutes))
             throw new ChhtProtocolException(
                 "CHHT day is outside the open UTC window",
@@ -165,7 +178,7 @@ public static partial class ChhtV1Protocol
         ReadOnlySpan<byte> secret)
     {
         using var hmac = IncrementalHash.CreateHMAC(HashAlgorithmName.SHA256, secret);
-        var prefix = Encoding.UTF8.GetBytes($"CHHT/1\n{crawlerId}\n{epoch}\n{sequence}\n{endSequence}\n{payloadSha256Hex.ToLowerInvariant()}\n");
+        var prefix = Encoding.UTF8.GetBytes($"CHHT/2\n{crawlerId}\n{epoch}\n{sequence}\n{endSequence}\n{payloadSha256Hex.ToLowerInvariant()}\n");
         hmac.AppendData(prefix);
         hmac.AppendData(payload);
         return hmac.GetHashAndReset();
@@ -205,6 +218,11 @@ public static partial class ChhtV1Protocol
         if (!options.IsExpectedCrawler(crawlerId))
             throw new ChhtProtocolException("Invalid X-CHHT-Crawler authentication", ChhtProtocolError.Authentication);
         var completion = new ChhtCompletion(crawlerId, day, epoch, startSequence, nextSequence, true);
+        var normalizedNow = utcNow.Kind == DateTimeKind.Utc ? utcNow : utcNow.ToUniversalTime();
+        if (day >= DateOnly.FromDateTime(normalizedNow))
+            throw new ChhtProtocolException(
+                "CHHT completion day has not closed on the storage clock; retry later",
+                ChhtProtocolError.Future);
         if (!IsDayOpen(day, utcNow, options.LateGraceMinutes))
             throw new ChhtProtocolException(
                 "CHHT completion UTC day is closed",

@@ -84,7 +84,9 @@ async function main() {
             `Verified a fresh index with ${rebuild?.verifiedEmptyDocuments ?? 'unknown'} documents; ` +
             `enqueued ${enqueued ?? 'unknown'} metadata rows; ` +
             `heat rebuild=${Boolean(rebuild?.heatRebuildRequested)}` +
-            `${rebuild?.heatTargetDay ? ` target=${rebuild.heatTargetDay}` : ''}.`);
+            `${rebuild?.heatTargetDay ? ` target=${rebuild.heatTargetDay}` : ''}; ` +
+            `rolling heat rebuild=${Boolean(rebuild?.rollingHeatRebuildRequested)}` +
+            `${rebuild?.rollingTargetThroughUtc ? ` target=${rebuild.rollingTargetThroughUtc}` : ''}.`);
     } else {
         console.log(`Metadata refresh enqueued for ${enqueued ?? 'unknown'} catalog rows.`);
     }
@@ -94,6 +96,8 @@ async function main() {
     let lastLine = '';
     const heatRequested = recoverEmptyIndex && Boolean(rebuild?.heatRebuildRequested);
     const heatTargetDay = rebuild?.heatTargetDay || null;
+    const rollingRequested = recoverEmptyIndex && Boolean(rebuild?.rollingHeatRebuildRequested);
+    const rollingTarget = rebuild?.rollingTargetThroughUtc || null;
     while (true) {
         const status = await api('/api/v1/search/outbox/stats');
         const backlog = status?.backlog || {};
@@ -107,15 +111,22 @@ async function main() {
             heat.rebuildRequired === false &&
             heatPending === 0 &&
             (!heatTargetDay || heat.projectedThrough === heatTargetDay));
+        const rollingProjected = heat.rollingProjectedThroughUtc || null;
+        const rollingCaughtUp = !rollingRequested || (
+            heat.rollingRebuildRequired === false &&
+            rollingProjected &&
+            (!rollingTarget || Date.parse(rollingProjected) >= Date.parse(rollingTarget)));
         const line = recoverEmptyIndex
             ? `depth=${depth} due=${due} retrying=${retrying} ` +
               `heatTarget=${heat.projectedThrough || '-'} heatPending=${heatPending} heatRebuild=${String(heat.rebuildRequired)}`
+              + ` rollingTarget=${rollingProjected || '-'} rollingCoverage=${Number(heat.rollingCoverageHours || 0)}`
+              + ` rollingRebuild=${String(heat.rollingRebuildRequired)}`
             : `depth=${depth} due=${due} retrying=${retrying} oldest=${Number(backlog.oldestAgeSeconds || 0).toFixed(1)}s`;
         if (line !== lastLine) {
             console.log(line);
             lastLine = line;
         }
-        if (depth === 0 && heatCaughtUp) {
+        if (depth === 0 && heatCaughtUp && rollingCaughtUp) {
             if (!recoverEmptyIndex) {
                 console.log('Meilisearch metadata projection is caught up.');
                 return;

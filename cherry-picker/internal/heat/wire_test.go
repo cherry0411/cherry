@@ -14,12 +14,12 @@ func TestWireCanonicalSortDedupeAndRoundTrip(t *testing.T) {
 	low[19] = 1
 	high[0] = 1
 	observations := []Observation{
-		{Day: 20_654, InfoHash: high, Actor: 9},
-		{Day: 20_654, InfoHash: low, Actor: 3},
-		{Day: 20_654, InfoHash: low, Actor: 1},
-		{Day: 20_654, InfoHash: low, Actor: 3},
+		{Day: 20_654, Hour: 12, InfoHash: high, Actor: 9},
+		{Day: 20_654, Hour: 12, InfoHash: low, Actor: 3},
+		{Day: 20_654, Hour: 12, InfoHash: low, Actor: 1},
+		{Day: 20_654, Hour: 12, InfoHash: low, Actor: 3},
 	}
-	batch, err := BuildWireBatch(20_654, observations)
+	batch, err := BuildWireBatch(20_654, 12, observations)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -41,24 +41,24 @@ func TestWireCanonicalSortDedupeAndRoundTrip(t *testing.T) {
 }
 
 func TestDecodeWireRejectsNonCanonicalAndBoundaryViolations(t *testing.T) {
-	base := append([]byte{'C', 'H', 'H', 'T', 1, 0, 0, 0, 1}, 1)
+	base := append([]byte{'C', 'H', 'H', 'T', 2, 0, 0, 0, 1, 12}, 1)
 	base = append(base, make([]byte, 20)...)
 	base = append(base, 1)
 	base = binary.BigEndian.AppendUint64(base, 1)
 	cases := map[string][]byte{
 		"trailing":            append(append([]byte(nil), base...), 0),
-		"noncanonical groups": append(append([]byte(nil), base[:9]...), append([]byte{0x81, 0}, base[10:]...)...),
-		"zero actor count":    append(append([]byte(nil), base[:30]...), 0),
+		"noncanonical groups": append(append([]byte(nil), base[:10]...), append([]byte{0x81, 0}, base[11:]...)...),
+		"zero actor count":    append(append([]byte(nil), base[:31]...), 0),
 		"unsupported version": append([]byte(nil), base...),
 	}
-	cases["unsupported version"][4] = 2
+	cases["unsupported version"][4] = 1
 	for name, data := range cases {
 		if _, err := DecodeWire(data); err == nil {
 			t.Errorf("%s accepted", name)
 		}
 	}
 
-	duplicateActor := append([]byte{'C', 'H', 'H', 'T', 1, 0, 0, 0, 1, 1}, make([]byte, 20)...)
+	duplicateActor := append([]byte{'C', 'H', 'H', 'T', 2, 0, 0, 0, 1, 12, 1}, make([]byte, 20)...)
 	duplicateActor = append(duplicateActor, 2)
 	duplicateActor = binary.BigEndian.AppendUint64(duplicateActor, 7)
 	duplicateActor = binary.BigEndian.AppendUint64(duplicateActor, 7)
@@ -72,13 +72,14 @@ func TestWireRandomizedCanonicalRoundTrips(t *testing.T) {
 		rows := make([]Observation, 1+rand.IntN(300))
 		for idx := range rows {
 			rows[idx].Day = 20_654
+			rows[idx].Hour = 12
 			_, _ = cryptorand.Read(rows[idx].InfoHash[:])
 			rows[idx].Actor = rand.Uint64()
 			if idx > 0 && idx%7 == 0 {
 				rows[idx] = rows[idx-1]
 			}
 		}
-		batch, err := BuildWireBatch(20_654, rows)
+		batch, err := BuildWireBatch(20_654, 12, rows)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -105,12 +106,13 @@ func BenchmarkBuildAndEncodeWire(b *testing.B) {
 	rows := make([]Observation, 4096)
 	for idx := range rows {
 		rows[idx].Day = 20_654
+		rows[idx].Hour = 12
 		binary.BigEndian.PutUint64(rows[idx].InfoHash[12:], uint64(idx/4))
 		rows[idx].Actor = uint64(idx)
 	}
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		batch, err := BuildWireBatch(20_654, rows)
+		batch, err := BuildWireBatch(20_654, 12, rows)
 		if err != nil {
 			b.Fatal(err)
 		}

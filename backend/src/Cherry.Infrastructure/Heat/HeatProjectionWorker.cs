@@ -114,7 +114,8 @@ public sealed class HeatProjectionWorker : BackgroundService
             update.Parameters.AddWithValue("day", target.Value);
             update.Parameters.AddWithValue("mask", projectionCoverageMask);
             update.Parameters.AddWithValue("generation", _options.IndexGeneration);
-            update.Parameters.AddWithValue("gc", target.Value.AddDays(-30));
+            // Keep the outgoing 15-day boundary as a small recovery margin.
+            update.Parameters.AddWithValue("gc", target.Value.AddDays(-15));
             await update.ExecuteNonQueryAsync(cancellationToken);
             await transaction.CommitAsync(cancellationToken);
         }
@@ -127,7 +128,7 @@ public sealed class HeatProjectionWorker : BackgroundService
         DateOnly target,
         short shard,
         byte[] sourceDigest,
-        IReadOnlyList<HeatProjectionDocument> documents,
+        IReadOnlyList<DailyHeatProjectionDocument> documents,
         CancellationToken ct)
     {
         await using (var create = new NpgsqlCommand(
@@ -222,7 +223,7 @@ public sealed class HeatProjectionWorker : BackgroundService
         }
 
         var payloadDigest = ProjectionPayloadDigest(batch);
-        var taskUid = await _meili.SubmitHeatDocumentsAsync(batch, _options.IndexUid, ct);
+        var taskUid = await _meili.SubmitDailyHeatDocumentsAsync(batch, _options.IndexUid, ct);
         await using var pending = new NpgsqlCommand(
             """
             UPDATE heat_projection_tasks
@@ -248,7 +249,7 @@ public sealed class HeatProjectionWorker : BackgroundService
         CancellationToken ct)
     {
         var coverageStart = _options.ParsedCoverageStartDay!.Value;
-        var start = target.AddDays(-30);
+        var start = target.AddDays(-15);
         var manifests = new Dictionary<DateOnly, byte[]>();
         var frames = new Dictionary<DateOnly, IReadOnlyList<HeatFrameEntry>>();
         await using var command = new NpgsqlCommand(
@@ -289,7 +290,7 @@ public sealed class HeatProjectionWorker : BackgroundService
             digest.AppendData(pair.Value);
         }
         var coverageMask = 0;
-        for (var offset = 0; offset < 30; offset++)
+        for (var offset = 0; offset < 15; offset++)
             if (frames.ContainsKey(target.AddDays(-offset))) coverageMask |= 1 << offset;
         return new ProjectionSource(frames, digest.GetHashAndReset(), coverageMask);
     }
@@ -352,17 +353,16 @@ public sealed class HeatProjectionWorker : BackgroundService
         command.Parameters.AddWithValue("shard", shard);
     }
 
-    private static byte[] ProjectionPayloadDigest(IEnumerable<HeatProjectionDocument> documents)
+    private static byte[] ProjectionPayloadDigest(IEnumerable<DailyHeatProjectionDocument> documents)
     {
         using var digest = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
-        Span<byte> row = stackalloc byte[40];
+        Span<byte> row = stackalloc byte[32];
         foreach (var document in documents)
         {
             BinaryPrimitives.WriteInt64BigEndian(row[0..8], document.Id);
-            BinaryPrimitives.WriteInt64BigEndian(row[8..16], document.Heat1d);
+            BinaryPrimitives.WriteInt64BigEndian(row[8..16], document.Heat3d);
             BinaryPrimitives.WriteInt64BigEndian(row[16..24], document.Heat7d);
             BinaryPrimitives.WriteInt64BigEndian(row[24..32], document.Heat15d);
-            BinaryPrimitives.WriteInt64BigEndian(row[32..40], document.Heat30d);
             digest.AppendData(row);
         }
         return digest.GetHashAndReset();
@@ -378,7 +378,7 @@ public static class HeatCoverage
 {
     public static int Count(int mask, int windowDays)
     {
-        if (windowDays is not (1 or 7 or 15 or 30))
+        if (windowDays is not (1 or 3 or 7 or 15))
             throw new ArgumentOutOfRangeException(nameof(windowDays));
         var selected = mask & ((1 << windowDays) - 1);
         return System.Numerics.BitOperations.PopCount((uint)selected);
