@@ -220,3 +220,24 @@ func TestAutoTuneControllerWaitsBeforeResume(t *testing.T) {
 		t.Fatalf("resume action = %v, want resume", action)
 	}
 }
+
+func TestDurableMetadataEndpointUpgradesLegacyBatchURL(t *testing.T) {
+	tests := map[string]string{
+		"https://storage.example/api/v1/torrents/batch":         "https://storage.example/api/v1/torrents/batch/durable",
+		"https://storage.example/api/v1/torrents/batch/":        "https://storage.example/api/v1/torrents/batch/durable",
+		"https://storage.example/api/v1/torrents/batch/durable": "https://storage.example/api/v1/torrents/batch/durable",
+		"https://storage.example/custom-ingest":                 "https://storage.example/custom-ingest",
+	}
+	for input, want := range tests {
+		if got := durableMetadataEndpoint(input); got != want {
+			t.Errorf("durableMetadataEndpoint(%q)=%q, want %q", input, got, want)
+		}
+	}
+}
+
+func TestBuildStoragePolicyRejectsUnwritableConfiguredBudget(t *testing.T) {
+	_, err := buildStoragePolicy(config.FilterConfig{SummaryAboveFiles: 10_001})
+	if err == nil {
+		t.Fatal("expected policy budget above the closed wire schema to fail at startup")
+	}
+}

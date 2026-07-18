@@ -81,6 +81,18 @@ type FilterConfig struct {
 	// when every filename (extension stripped) is purely numeric.
 	// Default: 100.
 	MaxFileCountNumeric int
+
+	// Durable storage budgets. Full records above either summary threshold are
+	// downgraded, never silently dropped. Hash/reject caps are disabled at 0.
+	SummaryAboveFiles     int
+	SummaryAbovePathBytes int
+	MaxFullPathBytes      int
+	MaxStoredNameBytes    int
+	SummaryMaxAliases     int
+	SummaryAliasBytes     int
+	SummaryMaxExtensions  int
+	HashOnlyAboveFiles    int
+	RejectAboveFiles      int
 }
 
 type ExporterConfig struct {
@@ -94,6 +106,19 @@ type ExporterConfig struct {
 	RetryBackoff  time.Duration
 	WalDir        string // WAL 本地缓冲目录，空 = 不启用
 	APIKey        string // X-API-Key 认证头，空 = 不发送
+	// CrawlerID 是 durable spool/receipt 协议的稳定身份。它必须跨进程重启
+	// 保持不变，不能复用默认带 PID 的 InstanceID。
+	CrawlerID string
+	// Region 是低基数部署区域标签（如 sg/jp），用于跨区覆盖与热度分析。
+	Region string
+
+	// SpoolDir 启用崩溃安全的 pre-send durable spool（推荐用于 http 导出）。
+	// 非空时，metadata 事件先落 spool 再经 durable 批次协议投递，替代
+	// walSink fallback。空 = 沿用旧 httpSink 路径。
+	SpoolDir string
+	// SpoolMaxBytes 是 spool 总磁盘上限（字节），用于背压；durable
+	// spool 启用时 0/负数会归一化为安全的 4 GiB 默认值。
+	SpoolMaxBytes int64
 }
 
 func Load() (Config, error) {
@@ -152,9 +177,18 @@ func Load() (Config, error) {
 			WorkerQueueSize:  getenvInt("CHERRY_PICKER_METADATA_WORKERS", defaultMetadataWorkers()),
 		},
 		Filter: FilterConfig{
-			MaxFileCount:        getenvInt("CHERRY_PICKER_FILTER_MAX_FILES", 0),
-			MaxFileCountNonCN:   getenvInt("CHERRY_PICKER_FILTER_MAX_FILES_NON_CN", 0),
-			MaxFileCountNumeric: getenvInt("CHERRY_PICKER_FILTER_MAX_FILES_NUMERIC", 0),
+			MaxFileCount:          getenvInt("CHERRY_PICKER_FILTER_MAX_FILES", 0),
+			MaxFileCountNonCN:     getenvInt("CHERRY_PICKER_FILTER_MAX_FILES_NON_CN", 0),
+			MaxFileCountNumeric:   getenvInt("CHERRY_PICKER_FILTER_MAX_FILES_NUMERIC", 0),
+			SummaryAboveFiles:     getenvInt("CHERRY_PICKER_POLICY_SUMMARY_FILES", 0),
+			SummaryAbovePathBytes: getenvInt("CHERRY_PICKER_POLICY_SUMMARY_PATH_BYTES", 0),
+			MaxFullPathBytes:      getenvInt("CHERRY_PICKER_POLICY_MAX_PATH_BYTES", 0),
+			MaxStoredNameBytes:    getenvInt("CHERRY_PICKER_POLICY_MAX_NAME_BYTES", 0),
+			SummaryMaxAliases:     getenvInt("CHERRY_PICKER_POLICY_SUMMARY_ALIASES", 0),
+			SummaryAliasBytes:     getenvInt("CHERRY_PICKER_POLICY_SUMMARY_ALIAS_BYTES", 0),
+			SummaryMaxExtensions:  getenvInt("CHERRY_PICKER_POLICY_SUMMARY_EXTENSIONS", 0),
+			HashOnlyAboveFiles:    getenvInt("CHERRY_PICKER_POLICY_HASH_ONLY_FILES", 0),
+			RejectAboveFiles:      getenvInt("CHERRY_PICKER_POLICY_REJECT_FILES", 0),
 		},
 		Exporter: ExporterConfig{
 			Kind:          strings.ToLower(getenvDefault("CHERRY_PICKER_EXPORTER", "stdout")),
@@ -167,6 +201,10 @@ func Load() (Config, error) {
 			RetryBackoff:  getenvDuration("CHERRY_PICKER_EXPORTER_RETRY_BACKOFF", time.Second),
 			WalDir:        getenvDefault("CHERRY_PICKER_WAL_DIR", ""),
 			APIKey:        getenvDefault("CHERRY_API_KEY", ""),
+			CrawlerID:     strings.TrimSpace(os.Getenv("CHERRY_PICKER_CRAWLER_ID")),
+			Region:        strings.TrimSpace(os.Getenv("CHERRY_PICKER_REGION")),
+			SpoolDir:      getenvDefault("CHERRY_PICKER_SPOOL_DIR", ""),
+			SpoolMaxBytes: int64(getenvInt("CHERRY_PICKER_SPOOL_MAX_BYTES", 0)),
 		},
 	}
 
@@ -236,9 +274,18 @@ func loadFromFile(path string) (Config, error) {
 			WorkerQueueSize:  intOrDefault(raw.Metadata.WorkerQueueSize, defaultMetadataWorkers()),
 		},
 		Filter: FilterConfig{
-			MaxFileCount:        raw.Filter.MaxFileCount,
-			MaxFileCountNonCN:   raw.Filter.MaxFileCountNonCN,
-			MaxFileCountNumeric: raw.Filter.MaxFileCountNumeric,
+			MaxFileCount:          raw.Filter.MaxFileCount,
+			MaxFileCountNonCN:     raw.Filter.MaxFileCountNonCN,
+			MaxFileCountNumeric:   raw.Filter.MaxFileCountNumeric,
+			SummaryAboveFiles:     raw.Filter.SummaryAboveFiles,
+			SummaryAbovePathBytes: raw.Filter.SummaryAbovePathBytes,
+			MaxFullPathBytes:      raw.Filter.MaxFullPathBytes,
+			MaxStoredNameBytes:    raw.Filter.MaxStoredNameBytes,
+			SummaryMaxAliases:     raw.Filter.SummaryMaxAliases,
+			SummaryAliasBytes:     raw.Filter.SummaryAliasBytes,
+			SummaryMaxExtensions:  raw.Filter.SummaryMaxExtensions,
+			HashOnlyAboveFiles:    raw.Filter.HashOnlyAboveFiles,
+			RejectAboveFiles:      raw.Filter.RejectAboveFiles,
 		},
 		Exporter: ExporterConfig{
 			Kind:          strings.ToLower(strings.TrimSpace(raw.Exporter.Kind)),
@@ -251,6 +298,10 @@ func loadFromFile(path string) (Config, error) {
 			RetryBackoff:  parseDuration(raw.Exporter.RetryBackoff),
 			WalDir:        strings.TrimSpace(raw.Exporter.WalDir),
 			APIKey:        strings.TrimSpace(raw.Exporter.APIKey),
+			CrawlerID:     strings.TrimSpace(raw.Exporter.CrawlerID),
+			Region:        strings.TrimSpace(raw.Exporter.Region),
+			SpoolDir:      strings.TrimSpace(raw.Exporter.SpoolDir),
+			SpoolMaxBytes: raw.Exporter.SpoolMaxBytes,
 		},
 	}
 
@@ -347,6 +398,11 @@ func normalize(cfg Config) Config {
 	if cfg.Exporter.RetryBackoff <= 0 {
 		cfg.Exporter.RetryBackoff = time.Second
 	}
+	if cfg.Exporter.SpoolDir != "" && cfg.Exporter.SpoolMaxBytes <= 0 {
+		// Bound local outage buffering so a disconnected storage service cannot
+		// consume the crawler's entire disk. Operators can raise this explicitly.
+		cfg.Exporter.SpoolMaxBytes = 4 << 30
+	}
 
 	switch cfg.Role {
 	case "discovery":
@@ -383,9 +439,18 @@ type fileConfig struct {
 }
 
 type fileFilterConfig struct {
-	MaxFileCount        int `json:"max_file_count"`
-	MaxFileCountNonCN   int `json:"max_file_count_non_cn"`
-	MaxFileCountNumeric int `json:"max_file_count_numeric"`
+	MaxFileCount          int `json:"max_file_count"`
+	MaxFileCountNonCN     int `json:"max_file_count_non_cn"`
+	MaxFileCountNumeric   int `json:"max_file_count_numeric"`
+	SummaryAboveFiles     int `json:"summary_above_files"`
+	SummaryAbovePathBytes int `json:"summary_above_path_bytes"`
+	MaxFullPathBytes      int `json:"max_full_path_bytes"`
+	MaxStoredNameBytes    int `json:"max_stored_name_bytes"`
+	SummaryMaxAliases     int `json:"summary_max_aliases"`
+	SummaryAliasBytes     int `json:"summary_alias_bytes"`
+	SummaryMaxExtensions  int `json:"summary_max_extensions"`
+	HashOnlyAboveFiles    int `json:"hash_only_above_files"`
+	RejectAboveFiles      int `json:"reject_above_files"`
 }
 
 type fileDedupeConfig struct {
@@ -435,6 +500,10 @@ type fileExporterConfig struct {
 	RetryBackoff  string `json:"retry_backoff"`
 	WalDir        string `json:"wal_dir"`
 	APIKey        string `json:"api_key"`
+	CrawlerID     string `json:"crawler_id"`
+	Region        string `json:"region"`
+	SpoolDir      string `json:"spool_dir"`
+	SpoolMaxBytes int64  `json:"spool_max_bytes"`
 }
 
 // normalizeFilterConfig applies built-in defaults for any filter threshold that
@@ -448,6 +517,33 @@ func normalizeFilterConfig(f *FilterConfig) {
 	}
 	if f.MaxFileCountNumeric == 0 {
 		f.MaxFileCountNumeric = 100
+	}
+	if f.SummaryAboveFiles <= 0 {
+		f.SummaryAboveFiles = 2_000
+	}
+	if f.SummaryAbovePathBytes <= 0 {
+		f.SummaryAbovePathBytes = 512 << 10
+	}
+	if f.MaxFullPathBytes <= 0 {
+		f.MaxFullPathBytes = 4 << 10
+	}
+	if f.MaxStoredNameBytes <= 0 {
+		f.MaxStoredNameBytes = 1 << 10
+	}
+	if f.SummaryMaxAliases <= 0 {
+		f.SummaryMaxAliases = 32
+	}
+	if f.SummaryAliasBytes <= 0 {
+		f.SummaryAliasBytes = 4 << 10
+	}
+	if f.SummaryMaxExtensions <= 0 {
+		f.SummaryMaxExtensions = 32
+	}
+	if f.HashOnlyAboveFiles < 0 {
+		f.HashOnlyAboveFiles = 0
+	}
+	if f.RejectAboveFiles < 0 {
+		f.RejectAboveFiles = 0
 	}
 }
 

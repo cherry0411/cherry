@@ -99,3 +99,41 @@ func TestLoadActiveLookupFromEnvironment(t *testing.T) {
 		t.Fatalf("unexpected lookup config: %+v", cfg.Discovery)
 	}
 }
+
+func TestLoadDurableIdentityAndStoragePolicyFromEnvironment(t *testing.T) {
+	t.Setenv("CHERRY_PICKER_CONFIG", "")
+	t.Setenv("CHERRY_PICKER_CRAWLER_ID", "jp-1")
+	t.Setenv("CHERRY_PICKER_REGION", "jp")
+	t.Setenv("CHERRY_PICKER_POLICY_SUMMARY_FILES", "2500")
+	t.Setenv("CHERRY_PICKER_POLICY_SUMMARY_PATH_BYTES", "123456")
+	t.Setenv("CHERRY_PICKER_POLICY_HASH_ONLY_FILES", "5000")
+	t.Setenv("CHERRY_PICKER_POLICY_REJECT_FILES", "6000")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.Exporter.CrawlerID != "jp-1" || cfg.Exporter.Region != "jp" {
+		t.Fatalf("durable identity = %+v", cfg.Exporter)
+	}
+	if cfg.Filter.SummaryAboveFiles != 2500 || cfg.Filter.SummaryAbovePathBytes != 123456 ||
+		cfg.Filter.HashOnlyAboveFiles != 5000 || cfg.Filter.RejectAboveFiles != 6000 {
+		t.Fatalf("storage policy = %+v", cfg.Filter)
+	}
+}
+
+func TestLoadDefaultStoragePolicyIsConservative(t *testing.T) {
+	t.Setenv("CHERRY_PICKER_CONFIG", "")
+	t.Setenv("CHERRY_PICKER_SPOOL_DIR", "spool-test")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Filter.SummaryAboveFiles != 2000 || cfg.Filter.SummaryAbovePathBytes != 512<<10 ||
+		cfg.Filter.HashOnlyAboveFiles != 0 || cfg.Filter.RejectAboveFiles != 0 {
+		t.Fatalf("unexpected default storage policy: %+v", cfg.Filter)
+	}
+	if cfg.Exporter.SpoolMaxBytes != 4<<30 {
+		t.Fatalf("default bounded spool bytes=%d", cfg.Exporter.SpoolMaxBytes)
+	}
+}

@@ -68,8 +68,15 @@ Durations use Go duration strings such as `2s`, `30s`, or `10m`.
 - `CHERRY_PICKER_EXPORTER_TIMEOUT`: HTTP exporter timeout.
 - `CHERRY_PICKER_EXPORTER_HTTP_RETRIES`: HTTP batch retry count.
 - `CHERRY_PICKER_EXPORTER_RETRY_BACKOFF`: per-attempt retry backoff base duration.
-- `CHERRY_PICKER_DEDUPE_PEER_TTL`: local dedupe TTL for repeated peer events.
-- `CHERRY_PICKER_DEDUPE_METADATA_TTL`: local dedupe TTL for repeated metadata work.
+- `CHERRY_PICKER_CRAWLER_ID`: stable durable receipt identity; required with a spool and preserved across process restarts.
+- `CHERRY_PICKER_REGION`: low-cardinality source region such as `sg` or `jp`.
+- `CHERRY_PICKER_SPOOL_DIR`: enables the typed pre-send durable spool for the HTTP exporter.
+- `CHERRY_PICKER_SPOOL_MAX_BYTES`: local spool disk bound; defaults to 4 GiB when durable mode is enabled.
+- `CHERRY_API_KEY`: required by the durable HTTP exporter and sent as `X-API-Key`.
+- `CHERRY_PICKER_DEDUPE_PEER_TTL` and `CHERRY_PICKER_DEDUPE_METADATA_TTL`:
+  reserved policy inputs. The current hot-path caches are capacity-bounded LRUs,
+  not TTL caches; experiments must not claim a TTL treatment until the runtime
+  metrics and expiry implementation are wired.
 - `CHERRY_PICKER_PPROF_ADDR`: optional local Go profiling listener, for example `127.0.0.1:6060`.
 
 ## Example
@@ -99,6 +106,21 @@ Adjust those paths if your deployment layout differs.
 - Hot-path dedupe now uses a sharded LRU to avoid a single global mutex under heavy announce/get_peers fan-in.
 - Remote existence checks are batched in parallel workers, so metadata enqueue no longer waits behind one slow `/check` loop.
 - Checked-in configs are intentionally aggressive. On a small host, prefer overriding `CHERRY_PICKER_DHT_PACKET_WORKERS`, `CHERRY_PICKER_METADATA_WORKERS`, and `CHERRY_PICKER_EVENT_QUEUE` downward.
+
+## Durable zero-raw delivery
+
+For production HTTP delivery, set a stable crawler ID, region, spool directory,
+API key and the normal batch endpoint. When the configured endpoint ends in
+`/api/v1/torrents/batch`, durable mode upgrades it to
+`/api/v1/torrents/batch/durable`; an explicitly supplied durable/custom endpoint
+is left unchanged.
+
+Only the versioned `normalized`, `summary`, `hash_only`, or `reject` record is
+written to the spool. Raw bencode, `pieces`, and piece hashes are never written
+to the spool or HTTP body. A metadata hash becomes locally known only after its
+record has crossed the group-fsync boundary. The sender keeps one stable batch
+in flight and advances the local cursor only after an identity-, checksum-,
+range-, count-, and commit-matching ACK.
 
 ## 2-core / 4-GB profiles
 

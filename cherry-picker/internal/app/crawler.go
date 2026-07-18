@@ -39,6 +39,8 @@ import (
 	"cherry-picker/internal/export"
 	"cherry-picker/internal/filter"
 	"cherry-picker/internal/pipeline"
+	"cherry-picker/internal/spool"
+	"cherry-picker/internal/storagepolicy"
 	"cherry-picker/internal/sysres"
 
 	"golang.org/x/text/encoding/simplifiedchinese"
@@ -84,6 +86,10 @@ type Application struct {
 
 	// filterChain 在 metadata 上报前执行规则过滤。
 	filterChain *filter.Chain
+	// storagePolicy 将已解析 metadata 投影为有严格字节预算的
+	// full/summary/hash_only/reject typed record。
+	storagePolicy    *storagepolicy.Policy
+	storagePolicyErr error
 	// rejectQueue 将被过滤的 hash 异步批量上报给后端 cuckoo filter。
 	rejectQueue chan string
 
@@ -216,6 +222,7 @@ func New(cfg config.Config, logger *log.Logger) *Application {
 	}
 	memLimit := resolveMemLimit(cfg)
 	lruCaps := newLRUCaps(cfg, memLimit)
+	policy, policyErr := buildStoragePolicy(cfg.Filter)
 	return &Application{
 		cfg:      cfg,
 		logger:   logger,
@@ -227,9 +234,11 @@ func New(cfg config.Config, logger *log.Logger) *Application {
 		metadataResultSeen:  cache.NewLRU(lruCaps.metadataResultSeen),
 		remoteKnown:         cache.NewLRU(lruCaps.remoteKnown),
 
-		peerCounts:  make(map[string]int, 4096),
-		filterChain: buildFilterChain(cfg.Filter),
-		rejectQueue: make(chan string, 10_000),
+		peerCounts:       make(map[string]int, 4096),
+		filterChain:      buildFilterChain(cfg.Filter),
+		storagePolicy:    policy,
+		storagePolicyErr: policyErr,
+		rejectQueue:      make(chan string, 10_000),
 		// check/peers/reject 三条上报回路共用此 client，均为对同一后端 host
 		// 的高频小 POST。默认 Transport 的 MaxIdleConnsPerHost=2 会导致
 		// 并发 worker 不断新建/关闭 TCP 连接，这里放大空闲连接池。
@@ -259,14 +268,127 @@ func resolveMemLimit(cfg config.Config) uint64 {
 
 // Run 启动爬虫，阻塞直到 ctx 取消。
 func (a *Application) Run(ctx context.Context) error {
-	events := make(chan pipeline.Event, a.cfg.EventQueue)
-	sink, err := export.NewSink(a.cfg.Exporter)
-	if err != nil {
-		return err
+	if a.storagePolicyErr != nil {
+		return fmt.Errorf("invalid metadata storage policy: %w", a.storagePolicyErr)
 	}
+	runCtx, cancelRun := context.WithCancel(ctx)
+	ctx = runCtx
+	events := make(chan pipeline.Event, a.cfg.EventQueue)
 
-	exporter := export.NewBatchExporter(a.logger, sink, a.cfg.Exporter.BatchSize, a.cfg.Exporter.FlushInterval, events)
-	go func() { _ = exporter.Run(ctx) }()
+	var durableIngestor *export.DurableIngestor
+	var durableSpool *spool.Spool
+	var cancelDelivery context.CancelFunc
+	var deliveryDone chan error
+	durableErrors := make(chan error, 1)
+	reportDurableError := func(err error) {
+		if err == nil {
+			return
+		}
+		select {
+		case durableErrors <- err:
+		default:
+		}
+	}
+	defer func() {
+		cancelRun()
+		deliveryFinished := false
+		if deliveryDone != nil {
+			select {
+			case err := <-deliveryDone:
+				deliveryFinished = true
+				if err != nil && durableIngestor != nil {
+					durableIngestor.Abort(err)
+				}
+			default:
+			}
+		}
+		if durableIngestor != nil {
+			if err := durableIngestor.Close(); err != nil {
+				a.logger.Printf("durable ingestor close: %v", err)
+			}
+		}
+		if cancelDelivery != nil {
+			cancelDelivery()
+		}
+		if deliveryDone != nil && !deliveryFinished {
+			<-deliveryDone
+		}
+		if durableSpool != nil {
+			if err := durableSpool.Close(); err != nil {
+				a.logger.Printf("durable spool close: %v", err)
+			}
+		}
+	}()
+
+	// Durable pre-send spool path: enabled for http export with a spool_dir.
+	// Metadata consumers submit directly to a short group fsync, bypassing the
+	// legacy in-memory BatchExporter window. Delivery is independently retried.
+	if a.cfg.Exporter.Kind == "http" && a.cfg.Exporter.SpoolDir != "" {
+		if strings.TrimSpace(a.cfg.Exporter.CrawlerID) == "" {
+			return errors.New("durable spool requires CHERRY_PICKER_CRAWLER_ID (stable across restarts)")
+		}
+		sp, err := spool.Open(spool.Options{
+			Dir:       a.cfg.Exporter.SpoolDir,
+			CrawlerID: a.cfg.Exporter.CrawlerID,
+			MaxBytes:  a.cfg.Exporter.SpoolMaxBytes,
+		})
+		if err != nil {
+			return fmt.Errorf("open durable spool: %w", err)
+		}
+		durableSpool = sp
+		spoolExp, err := export.NewSpoolExporter(export.SpoolExporterOptions{
+			Logger:       a.logger,
+			Spool:        sp,
+			URL:          durableMetadataEndpoint(a.cfg.Exporter.HTTPEndpoint),
+			APIKey:       a.cfg.Exporter.APIKey,
+			BatchSize:    a.cfg.Exporter.BatchSize,
+			RetryBackoff: a.cfg.Exporter.RetryBackoff,
+			HTTPTimeout:  a.cfg.Exporter.HTTPTimeout,
+		})
+		if err != nil {
+			return err
+		}
+		durableIngestor, err = export.NewDurableIngestor(export.DurableIngestorOptions{
+			Spool: sp, BatchSize: min(a.cfg.Exporter.BatchSize, 128), MaxDelay: 25 * time.Millisecond,
+		})
+		if err != nil {
+			return err
+		}
+		deliveryCtx, stopDelivery := context.WithCancel(context.Background())
+		cancelDelivery = stopDelivery
+		deliveryDone = make(chan error, 1)
+		go func() {
+			err := spoolExp.Deliver(deliveryCtx)
+			deliveryDone <- err
+			reportDurableError(err)
+		}()
+		go func() {
+			select {
+			case err, ok := <-sp.SyncError():
+				if ok {
+					reportDurableError(err)
+				}
+			case <-ctx.Done():
+			}
+		}()
+		// Cheap peer/stats events are deliberately not sent to the durable
+		// metadata endpoint, but must still be drained to avoid filling events.
+		go drainEvents(ctx, events)
+		a.logger.Printf("durable spool enabled: dir=%s crawler_id=%s region=%s epoch=%d policy_id=%s max_bytes=%d",
+			a.cfg.Exporter.SpoolDir, a.cfg.Exporter.CrawlerID, a.cfg.Exporter.Region,
+			sp.Epoch(), a.storagePolicy.ID(), a.cfg.Exporter.SpoolMaxBytes)
+	} else {
+		s, err := export.NewSink(a.cfg.Exporter)
+		if err != nil {
+			return err
+		}
+		exporter := export.NewBatchExporter(a.logger, s, a.cfg.Exporter.BatchSize, a.cfg.Exporter.FlushInterval, events)
+		go func() {
+			if err := exporter.Run(ctx); err != nil {
+				a.logger.Printf("exporter halted: %v", err)
+			}
+		}()
+	}
 
 	stats := &runtimeStats{}
 
@@ -279,7 +401,7 @@ func (a *Application) Run(ctx context.Context) error {
 	// peer wire metadata 下载器
 	downloader := dht.NewWire(a.cfg.Metadata.BlackListSize, a.cfg.Metadata.RequestQueueSize, a.cfg.Metadata.WorkerQueueSize)
 	if a.cfg.Metadata.Enabled {
-		a.startMetadataConsumers(ctx, downloader, events, stats)
+		a.startMetadataConsumers(ctx, downloader, events, durableIngestor, durableErrors, stats)
 		go downloader.Run()
 		go a.tuneWireWorkers(ctx, downloader)
 	}
@@ -391,6 +513,11 @@ func (a *Application) Run(ctx context.Context) error {
 		return nil
 	case err := <-dhtErrors:
 		return err
+	case err := <-durableErrors:
+		if durableIngestor != nil {
+			durableIngestor.Abort(err)
+		}
+		return fmt.Errorf("durable metadata pipeline halted: %w", err)
 	}
 }
 
@@ -1079,12 +1206,19 @@ func (a *Application) incPeerCount(ihHex string) {
 	a.peerCountsMu.Unlock()
 }
 
-func (a *Application) startMetadataConsumers(ctx context.Context, downloader *dht.Wire, events chan<- pipeline.Event, stats *runtimeStats) {
+func (a *Application) startMetadataConsumers(
+	ctx context.Context,
+	downloader *dht.Wire,
+	events chan<- pipeline.Event,
+	durable *export.DurableIngestor,
+	durableErrors chan<- error,
+	stats *runtimeStats,
+) {
 	workers := runtime.GOMAXPROCS(0) * 2
 	workers = clampInt(workers, 4, 64)
 	var ok, fail atomic.Uint64
 	for i := 0; i < workers; i++ {
-		go a.consumeMetadata(ctx, downloader, events, stats, &ok, &fail)
+		go a.consumeMetadata(ctx, downloader, events, durable, durableErrors, stats, &ok, &fail)
 	}
 
 	go func() {
@@ -1105,6 +1239,8 @@ func (a *Application) consumeMetadata(
 	ctx context.Context,
 	downloader *dht.Wire,
 	events chan<- pipeline.Event,
+	durable *export.DurableIngestor,
+	durableErrors chan<- error,
 	stats *runtimeStats,
 	ok *atomic.Uint64,
 	fail *atomic.Uint64,
@@ -1132,8 +1268,11 @@ func (a *Application) consumeMetadata(
 			// Record script-level regional signals before content filtering so
 			// filter policy cannot bias cross-region comparisons.
 			stats.metadataLocale.observe(metadata)
-			// Apply content filter rules before reporting to the backend.
-			if reason := a.filterChain.Apply(metadata); reason != filter.ReasonPass {
+			filterReason := a.filterChain.Apply(metadata)
+			if durable == nil && filterReason != filter.ReasonPass {
+				// Legacy exporters preserve their historical hard-filter behavior.
+				// Durable storage instead records a versioned summary decision below,
+				// so an already-downloaded title is not irreversibly discarded.
 				stats.metadataEventsFiltered.Add(1)
 				// Prevent re-requesting this hash within the current session.
 				a.remoteKnown.Set(ihHex)
@@ -1147,17 +1286,7 @@ func (a *Application) consumeMetadata(
 				continue
 			}
 			ok.Add(1)
-			// 下载成功后立即标记为已知：后续同一 hash 的其他 peer 宣告会在
-			// queueMetadataRequest 的 remoteKnown 检查处被短路（跳过重复下载，
-			// 只累加 peer count）。热门种子有成百上千个宣告 peer，缺少这一行
-			// 会导致同一 metadata 被完整重复下载，浪费稀缺的 wire worker。
-			a.remoteKnown.Set(ihHex)
-			// metadata 是整条流水线的产物：下载它花了一个稀缺 wire worker 的
-			// 拨号+握手+传输。这里用阻塞式提交而非丢弃——导出通道满（后端 429
-			// 背压时 httpSink 会 sleep 30s）时宁可让 consumeMetadata 等待，
-			// 背压经 responses/requests 通道自然回传到拨号侧放慢下载，也绝不
-			// 丢弃已下载的 metadata。peer/infohash 事件廉价、可丢，仍走非阻塞。
-			a.submitMetadataEvent(ctx, events, pipeline.Event{
+			event := pipeline.Event{
 				Type:       pipeline.EventMetadataFetched,
 				Timestamp:  time.Now().UTC(),
 				InstanceID: a.cfg.InstanceID,
@@ -1166,7 +1295,36 @@ func (a *Application) consumeMetadata(
 				IP:         response.IP,
 				Port:       response.Port,
 				Metadata:   metadata,
-			}, stats)
+			}
+
+			if durable != nil {
+				decision := a.storagePolicy.Decide(
+					ihHex, event.Timestamp, a.cfg.Exporter.Region, metadata, string(filterReason),
+				)
+				if err := durable.Submit(ctx, decision.Record); err != nil {
+					stats.metadataEventsDropped.Add(1)
+					if ctx.Err() != nil {
+						return
+					}
+					select {
+					case durableErrors <- err:
+					default:
+					}
+					return
+				}
+				stats.metadataEventsSent.Add(1)
+				if decision.Action != storagepolicy.ActionFull {
+					stats.metadataEventsFiltered.Add(1)
+				}
+				a.remoteKnown.Set(ihHex)
+				continue
+			}
+
+			// Legacy path: mark the hash known only after the event was accepted by
+			// the exporter queue. Durable mode waits for fsync above.
+			if a.submitMetadataEvent(ctx, events, event, stats) {
+				a.remoteKnown.Set(ihHex)
+			}
 		}
 	}
 }
@@ -1309,10 +1467,10 @@ func (a *Application) emitStats(ctx context.Context, events chan<- pipeline.Even
 				"wire_getpeers_dial_ok":     uint64(current.wireGetPeersDialOK),
 				"wire_getpeers_download":    uint64(current.wireGetPeersDownload),
 				// 黑名单诊断为当前瞬时值（gauge），非窗口增量。
-				"wire_blacklist_size":       uint64(current.wireBlacklistSize),
-				"wire_blacklist_max":        uint64(current.wireBlacklistMax),
-				"wire_blacklist_rejected":   uint64(current.wireBlacklistRejected),
-				"wire_blacklist_expired":    uint64(current.wireBlacklistExpired),
+				"wire_blacklist_size":     uint64(current.wireBlacklistSize),
+				"wire_blacklist_max":      uint64(current.wireBlacklistMax),
+				"wire_blacklist_rejected": uint64(current.wireBlacklistRejected),
+				"wire_blacklist_expired":  uint64(current.wireBlacklistExpired),
 			}
 			current.metadataLocale.addWorkerStats(workerStats)
 			a.submitEvent(events, pipeline.Event{
@@ -1434,16 +1592,16 @@ func (a *Application) submitEvent(events chan<- pipeline.Event, event pipeline.E
 
 // submitMetadataEvent 阻塞式提交 metadata 事件，永不丢弃已下载的产物。
 // 通道满时等待，直到导出侧腾出空间或进程退出（ctx 取消）。
-func (a *Application) submitMetadataEvent(ctx context.Context, events chan<- pipeline.Event, event pipeline.Event, stats *runtimeStats) {
+func (a *Application) submitMetadataEvent(ctx context.Context, events chan<- pipeline.Event, event pipeline.Event, stats *runtimeStats) bool {
 	if !a.shouldExportEvent(event) {
-		return
+		return false
 	}
 
 	// 快路径：通道有空位立即入队，不进入 select 的调度开销。
 	select {
 	case events <- event:
 		stats.metadataEventsSent.Add(1)
-		return
+		return true
 	default:
 	}
 
@@ -1451,8 +1609,20 @@ func (a *Application) submitMetadataEvent(ctx context.Context, events chan<- pip
 	select {
 	case events <- event:
 		stats.metadataEventsSent.Add(1)
+		return true
 	case <-ctx.Done():
 		stats.metadataEventsDropped.Add(1)
+		return false
+	}
+}
+
+func drainEvents(ctx context.Context, events <-chan pipeline.Event) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-events:
+		}
 	}
 }
 
@@ -1531,6 +1701,34 @@ func buildFilterChain(cfg config.FilterConfig) *filter.Chain {
 	return c
 }
 
+func buildStoragePolicy(cfg config.FilterConfig) (*storagepolicy.Policy, error) {
+	policyCfg := storagepolicy.DefaultConfig()
+	if cfg.SummaryAboveFiles != 0 {
+		policyCfg.SummaryAboveFiles = cfg.SummaryAboveFiles
+	}
+	if cfg.SummaryAbovePathBytes != 0 {
+		policyCfg.SummaryAbovePathBytes = cfg.SummaryAbovePathBytes
+	}
+	if cfg.MaxFullPathBytes != 0 {
+		policyCfg.MaxFullPathBytes = cfg.MaxFullPathBytes
+	}
+	if cfg.MaxStoredNameBytes != 0 {
+		policyCfg.MaxNameBytes = cfg.MaxStoredNameBytes
+	}
+	if cfg.SummaryMaxAliases != 0 {
+		policyCfg.SummaryMaxAliases = cfg.SummaryMaxAliases
+	}
+	if cfg.SummaryAliasBytes != 0 {
+		policyCfg.SummaryAliasBytes = cfg.SummaryAliasBytes
+	}
+	if cfg.SummaryMaxExtensions != 0 {
+		policyCfg.SummaryMaxExtensions = cfg.SummaryMaxExtensions
+	}
+	policyCfg.HashOnlyAboveFiles = cfg.HashOnlyAboveFiles
+	policyCfg.RejectAboveFiles = cfg.RejectAboveFiles
+	return storagepolicy.New(policyCfg)
+}
+
 // --- 辅助函数 ---
 
 func (a *Application) listenAddrs() ([]string, error) {
@@ -1603,6 +1801,14 @@ func (a *Application) baseURL() string {
 		return url[:idx]
 	}
 	return url
+}
+
+func durableMetadataEndpoint(endpoint string) string {
+	endpoint = strings.TrimRight(strings.TrimSpace(endpoint), "/")
+	if strings.HasSuffix(endpoint, "/api/v1/torrents/batch") {
+		return endpoint + "/durable"
+	}
+	return endpoint
 }
 
 func (a *Application) shouldExportEvent(event pipeline.Event) bool {
