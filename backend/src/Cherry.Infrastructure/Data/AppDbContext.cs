@@ -7,6 +7,7 @@ public class AppDbContext : DbContext
 {
     public DbSet<DurableBatchReceipt> DurableBatchReceipts => Set<DurableBatchReceipt>();
     public DbSet<MetadataDecision> MetadataDecisions => Set<MetadataDecision>();
+    public DbSet<SearchOutboxItem> SearchOutbox => Set<SearchOutboxItem>();
     public DbSet<Torrent> Torrents => Set<Torrent>();
     public DbSet<TorrentExtensionSummary> TorrentExtensionSummaries => Set<TorrentExtensionSummary>();
     public DbSet<TorrentFile> TorrentFiles => Set<TorrentFile>();

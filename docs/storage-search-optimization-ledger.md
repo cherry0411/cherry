@@ -98,6 +98,107 @@ task-status polling, retry/dead-letter visibility, and a full rebuild command.
 Required metrics: outbox depth, oldest age, documents/second, task latency,
 retry count, terminal failures, and PostgreSQL-to-Meili visibility lag.
 
+## Iteration S-002 (pre-registered): transactional Meilisearch outbox
+
+### Hypothesis and isolated scope
+
+Replacing the process-memory `MeiliIndexQueue` with a PostgreSQL outbox written
+in the same transaction as each accepted torrent will remove the permanent
+search-loss windows without extending the crawler's PostgreSQL ACK latency to
+include Meilisearch. This iteration changes search delivery durability only. It
+does not change metadata retention, the crawler protocol, search document
+shape/ranking, or permanent raw-byte retention (which remains 0%).
+
+### Design fixed before implementation
+
+- One compact outbox row per `info_hash`; transactional UPSERT increments a
+  generation and resets retry/lease state whenever authoritative searchable
+  metadata is inserted or upgraded. This bounds backlog storage and makes
+  repeated ingest idempotent while preserving an upgrade that races a worker.
+- Workers claim due rows with `FOR UPDATE SKIP LOCKED` and a time-bounded lease.
+  They load the current torrent rows from PostgreSQL rather than persisting a
+  second document copy in the outbox.
+- A claim is deleted only after Meilisearch accepts the document batch, returns
+  a parseable `taskUid`, and that task reaches `succeeded`. HTTP 202 alone is
+  not an acknowledgement. Network errors, outage, timeout, and Meili `failed`
+  tasks retain the row, record a bounded error, increment attempts, and schedule
+  exponential retry. Delete predicates include claim owner and generation so a
+  concurrent metadata upgrade cannot be acknowledged by an older task.
+- PostgreSQL metadata and durable crawler receipts commit before the worker
+  talks to Meilisearch. The durable ingest response therefore remains
+  independent of Meili availability.
+- Backlog depth, oldest enqueued age, due/retrying counts, completed document
+  count, task latency, retry count, and last error are exposed as basic
+  operational state. A rebuild operation repopulates the outbox from all
+  authoritative torrent rows without storing raw metadata.
+
+### Pre-registered failure matrix and success criteria
+
+The implementation is accepted only if real-PostgreSQL plus mock-Meili tests
+show: (1) metadata and outbox commit/rollback together for both durable and
+legacy ingest; (2) an API/worker crash before delivery leaves a claim
+recoverable after lease expiry; (3) outage/submission errors retain rows; (4) a
+202 followed by a failed task retains rows and records a retry; (5) only a
+polled `succeeded` task removes the matching generation; (6) a concurrent
+upgrade survives acknowledgement of the older generation; and (7) a full
+rebuild restores a missing outbox deterministically. EF pending-model and
+package-vulnerability checks must remain clean.
+
+### Rollback
+
+Disable the outbox worker while retaining its table, then restore the previous
+in-memory queue registration if an unexpected search-delivery regression is
+found. Migration `Down` drops only the outbox table/indexes. PostgreSQL remains
+the authority, so rebuilding Meilisearch from `torrents` is the recovery path;
+rollback never requires replaying raw bencode or crawler events.
+
+### Implementation and fault-test result (2026-07-18)
+
+S-002 is implemented locally and remains an iteration, not a final storage or
+search configuration:
+
+- migration `20260718133000_AddSearchOutbox` creates the coalescing outbox after
+  S-001 and seeds one marker for every pre-existing torrent; its tested `Down`
+  removes only the outbox and its tested `Up` recreates it;
+- both the durable crawler transaction and the legacy torrent transaction add
+  or refresh the marker before PostgreSQL commit. Their API acknowledgement
+  paths contain no Meilisearch call;
+- each write stores only the 40-character authority key plus delivery state,
+  never raw bencode, pieces, file lists, or a duplicate search document;
+- workers use `FOR UPDATE SKIP LOCKED`, bounded leases, generation-fenced
+  completion, bounded errors, and exponential retries. Unsafe batch/interval
+  configuration is clamped, and the effective lease is always longer than the
+  configured Meili task timeout plus a polling margin;
+- Meili document submission must return a numeric `taskUid`; the worker polls
+  `/tasks/{taskUid}` and deletes only after `succeeded`. `failed`, `canceled`,
+  malformed responses, HTTP/network outage, and timeout all retain the marker;
+- optional `MeiliSearch:ApiKey`, `MEILI_MASTER_KEY`, or `MEILI_API_KEY` is sent
+  as a Bearer credential; outbox stats and rebuild operations fail closed behind
+  the application's API key;
+- `/api/v1/search/outbox/stats` exposes persistent depth/due/retrying/oldest-age
+  state and process counters; `/api/v1/search/outbox/rebuild` coalesces the full
+  PostgreSQL authority back into the outbox.
+
+Real PostgreSQL 17 plus scripted mock-Meili tests cover transactional markers
+for both ingest paths, 202 followed by `failed` and `canceled`, submission
+outage, processing-to-success polling, expired-lease recovery, a process crash
+after observed Meili success but before PostgreSQL completion, idempotent
+replay, concurrent generation upgrade fencing, and full rebuild. The complete
+42-test suite passed twice consecutively against PostgreSQL. Build completed
+with zero warnings/errors, EF reports no pending model change, the migration
+Down/Up round trip passed, and the transitive package vulnerability audit is
+clean.
+
+### Remaining measurement gate
+
+Correctness is established, but batch size, polling cadence, lease duration,
+retry curve, and Meili document shape are not declared optimal. On the storage
+server, measure outbox rows/second and bytes/row, PostgreSQL WAL/event, Meili
+documents/second and task p95, visibility lag, backlog recovery slope after a
+fixed outage, search quality, index bytes/document, and RSS. Isolate those
+variables one at a time against a versioned zero-raw corpus before changing the
+defaults.
+
 ## Storage-server experiment gate
 
 Before using live traffic to choose the final schema or Meili document shape,

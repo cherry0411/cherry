@@ -50,6 +50,10 @@ public sealed class TorrentRepositoryPostgresTests
         Assert.Empty(duplicateReject);
         Assert.Contains(torrentHash, filter.Recorded);
         Assert.Contains(rejectedHash, filter.Recorded);
+        var legacyOutbox = await db.SearchOutbox.SingleAsync(
+            item => item.InfoHash == torrentHash);
+        Assert.Equal(1, legacyOutbox.Generation);
+        Assert.Equal(0, legacyOutbox.AttemptCount);
 
         var processed = await repository.CheckProcessedAsync(
             [torrentHash, rejectedHash, missingHash],

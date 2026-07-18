@@ -98,6 +98,7 @@ public sealed class DurableIngestPostgresTests
         Assert.Equal(firstResult.Response.Duplicates, replay.Response.Duplicates);
         Assert.Equal(1, await db.Torrents.CountAsync(t => t.InfoHash == firstHash));
         Assert.Equal(1, await db.TorrentFiles.CountAsync(f => f.InfoHash == firstHash));
+        Assert.Equal(1, await db.SearchOutbox.CountAsync(item => item.InfoHash == firstHash));
 
         var gapHash = HashFor(Guid.NewGuid());
         var gap = await service.IngestAsync(Batch(crawlerId, epoch, 3, gapHash));
@@ -154,6 +155,8 @@ public sealed class DurableIngestPostgresTests
             torrent => torrent.InfoHash == firstHash || torrent.InfoHash == summaryHash));
         Assert.Equal(2, await db.TorrentFiles.CountAsync(
             file => file.InfoHash == firstHash || file.InfoHash == summaryHash));
+        Assert.Equal(2, await db.SearchOutbox.CountAsync(
+            item => item.InfoHash == firstHash || item.InfoHash == summaryHash));
 
         var summary = await db.Torrents.SingleAsync(torrent => torrent.InfoHash == summaryHash);
         Assert.Equal(MetadataRetentionLevel.Summary, summary.RetainedLevel);

@@ -12,18 +12,15 @@ namespace Cherry.Infrastructure.Repositories;
 public class TorrentRepository : ITorrentRepository
 {
     private readonly AppDbContext _db;
-    private readonly MeiliIndexQueue? _meiliQueue;
     private readonly MeiliSearchClient? _meiliClient;
     private readonly IProcessedHashFilter? _processedHashFilter;
 
     public TorrentRepository(
         AppDbContext db,
-        MeiliIndexQueue? meiliQueue = null,
         MeiliSearchClient? meiliClient = null,
         IProcessedHashFilter? processedHashFilter = null)
     {
         _db = db;
-        _meiliQueue = meiliQueue;
         _meiliClient = meiliClient;
         _processedHashFilter = processedHashFilter;
     }
@@ -87,18 +84,16 @@ public class TorrentRepository : ITorrentRepository
             if (files.Count > 0)
                 await CopyFilesAsync(files, conn, tx, ct);
 
+            // The marker commits atomically with authoritative metadata. The
+            // crawler/API response never waits for Meilisearch itself.
+            await SearchOutboxWriter.EnqueueAsync(insertedHashes, conn, tx, ct);
+
             await tx.CommitAsync(ct);
         }
         catch
         {
             await tx.RollbackAsync(ct);
             throw;
-        }
-
-        if (_meiliQueue != null && insertedHashes.Count > 0)
-        {
-            var indexDocs = unique.Where(t => insertedHashes.Contains(t.InfoHash)).ToList();
-            _meiliQueue.Enqueue(indexDocs);
         }
 
         return insertedHashes;

@@ -21,16 +21,13 @@ public sealed class DurableIngestService
 {
     private readonly AppDbContext _db;
     private readonly IProcessedHashFilter _processedHashFilter;
-    private readonly MeiliIndexQueue? _meiliQueue;
 
     public DurableIngestService(
         AppDbContext db,
-        IProcessedHashFilter processedHashFilter,
-        MeiliIndexQueue? meiliQueue = null)
+        IProcessedHashFilter processedHashFilter)
     {
         _db = db;
         _processedHashFilter = processedHashFilter;
-        _meiliQueue = meiliQueue;
     }
 
     public async Task<DurableIngestResult> IngestAsync(
@@ -165,6 +162,12 @@ public sealed class DurableIngestService
                 transaction,
                 cancellationToken);
 
+            await SearchOutboxWriter.EnqueueAsync(
+                changedTorrentHashes,
+                connection,
+                transaction,
+                cancellationToken);
+
             var accepted = changedTorrentHashes.Count + changedDecisionHashes.Count;
             var duplicates = validated.EventCount - accepted;
             await UpdateReceiptAsync(
@@ -180,14 +183,6 @@ public sealed class DurableIngestService
                 cancellationToken);
 
             await transaction.CommitAsync(cancellationToken);
-
-            if (_meiliQueue is not null && accepted > 0)
-            {
-                _meiliQueue.Enqueue(
-                    uniqueTorrents
-                        .Where(torrent => changedTorrentHashes.Contains(torrent.InfoHash))
-                        .ToList());
-            }
 
             return new DurableIngestResult(
                 IsConflict: false,

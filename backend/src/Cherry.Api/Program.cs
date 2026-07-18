@@ -30,11 +30,46 @@ if (!string.IsNullOrWhiteSpace(meiliUrl))
     {
         c.BaseAddress = new Uri(meiliUrl);
         c.Timeout = TimeSpan.FromSeconds(5);
+        var meiliApiKey = builder.Configuration["MeiliSearch:ApiKey"]
+                          ?? builder.Configuration["MEILI_MASTER_KEY"]
+                          ?? builder.Configuration["MEILI_API_KEY"];
+        if (!string.IsNullOrWhiteSpace(meiliApiKey))
+        {
+            c.DefaultRequestHeaders.Authorization =
+                new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", meiliApiKey);
+        }
     });
-    builder.Services.AddSingleton<Cherry.Infrastructure.Search.MeiliIndexQueue>();
-    builder.Services.AddHostedService(sp =>
-        sp.GetRequiredService<Cherry.Infrastructure.Search.MeiliIndexQueue>());
+    builder.Services.AddSingleton(new Cherry.Infrastructure.Search.SearchOutboxOptions
+    {
+        BatchSize = Math.Clamp(
+            builder.Configuration.GetValue<int?>("MeiliSearch:OutboxBatchSize") ?? 500,
+            1,
+            5_000),
+        LeaseDuration = TimeSpan.FromSeconds(
+            Math.Clamp(
+                builder.Configuration.GetValue<double?>("MeiliSearch:OutboxLeaseSeconds") ?? 300,
+                1,
+                3_600)),
+        PollInterval = TimeSpan.FromMilliseconds(
+            Math.Clamp(
+                builder.Configuration.GetValue<double?>("MeiliSearch:TaskPollMilliseconds") ?? 250,
+                10,
+                5_000)),
+        TaskTimeout = TimeSpan.FromSeconds(
+            Math.Clamp(
+                builder.Configuration.GetValue<double?>("MeiliSearch:TaskTimeoutSeconds") ?? 120,
+                1,
+                1_800)),
+        IdleDelay = TimeSpan.FromMilliseconds(
+            Math.Clamp(
+                builder.Configuration.GetValue<double?>("MeiliSearch:OutboxIdleMilliseconds") ?? 2_000,
+                10,
+                60_000))
+    });
+    builder.Services.AddHostedService<Cherry.Infrastructure.Search.SearchOutboxWorker>();
 }
+builder.Services.AddSingleton<Cherry.Infrastructure.Search.SearchOutboxMetrics>();
+builder.Services.AddScoped<Cherry.Infrastructure.Search.SearchOutboxStore>();
 
 // Core services
 var dedupPath = Path.Combine(builder.Environment.ContentRootPath, "data", "cuckoo.dat");
@@ -88,6 +123,8 @@ var app = builder.Build();
 
 var apiKey = builder.Configuration["ApiKey"];
 const string durableCrawlerPath = "/api/v1/torrents/batch/durable";
+const string searchOutboxStatsPath = "/api/v1/search/outbox/stats";
+const string searchOutboxRebuildPath = "/api/v1/search/outbox/rebuild";
 var protectedCrawlerPaths = new[]
 {
     "/api/v1/torrents/batch",
@@ -98,14 +135,16 @@ var protectedCrawlerPaths = new[]
 app.Use(async (context, next) =>
 {
     var normalizedPath = context.Request.Path.Value?.TrimEnd('/');
-    if (string.Equals(normalizedPath, durableCrawlerPath, StringComparison.OrdinalIgnoreCase))
+    if (string.Equals(normalizedPath, durableCrawlerPath, StringComparison.OrdinalIgnoreCase) ||
+        string.Equals(normalizedPath, searchOutboxStatsPath, StringComparison.OrdinalIgnoreCase) ||
+        string.Equals(normalizedPath, searchOutboxRebuildPath, StringComparison.OrdinalIgnoreCase))
     {
         if (string.IsNullOrWhiteSpace(apiKey))
         {
             context.Response.StatusCode = StatusCodes.Status503ServiceUnavailable;
             await context.Response.WriteAsJsonAsync(new
             {
-                error = "Durable crawler ingestion is disabled until ApiKey is configured"
+                error = "This durable operation is disabled until ApiKey is configured"
             });
             return;
         }
@@ -208,6 +247,7 @@ app.UseSwaggerUI(options =>
 // Map endpoints
 TorrentEndpoints.Map(app);
 StatsEndpoints.Map(app);
+SearchOutboxEndpoints.Map(app);
 
 // Health check
 app.MapGet("/health", (IProcessedHashFilter processedHashFilter) => Results.Ok(new

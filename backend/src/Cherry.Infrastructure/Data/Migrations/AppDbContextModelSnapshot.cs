@@ -129,6 +129,69 @@ namespace Cherry.Infrastructure.Data.Migrations
                         });
                 });
 
+            modelBuilder.Entity("Cherry.Domain.Entities.SearchOutboxItem", b =>
+                {
+                    b.Property<string>("InfoHash")
+                        .HasMaxLength(40)
+                        .HasColumnType("character varying(40)")
+                        .HasColumnName("info_hash");
+
+                    b.Property<int>("AttemptCount")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("integer")
+                        .HasDefaultValue(0)
+                        .HasColumnName("attempt_count");
+
+                    b.Property<DateTime>("AvailableAt")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("timestamp with time zone")
+                        .HasColumnName("available_at")
+                        .HasDefaultValueSql("NOW()");
+
+                    b.Property<DateTime>("EnqueuedAt")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("timestamp with time zone")
+                        .HasColumnName("enqueued_at")
+                        .HasDefaultValueSql("NOW()");
+
+                    b.Property<long>("Generation")
+                        .HasColumnType("bigint")
+                        .HasColumnName("generation");
+
+                    b.Property<string>("LastError")
+                        .HasMaxLength(1024)
+                        .HasColumnType("character varying(1024)")
+                        .HasColumnName("last_error");
+
+                    b.Property<Guid?>("LeaseOwner")
+                        .HasColumnType("uuid")
+                        .HasColumnName("lease_owner");
+
+                    b.Property<DateTime?>("LeaseUntil")
+                        .HasColumnType("timestamp with time zone")
+                        .HasColumnName("lease_until");
+
+                    b.Property<DateTime>("UpdatedAt")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("timestamp with time zone")
+                        .HasColumnName("updated_at")
+                        .HasDefaultValueSql("NOW()");
+
+                    b.HasKey("InfoHash");
+
+                    b.HasIndex("AvailableAt", "LeaseUntil")
+                        .HasDatabaseName("idx_search_outbox_due");
+
+                    b.ToTable("search_outbox", null, t =>
+                        {
+                            t.HasCheckConstraint("CK_search_outbox_attempts", "attempt_count >= 0");
+
+                            t.HasCheckConstraint("CK_search_outbox_generation", "generation > 0");
+
+                            t.HasCheckConstraint("CK_search_outbox_lease", "(lease_owner IS NULL AND lease_until IS NULL) OR (lease_owner IS NOT NULL AND lease_until IS NOT NULL)");
+                        });
+                });
+
             modelBuilder.Entity("Cherry.Domain.Entities.Torrent", b =>
                 {
                     b.Property<string>("InfoHash")
@@ -306,6 +369,15 @@ namespace Cherry.Infrastructure.Data.Migrations
                         .HasDatabaseName("idx_torrent_requests_status");
 
                     b.ToTable("torrent_requests", (string)null);
+                });
+
+            modelBuilder.Entity("Cherry.Domain.Entities.SearchOutboxItem", b =>
+                {
+                    b.HasOne("Cherry.Domain.Entities.Torrent", null)
+                        .WithMany()
+                        .HasForeignKey("InfoHash")
+                        .OnDelete(DeleteBehavior.Cascade)
+                        .IsRequired();
                 });
 #pragma warning restore 612, 618
         }
