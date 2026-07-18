@@ -1,5 +1,7 @@
 using System.Buffers.Binary;
+using System.Globalization;
 using System.Security.Cryptography;
+using System.Text;
 using System.Threading.Channels;
 using Microsoft.Data.Sqlite;
 using Microsoft.Extensions.Hosting;
@@ -39,6 +41,8 @@ internal sealed record HeatBarrierCommand(
 
 public sealed class HeatAccumulatorService : BackgroundService
 {
+    private const int DailyHashStagingRowsPerCommand = 4_096;
+    private const int DailyObservationStagingRowsPerCommand = 1_024;
     private readonly HeatOptions _options;
     private readonly HeatRuntimeMetrics _metrics;
     private readonly ILogger<HeatAccumulatorService> _logger;
@@ -222,15 +226,20 @@ public sealed class HeatAccumulatorService : BackgroundService
             // filesystem watermarks before the daily authority is extended.
             // A rejected batch receives no durable ACK and is safe to retry.
             await _rolling.PrepareForIngestAsync(stoppingToken);
-            await using var connection = await OpenAsync(PathForDay(commands[0].Batch.Day), stoppingToken);
-            await using var transaction =
-                (SqliteTransaction)await connection.BeginTransactionAsync(stoppingToken);
             var results = new HeatAcceptResult[commands.Count];
-            for (var index = 0; index < commands.Count; index++)
-                results[index] = await PersistAsync(connection, transaction, commands[index].Batch, stoppingToken);
+            await using (var connection = await OpenAsync(
+                             PathForDay(commands[0].Batch.Day), stoppingToken))
+            {
+                await PrepareDailyStagingAsync(connection, stoppingToken);
+                await using var transaction =
+                    (SqliteTransaction)await connection.BeginTransactionAsync(stoppingToken);
+                for (var index = 0; index < commands.Count; index++)
+                    results[index] = await PersistAsync(
+                        connection, transaction, commands[index].Batch, stoppingToken);
 
-            // synchronous=FULL makes this group commit the durable ACK boundary.
-            await transaction.CommitAsync(stoppingToken);
+                // synchronous=FULL makes this group commit the durable ACK boundary.
+                await transaction.CommitAsync(stoppingToken);
+            }
             // The crawler is ACKed only after both authorities are durable.
             // A crash between commits yields a daily receipt replay; replaying
             // the idempotent MAX(last_seen_hour) upsert closes that gap.
@@ -325,35 +334,41 @@ public sealed class HeatAccumulatorService : BackgroundService
             return new HeatAcceptResult(HeatAcceptStatus.Conflict, batch.RecordCount, 0, expected, "Non-contiguous heat sequence");
         }
 
-        var insertedCount = 0;
-        await using var insertHash = connection.CreateCommand();
-        insertHash.Transaction = transaction;
-        insertHash.CommandText = "INSERT OR IGNORE INTO hashes(info_hash) VALUES ($hash)";
-        var insertHashParameter = insertHash.Parameters.Add("$hash", SqliteType.Blob);
-        await using var findHash = connection.CreateCommand();
-        findHash.Transaction = transaction;
-        findHash.CommandText = "SELECT hash_id FROM hashes WHERE info_hash=$hash";
-        var findHashParameter = findHash.Parameters.Add("$hash", SqliteType.Blob);
-        await using var insertSeen = connection.CreateCommand();
-        insertSeen.Transaction = transaction;
-        insertSeen.CommandText =
-            "INSERT OR IGNORE INTO seen(hash_id,actor) VALUES($hash_id,$actor)";
-        var seenHashParameter = insertSeen.Parameters.Add("$hash_id", SqliteType.Integer);
-        var seenActorParameter = insertSeen.Parameters.Add("$actor", SqliteType.Integer);
+        await ClearDailyStagingAsync(connection, transaction, cancellationToken);
+        await StageDailyHashesAsync(connection, transaction, batch.Groups, cancellationToken);
+        await StageDailyObservationsAsync(
+            connection, transaction, batch.Groups, dailyActorKey, cancellationToken);
 
-        foreach (var group in batch.Groups)
+        await using (var resolveHashes = connection.CreateCommand())
         {
-            insertHashParameter.Value = group.InfoHash;
-            await insertHash.ExecuteNonQueryAsync(cancellationToken);
-            findHashParameter.Value = group.InfoHash;
-            var hashId = (long)(await findHash.ExecuteScalarAsync(cancellationToken)
-                ?? throw new InvalidDataException("SQLite hash dictionary lookup failed"));
-            seenHashParameter.Value = hashId;
-            foreach (var actor in group.ActorFingerprints)
-            {
-                seenActorParameter.Value = DailyActorFingerprint(dailyActorKey, actor);
-                insertedCount += await insertSeen.ExecuteNonQueryAsync(cancellationToken);
-            }
+            resolveHashes.Transaction = transaction;
+            resolveHashes.CommandText =
+                """
+                INSERT OR IGNORE INTO hashes(info_hash)
+                SELECT info_hash FROM daily_ingest_hashes ORDER BY info_hash;
+                UPDATE daily_ingest_hashes
+                   SET hash_id=(SELECT hashes.hash_id FROM hashes
+                                 WHERE hashes.info_hash=daily_ingest_hashes.info_hash);
+                """;
+            await resolveHashes.ExecuteNonQueryAsync(cancellationToken);
+        }
+
+        int insertedCount;
+        await using (var insertSeen = connection.CreateCommand())
+        {
+            insertSeen.Transaction = transaction;
+            // Ordering by the persistent primary key makes sparse production
+            // batches substantially friendlier to SQLite's B-tree and WAL than
+            // thousands of provider round trips in wire hash order.
+            insertSeen.CommandText =
+                """
+                INSERT OR IGNORE INTO seen(hash_id,actor)
+                SELECT incoming.hash_id,observation.actor
+                  FROM daily_ingest_observations observation
+                  JOIN daily_ingest_hashes incoming USING(slot)
+                 ORDER BY incoming.hash_id,observation.actor;
+                """;
+            insertedCount = await insertSeen.ExecuteNonQueryAsync(cancellationToken);
         }
 
         var next = checked(batch.EndSequence + 1);
@@ -384,6 +399,148 @@ public sealed class HeatAccumulatorService : BackgroundService
         }
 
         return new HeatAcceptResult(HeatAcceptStatus.Accepted, batch.RecordCount, insertedCount, next);
+    }
+
+    private static async Task PrepareDailyStagingAsync(
+        SqliteConnection connection,
+        CancellationToken cancellationToken)
+    {
+        await using var command = connection.CreateCommand();
+        command.CommandText =
+            """
+            CREATE TEMP TABLE IF NOT EXISTS daily_ingest_hashes (
+                slot INTEGER PRIMARY KEY,
+                info_hash BLOB NOT NULL CHECK(length(info_hash)=20),
+                hash_id INTEGER NULL
+            );
+            CREATE TEMP TABLE IF NOT EXISTS daily_ingest_observations (
+                slot INTEGER NOT NULL,
+                actor INTEGER NOT NULL,
+                PRIMARY KEY(slot,actor)
+            ) WITHOUT ROWID;
+            """;
+        await command.ExecuteNonQueryAsync(cancellationToken);
+    }
+
+    private static async Task ClearDailyStagingAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        CancellationToken cancellationToken)
+    {
+        await using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText =
+            "DELETE FROM daily_ingest_observations; DELETE FROM daily_ingest_hashes";
+        await command.ExecuteNonQueryAsync(cancellationToken);
+    }
+
+    private static async Task StageDailyHashesAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        IReadOnlyList<ChhtHashGroup> groups,
+        CancellationToken cancellationToken)
+    {
+        for (var offset = 0; offset < groups.Count; offset += DailyHashStagingRowsPerCommand)
+        {
+            var count = Math.Min(DailyHashStagingRowsPerCommand, groups.Count - offset);
+            // 4096*20 remains below the large-object-heap boundary while one
+            // packed BLOB removes two managed provider parameters per hash.
+            var packed = GC.AllocateUninitializedArray<byte>(checked(count * 20));
+            for (var relativeSlot = 0; relativeSlot < count; relativeSlot++)
+            {
+                var hash = groups[offset + relativeSlot].InfoHash;
+                if (hash.Length != 20)
+                    throw new InvalidDataException("Daily heat info hash must be exactly 20 bytes");
+                hash.CopyTo(packed, relativeSlot * 20);
+            }
+            await using var command = connection.CreateCommand();
+            command.Transaction = transaction;
+            command.CommandText =
+                """
+                WITH RECURSIVE slots(relative_slot) AS (
+                    SELECT 0
+                    UNION ALL
+                    SELECT relative_slot+1 FROM slots WHERE relative_slot+1 < $count
+                )
+                INSERT INTO daily_ingest_hashes(slot,info_hash)
+                SELECT $offset+relative_slot,substr($packed,relative_slot*20+1,20) FROM slots;
+                """;
+            command.Parameters.AddWithValue("$offset", offset);
+            command.Parameters.AddWithValue("$count", count);
+            command.Parameters.Add("$packed", SqliteType.Blob).Value = packed;
+            await command.ExecuteNonQueryAsync(cancellationToken);
+        }
+    }
+
+    private static async Task StageDailyObservationsAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        IReadOnlyList<ChhtHashGroup> groups,
+        ReadOnlyMemory<byte> dailyActorKey,
+        CancellationToken cancellationToken)
+    {
+        var totalRecords = 0;
+        foreach (var group in groups)
+            totalRecords = checked(totalRecords + group.ActorFingerprints.Count);
+        if (totalRecords == 0) return;
+
+        var json = CreateDailyObservationJson(
+            Math.Min(DailyObservationStagingRowsPerCommand, totalRecords));
+        var staged = 0;
+        var completed = 0;
+        for (var slot = 0; slot < groups.Count; slot++)
+            foreach (var actor in groups[slot].ActorFingerprints)
+            {
+                if (staged != 0) json.Append(',');
+                json.Append('[');
+                AppendInvariant(json, slot);
+                json.Append(',');
+                AppendInvariant(json, DailyActorFingerprint(dailyActorKey.Span, actor));
+                json.Append(']');
+                staged++;
+                if (staged != DailyObservationStagingRowsPerCommand) continue;
+                json.Append(']');
+                await InsertDailyObservationRowsAsync(
+                    connection, transaction, json.ToString(), cancellationToken);
+                completed += staged;
+                staged = 0;
+                json = CreateDailyObservationJson(
+                    Math.Min(DailyObservationStagingRowsPerCommand, totalRecords - completed));
+            }
+        if (staged == 0) return;
+        json.Append(']');
+        await InsertDailyObservationRowsAsync(
+            connection, transaction, json.ToString(), cancellationToken);
+    }
+
+    private static StringBuilder CreateDailyObservationJson(int recordCapacity) =>
+        new StringBuilder(Math.Max(2, checked(recordCapacity * 32 + 2))).Append('[');
+
+    private static void AppendInvariant(StringBuilder builder, long value)
+    {
+        Span<char> buffer = stackalloc char[20];
+        if (!value.TryFormat(buffer, out var written, provider: CultureInfo.InvariantCulture))
+            throw new InvalidOperationException("Failed to format daily heat integer");
+        builder.Append(buffer[..written]);
+    }
+
+    private static async Task InsertDailyObservationRowsAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        string rowsJson,
+        CancellationToken cancellationToken)
+    {
+        await using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText =
+            """
+            INSERT OR IGNORE INTO daily_ingest_observations(slot,actor)
+            SELECT CAST(json_extract(value,'$[0]') AS INTEGER),
+                   CAST(json_extract(value,'$[1]') AS INTEGER)
+              FROM json_each($rows);
+            """;
+        command.Parameters.AddWithValue("$rows", rowsJson);
+        await command.ExecuteNonQueryAsync(cancellationToken);
     }
 
     private static async Task<HeatCompletionResult> PersistCompletionAsync(
@@ -495,6 +652,7 @@ public sealed class HeatAccumulatorService : BackgroundService
             PRAGMA synchronous=FULL;
             PRAGMA foreign_keys=ON;
             PRAGMA busy_timeout=5000;
+            PRAGMA temp_store=MEMORY;
             CREATE TABLE IF NOT EXISTS hashes (
                 hash_id INTEGER PRIMARY KEY,
                 info_hash BLOB NOT NULL UNIQUE CHECK(length(info_hash)=20)
