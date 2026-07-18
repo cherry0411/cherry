@@ -21,6 +21,7 @@
     {"kind": "sampler_end", "success": true, "runtime_windows": 30}
   ],
   "result": {
+    "measurement_seconds": 300,
     "runtime_windows": 10,
     "health": {
       "monitor_samples": 10,

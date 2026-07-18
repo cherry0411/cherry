@@ -113,7 +113,8 @@ def validate_prereg(prereg: Mapping[str, Any]) -> None:
         "validity.internal_drop_ratio_max", "validity.internal_drop_consecutive_windows",
         "validity.kernel_immediate_ratio", "validity.kernel_min_loss",
         "validity.kernel_conditioned_ratio", "validity.kernel_two_window_loss",
-        "validity.qdisc_drops_per_active_minute", "validity.announce_queued_min",
+        "validity.qdisc_drops_per_active_minute",
+        "validity.result_counter_sample_interval_seconds", "validity.announce_queued_min",
         "validity.announce_first_second_ratio", "validity.exposure_checks",
         "firewall.ufw.command", "firewall.ufw.sha256",
         "firewall.raw.command", "firewall.raw.sha256",
@@ -239,6 +240,7 @@ def validate_prereg(prereg: Mapping[str, Any]) -> None:
         "sampler_tail_seconds", "owner_grace_seconds", "controller_done_grace_seconds",
         "rss_max_mb", "cpu_max_percent", "cpu_consecutive_samples",
         "internal_drop_consecutive_windows", "kernel_min_loss", "kernel_two_window_loss",
+        "result_counter_sample_interval_seconds",
     )
     for field in positive_fields:
         if float(nested(prereg, f"validity.{field}")) <= 0:
@@ -670,6 +672,13 @@ def qdisc(netdev: str) -> int:
     return 0
 
 
+def qdisc_allowance(drops_per_active_minute: float, active_seconds: float) -> float:
+    """Return the preregistered cumulative allowance for an observed interval."""
+    if drops_per_active_minute < 0 or active_seconds < 0:
+        raise ValueError("qdisc rate and active duration must be non-negative")
+    return drops_per_active_minute * active_seconds / 60.0
+
+
 def netdev_drops(netdev: str) -> tuple[int, int]:
     try:
         for line in Path("/proc/net/dev").read_text().splitlines():
@@ -979,13 +988,16 @@ def sampler_main(argv: Sequence[str] | None = None) -> int:
                 high_cpu = high_cpu + 1 if cpu > float(validity["cpu_max_percent"]) else 0
                 if high_cpu >= int(validity["cpu_consecutive_samples"]):
                     gate("cpu_over_limit_consecutive_samples", cpu_pct=cpu, consecutive=high_cpu)
-                allowed_qdisc = (
-                    (max(elapsed - int(baseline["elapsed_s"]), 1) + 59) // 60
-                ) * int(validity["qdisc_drops_per_active_minute"])
+                active_seconds = max(elapsed - int(baseline["elapsed_s"]), 0)
+                allowed_qdisc = qdisc_allowance(
+                    float(validity["qdisc_drops_per_active_minute"]), active_seconds
+                )
                 if qdisc_drops - int(baseline["qdisc_drops"]) > allowed_qdisc:
                     gate(
                         "qdisc_growth_over_limit",
-                        delta=qdisc_drops - int(baseline["qdisc_drops"]), allowed=allowed_qdisc,
+                        delta=qdisc_drops - int(baseline["qdisc_drops"]),
+                        allowed=allowed_qdisc, active_seconds=active_seconds,
+                        drops_per_active_minute=validity["qdisc_drops_per_active_minute"],
                     )
             if stopped:
                 break
@@ -1046,7 +1058,21 @@ def result_gates(
     validity = nested(prereg, "validity")
     measure_windows = int(nested(prereg, "design.measure_seconds_per_block")) // RUNTIME_PERIOD_SECONDS
     gates: list[dict[str, Any]] = []
+    measurement_seconds = result.get("measurement_seconds")
+    expected_measurement_seconds = int(nested(prereg, "design.measure_seconds_per_block"))
+    if (
+        isinstance(measurement_seconds, bool)
+        or not isinstance(measurement_seconds, (int, float))
+        or float(measurement_seconds) != expected_measurement_seconds
+    ):
+        add_gate(
+            gates, "measurement_seconds_mismatch_or_missing",
+            actual=measurement_seconds, expected=expected_measurement_seconds,
+        )
     health = result.get("health", {})
+    if not isinstance(health, Mapping):
+        add_gate(gates, "result_health_missing_or_invalid", actual=health)
+        health = {}
     if int(result.get("runtime_windows", -1)) != measure_windows:
         add_gate(gates, "measurement_runtime_windows_mismatch", actual=result.get("runtime_windows"), expected=measure_windows)
     if int(health.get("monitor_samples", -1)) != measure_windows:
@@ -1086,11 +1112,50 @@ def result_gates(
             add_gate(gates, "measurement_pause_or_wire_queue_drop")
 
     resources = result.get("resources", {})
-    for key in ("udp_rcvbuf_errors", "udp_sndbuf_errors", "tx_qdisc_drops"):
-        if int(resources.get(key, -1)) != 0:
-            add_gate(gates, f"result_{key}_nonzero", actual=resources.get(key))
-    if float(resources.get("rss_mb_max", float("inf"))) > float(validity["rss_max_mb"]):
-        add_gate(gates, "result_rss_over_limit", actual=resources.get("rss_mb_max"), limit=validity["rss_max_mb"])
+    if not isinstance(resources, Mapping):
+        add_gate(gates, "result_resources_missing_or_invalid", actual=resources)
+        resources = {}
+    for key in ("udp_rcvbuf_errors", "udp_sndbuf_errors"):
+        value = resources.get(key)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            add_gate(gates, "result_resource_missing_or_invalid", resource=key, actual=value)
+        elif value < 0:
+            add_gate(gates, "result_resource_negative", resource=key, actual=value)
+        elif value != 0:
+            add_gate(gates, f"result_{key}_nonzero", actual=value)
+
+    qdisc_drops = resources.get("tx_qdisc_drops")
+    monitor_samples = health.get("monitor_samples") if isinstance(health, Mapping) else None
+    counter_interval = float(validity["result_counter_sample_interval_seconds"])
+    if isinstance(qdisc_drops, bool) or not isinstance(qdisc_drops, (int, float)):
+        add_gate(
+            gates, "result_resource_missing_or_invalid",
+            resource="tx_qdisc_drops", actual=qdisc_drops,
+        )
+    elif qdisc_drops < 0:
+        add_gate(gates, "result_resource_negative", resource="tx_qdisc_drops", actual=qdisc_drops)
+    elif isinstance(monitor_samples, bool) or not isinstance(monitor_samples, (int, float)) or monitor_samples < 2:
+        add_gate(
+            gates, "qdisc_active_duration_unavailable",
+            monitor_samples=monitor_samples,
+        )
+    else:
+        active_seconds = (float(monitor_samples) - 1.0) * counter_interval
+        allowed_qdisc = qdisc_allowance(
+            float(validity["qdisc_drops_per_active_minute"]), active_seconds
+        )
+        if qdisc_drops > allowed_qdisc:
+            add_gate(
+                gates, "result_tx_qdisc_rate_over_limit", actual=qdisc_drops,
+                allowed=allowed_qdisc, active_seconds=active_seconds,
+                drops_per_active_minute=validity["qdisc_drops_per_active_minute"],
+            )
+
+    rss_max = resources.get("rss_mb_max")
+    if isinstance(rss_max, bool) or not isinstance(rss_max, (int, float)):
+        add_gate(gates, "result_resource_missing_or_invalid", resource="rss_mb_max", actual=rss_max)
+    elif rss_max > float(validity["rss_max_mb"]):
+        add_gate(gates, "result_rss_over_limit", actual=rss_max, limit=validity["rss_max_mb"])
     local = result.get("local_funnel", {})
     if int(local.get("wire_queue_dropped", -1)) != 0:
         add_gate(gates, "result_wire_queue_dropped", actual=local.get("wire_queue_dropped"))

@@ -93,6 +93,12 @@ For every block, the supervisor enforces all of the following:
   an early-exit gate is emitted;
 - crawler pause, wire queue loss, internal DHT loss, kernel/socket loss, RSS,
   CPU, qdisc, softnet and netdev gates use numeric preregistered thresholds;
+- qdisc is a rate gate, not a zero-growth gate: both the 10-second sidecar and
+  `result.json` compare cumulative growth with
+  `qdisc_drops_per_active_minute * observed_seconds / 60`. The result-side
+  observed duration is `(monitor_samples - 1) *
+  result_counter_sample_interval_seconds`; missing counters or duration fail
+  closed, while a value exactly on the boundary remains eligible;
 - the run manifest binds the expected arm, binary, template config, overrides,
   node path, UDP base port and frozen baseline hash;
 - every artifact hash, the node content-set digest and the read-only production

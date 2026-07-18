@@ -141,6 +141,7 @@
         "internal_drop_ratio_max", "internal_drop_consecutive_windows",
         "kernel_immediate_ratio", "kernel_min_loss", "kernel_conditioned_ratio",
         "kernel_two_window_loss", "qdisc_drops_per_active_minute", "announce_queued_min",
+        "result_counter_sample_interval_seconds",
         "announce_first_second_ratio", "exposure_checks"
       ],
       "properties": {
@@ -159,6 +160,7 @@
         "kernel_conditioned_ratio": {"type": "number", "minimum": 0, "maximum": 1},
         "kernel_two_window_loss": {"type": "integer", "minimum": 1},
         "qdisc_drops_per_active_minute": {"type": "integer", "minimum": 0},
+        "result_counter_sample_interval_seconds": {"type": "number", "exclusiveMinimum": 0},
         "announce_queued_min": {"type": "integer", "minimum": 0},
         "announce_first_second_ratio": {"$ref": "#/$defs/range"},
         "exposure_checks": {

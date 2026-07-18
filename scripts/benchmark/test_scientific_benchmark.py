@@ -13,6 +13,7 @@ from scientific_benchmark import (  # noqa: E402
     expected_plan,
     node_content_digest,
     parse_proc_ports,
+    qdisc_allowance,
     result_gates,
     runtime_rows,
     sampler_event_gates,
@@ -113,6 +114,7 @@ def prereg_fixture(tmp_path: Path) -> dict:
             "kernel_conditioned_ratio": 0.0001,
             "kernel_two_window_loss": 32,
             "qdisc_drops_per_active_minute": 200,
+            "result_counter_sample_interval_seconds": 30,
             "announce_queued_min": 50_000,
             "announce_first_second_ratio": [0.70, 1.30],
             "exposure_checks": [
@@ -197,6 +199,59 @@ def test_full_measurement_result_and_lifecycle_fixture_pass(tmp_path: Path):
     lifecycle = audit_fixture()["sampler_lifecycle"]
     events.write_text("\n".join(json.dumps(row) for row in lifecycle) + "\n", encoding="utf-8")
     assert sampler_event_gates(events) == []
+
+
+@pytest.mark.parametrize("drops", [0, 256, 900])
+def test_qdisc_result_uses_preregistered_per_active_minute_boundary(
+    tmp_path: Path, drops: int
+):
+    prereg = prereg_fixture(tmp_path)
+    crawler_log = tmp_path / "crawler.log"
+    crawler_log.write_text("\n".join(runtime_line() for _ in range(30)) + "\n")
+    result = good_result()
+    result["resources"]["tx_qdisc_drops"] = drops
+
+    # Ten 30-second counter samples observe nine intervals = 270 seconds.
+    assert qdisc_allowance(200, 270) == 900
+    gates, _ = result_gates(prereg, "fixture", result, crawler_log)
+    assert not any(gate["reason"] == "result_tx_qdisc_rate_over_limit" for gate in gates)
+    assert gates == []
+
+
+def test_qdisc_result_one_over_preregistered_boundary_fails(tmp_path: Path):
+    prereg = prereg_fixture(tmp_path)
+    crawler_log = tmp_path / "crawler.log"
+    crawler_log.write_text("\n".join(runtime_line() for _ in range(30)) + "\n")
+    result = good_result()
+    result["resources"]["tx_qdisc_drops"] = 901
+
+    gates, _ = result_gates(prereg, "fixture", result, crawler_log)
+    qdisc_gate = next(gate for gate in gates if gate["reason"] == "result_tx_qdisc_rate_over_limit")
+    assert qdisc_gate == {
+        "kind": "gate",
+        "reason": "result_tx_qdisc_rate_over_limit",
+        "actual": 901,
+        "allowed": 900.0,
+        "active_seconds": 270.0,
+        "drops_per_active_minute": 200,
+    }
+
+
+@pytest.mark.parametrize("missing", ["tx_qdisc_drops", "udp_rcvbuf_errors", "udp_sndbuf_errors"])
+def test_missing_result_drop_counter_fails_closed(tmp_path: Path, missing: str):
+    prereg = prereg_fixture(tmp_path)
+    crawler_log = tmp_path / "crawler.log"
+    crawler_log.write_text("\n".join(runtime_line() for _ in range(30)) + "\n")
+    result = good_result()
+    result["resources"].pop(missing)
+
+    gates, _ = result_gates(prereg, "fixture", result, crawler_log)
+    assert {
+        "kind": "gate",
+        "reason": "result_resource_missing_or_invalid",
+        "resource": missing,
+        "actual": None,
+    } in gates
 
 
 def test_run_manifest_binds_binary_config_node_baseline_and_arm(tmp_path: Path):
