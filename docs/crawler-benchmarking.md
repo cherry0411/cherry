@@ -9,6 +9,8 @@ a process clears its local caches and can make the same metadata look new again.
 Every run has an immutable directory under `bench/runs/` containing:
 
 - the effective config and its SHA-256;
+- the tracked template SHA and a treatment SHA derived only from the template
+  plus sorted experimental overrides (excluding run-specific IDs/paths);
 - binary SHA-256 plus the commit/source/config identifiers printed by the binary;
 - warm/cold identity mode, port, node-ID cohort, host/kernel/sysctl snapshot;
 - complete crawler log and 30-second CPU/RSS/network/oracle samples;

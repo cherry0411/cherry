@@ -76,6 +76,7 @@ done
 [[ -x "${binary}" ]] || { echo "crawler binary is not executable: ${binary}" >&2; exit 2; }
 [[ -x "${sink_binary}" ]] || { echo "sink binary is not executable: ${sink_binary}" >&2; exit 2; }
 [[ -f "${config}" ]] || { echo "config does not exist: ${config}" >&2; exit 2; }
+template_config_sha="$(sha256sum "${config}" | awk '{print $1}')"
 
 duration_seconds() {
   local raw="$1" number unit
@@ -116,6 +117,12 @@ prepare_args=(
 for override in "${overrides[@]}"; do prepare_args+=(--set "${override}"); done
 python3 "${SCRIPT_DIR}/benchmark/prepare_config.py" "${prepare_args[@]}"
 config_sha="$(sha256sum "${effective_config}" | awk '{print $1}')"
+if ((${#overrides[@]})); then
+  treatment_input="$(printf '%s\n' "${overrides[@]}" | sort)"
+else
+  treatment_input=""
+fi
+treatment_sha="$(printf '%s\n%s' "${template_config_sha}" "${treatment_input}" | sha256sum | awk '{print $1}')"
 
 sink_base="${sink_url%%/api/*}"
 if ! curl -fsS "${sink_base}/health" >/dev/null 2>&1; then
@@ -161,6 +168,7 @@ uname -a > "${run_dir}/environment.txt"
 export RUN_ID="${run_id}" LABEL="${label}" VARIANT="${variant}" MODE="${mode}" COHORT="${cohort}"
 export WARMUP_SECONDS="${warmup_seconds}" MEASURE_SECONDS="${measure_seconds}" PORT="${port}"
 export BINARY="${binary}" BINARY_SHA="${binary_sha}" CONFIG="${effective_config}" CONFIG_SHA="${config_sha}"
+export TEMPLATE_CONFIG_SHA="${template_config_sha}" TREATMENT_SHA="${treatment_sha}"
 export NODE_DIR="${node_dir}" SINK_URL="${sink_url}"
 export NODE_IDS_BEFORE="${node_ids_before}"
 if ((${#overrides[@]})); then
@@ -173,7 +181,8 @@ export BUILD_JSON="${run_dir}/build.json"
 python3 - "${run_dir}/manifest.json" <<'PY'
 import json, os, sys
 keys = ["RUN_ID", "LABEL", "VARIANT", "MODE", "COHORT", "WARMUP_SECONDS", "MEASURE_SECONDS",
-        "PORT", "BINARY", "BINARY_SHA", "CONFIG", "CONFIG_SHA", "NODE_DIR", "NODE_IDS_BEFORE", "SINK_URL"]
+        "PORT", "BINARY", "BINARY_SHA", "CONFIG", "CONFIG_SHA", "TEMPLATE_CONFIG_SHA", "TREATMENT_SHA",
+        "NODE_DIR", "NODE_IDS_BEFORE", "SINK_URL"]
 manifest = {key.lower(): os.environ[key] for key in keys}
 manifest["schema_version"] = 1
 manifest["overrides"] = os.environ.get("OVERRIDES", "").splitlines() if os.environ.get("OVERRIDES") else []
