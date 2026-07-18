@@ -5,3 +5,5 @@ node_modules/
 cherry-picker/.bench/
 migration/node_modules/
 scripts/node_modules/
+__pycache__/
+*.py[cod]
