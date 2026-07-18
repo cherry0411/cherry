@@ -31,6 +31,8 @@ public class SearchService
             IsPrivate: t.IsPrivate,
             PeerCount: t.PeerCount,
             CreatedAt: t.CreatedAt,
+            RetainedLevel: t.RetainedLevel.ToString().ToLowerInvariant(),
+            NeedsRefetch: t.NeedsRefetch,
             Files: null
         )).ToList();
 
@@ -63,6 +65,8 @@ public class SearchService
             IsPrivate: t.IsPrivate,
             PeerCount: t.PeerCount,
             CreatedAt: t.CreatedAt,
+            RetainedLevel: t.RetainedLevel.ToString().ToLowerInvariant(),
+            NeedsRefetch: t.NeedsRefetch,
             Files: null
         )).ToList();
     }
@@ -81,6 +85,8 @@ public class SearchService
             IsPrivate: t.IsPrivate,
             PeerCount: t.PeerCount,
             CreatedAt: t.CreatedAt,
+            RetainedLevel: t.RetainedLevel.ToString().ToLowerInvariant(),
+            NeedsRefetch: t.NeedsRefetch,
             Files: t.Files.Select(f => new TorrentFileDto(f.PathText, f.Length)).ToList()
         );
     }

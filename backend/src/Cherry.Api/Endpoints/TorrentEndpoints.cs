@@ -1,9 +1,11 @@
 using System.Text;
+using System.Text.Json;
 using Cherry.Application.Dtos;
 using Cherry.Application.Services;
 using Cherry.Domain.Entities;
 using Cherry.Domain.Interfaces;
 using Cherry.Infrastructure.Data;
+using Cherry.Infrastructure.Repositories;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
 
@@ -22,6 +24,17 @@ public static class TorrentEndpoints
             .WithDescription("Receive torrent metadata batch from crawlers. Each event contains info_hash and metadata including file list.")
             .Produces<BatchIngestResponse>(200)
             .Produces(400);
+
+        group.MapPost("/batch/durable", IngestDurableBatchAsync)
+            .WithName("IngestDurableBatch")
+            .WithSummary("原子接收可重放的爬虫元数据批次")
+            .WithDescription("Hashes the raw events JSON bytes and atomically commits normalized/summary metadata, hash/reject decisions, and a per-crawler epoch receipt.")
+            .Produces<DurableBatchResponse>(StatusCodes.Status200OK)
+            .Produces<DurableBatchResponse>(StatusCodes.Status409Conflict)
+            .Produces(StatusCodes.Status400BadRequest)
+            .Produces(StatusCodes.Status401Unauthorized)
+            .Produces(StatusCodes.Status413PayloadTooLarge)
+            .Produces(StatusCodes.Status503ServiceUnavailable);
 
         group.MapPost("/upload", UploadTorrentAsync)
             .WithName("UploadTorrent")
@@ -442,6 +455,64 @@ public static class TorrentEndpoints
             return Results.StatusCode(429);
         return Results.Ok(result);
     }
+
+    private static async Task<IResult> IngestDurableBatchAsync(
+        HttpRequest request,
+        DurableIngestService ingestService,
+        CancellationToken cancellationToken)
+    {
+        const int maxRequestBytes = 64 * 1024 * 1024;
+        if (request.ContentLength > maxRequestBytes)
+        {
+            return Results.Json(
+                new { error = $"Request body exceeds {maxRequestBytes} bytes" },
+                statusCode: StatusCodes.Status413PayloadTooLarge);
+        }
+
+        try
+        {
+            var body = await ReadBodyAsync(request, maxRequestBytes, cancellationToken);
+            var parsed = DurableBatchPayloadParser.Parse(body);
+            var result = await ingestService.IngestAsync(parsed, cancellationToken);
+            return result.IsConflict
+                ? Results.Json(result.Response, statusCode: StatusCodes.Status409Conflict)
+                : Results.Ok(result.Response);
+        }
+        catch (DurableRequestTooLargeException exception)
+        {
+            return Results.Json(
+                new { error = exception.Message },
+                statusCode: StatusCodes.Status413PayloadTooLarge);
+        }
+        catch (Exception exception) when (
+            exception is JsonException or DurableBatchValidationException)
+        {
+            return Results.BadRequest(new { error = exception.Message });
+        }
+    }
+
+    private static async Task<byte[]> ReadBodyAsync(
+        HttpRequest request,
+        int maxBytes,
+        CancellationToken cancellationToken)
+    {
+        var initialCapacity = request.ContentLength is > 0 && request.ContentLength <= maxBytes
+            ? checked((int)request.ContentLength.Value)
+            : 0;
+        using var body = new MemoryStream(initialCapacity);
+        var buffer = new byte[64 * 1024];
+        while (true)
+        {
+            var read = await request.Body.ReadAsync(buffer, cancellationToken);
+            if (read == 0)
+                return body.ToArray();
+            if (body.Length + read > maxBytes)
+                throw new DurableRequestTooLargeException($"Request body exceeds {maxBytes} bytes");
+            await body.WriteAsync(buffer.AsMemory(0, read), cancellationToken);
+        }
+    }
+
+    private sealed class DurableRequestTooLargeException(string message) : Exception(message);
 
     private static async Task<IResult> SearchAsync(
         [FromQuery] string q,

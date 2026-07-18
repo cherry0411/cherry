@@ -58,8 +58,19 @@ public class TorrentRepository : ITorrentRepository
         HashSet<string> insertedHashes;
         try
         {
+            await ExactHashTransactionLock.AcquireAsync(
+                unique.Select(torrent => torrent.InfoHash),
+                conn,
+                tx,
+                ct);
+
             // Step 1: INSERT torrents via unnest arrays �� no temp table needed.
             insertedHashes = await InsertTorrentsAsync(unique, conn, tx, ct);
+            await ExactHashTransactionLock.DeleteDecisionsForTorrentsAsync(
+                unique.Select(torrent => torrent.InfoHash).ToArray(),
+                conn,
+                tx,
+                ct);
 
             // Step 2: INSERT files for successfully inserted torrents.
             var files = new List<TorrentFile>();
@@ -276,12 +287,19 @@ public class TorrentRepository : ITorrentRepository
             """
             SELECT t.info_hash
               FROM torrents AS t
-             WHERE t.info_hash = ANY(@hashes)
+             WHERE NOT t.needs_refetch
+               AND t.info_hash = ANY(@hashes)
             UNION
             SELECT encode(r.info_hash, 'hex')
               FROM rejected_hashes AS r
               JOIN unnest(@hashes::text[]) AS h(hash)
                 ON r.info_hash = decode(h.hash, 'hex')
+            UNION
+            SELECT encode(d.info_hash, 'hex')
+              FROM metadata_decisions AS d
+              JOIN unnest(@hashes::text[]) AS h(hash)
+                ON d.info_hash = decode(h.hash, 'hex')
+             WHERE NOT d.needs_refetch
             """, conn);
         cmd.Parameters.AddWithValue("hashes", hashes.ToArray());
 
@@ -302,9 +320,11 @@ public class TorrentRepository : ITorrentRepository
 
         await using var cmd = new NpgsqlCommand(
             """
-            SELECT info_hash FROM torrents
+            SELECT info_hash FROM torrents WHERE NOT needs_refetch
             UNION ALL
             SELECT encode(info_hash, 'hex') FROM rejected_hashes
+            UNION ALL
+            SELECT encode(info_hash, 'hex') FROM metadata_decisions WHERE NOT needs_refetch
             """, conn);
         await using var reader = await cmd.ExecuteReaderAsync(
             System.Data.CommandBehavior.SequentialAccess,

@@ -22,6 +22,113 @@ namespace Cherry.Infrastructure.Data.Migrations
 
             NpgsqlModelBuilderExtensions.UseIdentityByDefaultColumns(modelBuilder);
 
+            modelBuilder.Entity("Cherry.Domain.Entities.DurableBatchReceipt", b =>
+                {
+                    b.Property<string>("CrawlerId")
+                        .HasMaxLength(256)
+                        .HasColumnType("character varying(256)")
+                        .HasColumnName("crawler_id");
+
+                    b.Property<long>("Epoch")
+                        .HasColumnType("bigint")
+                        .HasColumnName("epoch");
+
+                    b.Property<int>("LastAccepted")
+                        .HasColumnType("integer")
+                        .HasColumnName("last_accepted");
+
+                    b.Property<int>("LastDuplicates")
+                        .HasColumnType("integer")
+                        .HasColumnName("last_duplicates");
+
+                    b.Property<long>("LastEndSequence")
+                        .HasColumnType("bigint")
+                        .HasColumnName("last_end_sequence");
+
+                    b.Property<string>("LastPayloadSha256")
+                        .IsRequired()
+                        .HasMaxLength(64)
+                        .HasColumnType("character varying(64)")
+                        .HasColumnName("last_payload_sha256");
+
+                    b.Property<long>("LastStartSequence")
+                        .HasColumnType("bigint")
+                        .HasColumnName("last_start_sequence");
+
+                    b.Property<DateTime>("UpdatedAt")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("timestamp with time zone")
+                        .HasColumnName("updated_at")
+                        .HasDefaultValueSql("NOW()");
+
+                    b.HasKey("CrawlerId", "Epoch");
+
+                    b.ToTable("durable_batch_receipts", null, t =>
+                        {
+                            t.HasCheckConstraint("CK_durable_batch_receipts_epoch", "epoch > 0");
+
+                            t.HasCheckConstraint("CK_durable_batch_receipts_state", "(last_start_sequence = 0 AND last_end_sequence = 0 AND last_payload_sha256 = '' AND last_accepted = 0 AND last_duplicates = 0) OR (last_start_sequence > 0 AND last_end_sequence >= last_start_sequence AND char_length(last_payload_sha256) = 64 AND last_accepted >= 0 AND last_duplicates >= 0)");
+                        });
+                });
+
+            modelBuilder.Entity("Cherry.Domain.Entities.MetadataDecision", b =>
+                {
+                    b.Property<byte[]>("InfoHash")
+                        .HasColumnType("bytea")
+                        .HasColumnName("info_hash");
+
+                    b.Property<short>("Action")
+                        .HasColumnType("smallint")
+                        .HasColumnName("action");
+
+                    b.Property<DateTime?>("FirstSeen")
+                        .HasColumnType("timestamp with time zone")
+                        .HasColumnName("first_seen");
+
+                    b.Property<bool>("NeedsRefetch")
+                        .HasColumnType("boolean")
+                        .HasColumnName("needs_refetch");
+
+                    b.Property<string>("PolicyId")
+                        .HasMaxLength(256)
+                        .HasColumnType("character varying(256)")
+                        .HasColumnName("policy_id");
+
+                    b.Property<string>("Reason")
+                        .IsRequired()
+                        .HasMaxLength(1024)
+                        .HasColumnType("character varying(1024)")
+                        .HasColumnName("reason");
+
+                    b.Property<string>("Region")
+                        .HasMaxLength(64)
+                        .HasColumnType("character varying(64)")
+                        .HasColumnName("region");
+
+                    b.Property<short>("RetainedLevel")
+                        .HasColumnType("smallint")
+                        .HasColumnName("retained_level");
+
+                    b.Property<DateTime>("UpdatedAt")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("timestamp with time zone")
+                        .HasColumnName("updated_at")
+                        .HasDefaultValueSql("NOW()");
+
+                    b.HasKey("InfoHash");
+
+                    b.ToTable("metadata_decisions", null, t =>
+                        {
+                            t.HasCheckConstraint("CK_metadata_decisions_action", "action IN (1, 2)");
+
+                            t.HasCheckConstraint("CK_metadata_decisions_info_hash", "octet_length(info_hash) = 20");
+
+                            t.HasCheckConstraint("CK_metadata_decisions_refetch", "action = 1 OR NOT needs_refetch");
+
+                            t.HasCheckConstraint("CK_metadata_decisions_retained_level", "retained_level = 1");
+                        });
+                });
+
             modelBuilder.Entity("Cherry.Domain.Entities.Torrent", b =>
                 {
                     b.Property<string>("InfoHash")
@@ -48,6 +155,12 @@ namespace Cherry.Infrastructure.Data.Migrations
                         .HasColumnType("text")
                         .HasColumnName("name");
 
+                    b.Property<bool>("NeedsRefetch")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("boolean")
+                        .HasDefaultValue(false)
+                        .HasColumnName("needs_refetch");
+
                     b.Property<int>("PeerCount")
                         .ValueGeneratedOnAdd()
                         .HasColumnType("integer")
@@ -61,6 +174,22 @@ namespace Cherry.Infrastructure.Data.Migrations
                     b.Property<int>("PieceLength")
                         .HasColumnType("integer")
                         .HasColumnName("piece_length");
+
+                    b.Property<string>("PolicyId")
+                        .HasMaxLength(256)
+                        .HasColumnType("character varying(256)")
+                        .HasColumnName("policy_id");
+
+                    b.Property<string>("Region")
+                        .HasMaxLength(64)
+                        .HasColumnType("character varying(64)")
+                        .HasColumnName("region");
+
+                    b.Property<short>("RetainedLevel")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("smallint")
+                        .HasDefaultValue((short)3)
+                        .HasColumnName("retained_level");
 
                     b.Property<string>("Source")
                         .HasMaxLength(32)
@@ -82,16 +211,40 @@ namespace Cherry.Infrastructure.Data.Migrations
                     b.HasIndex("CreatedAt")
                         .HasDatabaseName("idx_torrents_created");
 
-                    b.HasIndex("Name")
-                        .HasDatabaseName("idx_torrents_name_trgm");
-
-                    NpgsqlIndexBuilderExtensions.HasMethod(b.HasIndex("Name"), "GIN");
-                    NpgsqlIndexBuilderExtensions.HasOperators(b.HasIndex("Name"), new[] { "gin_trgm_ops" });
-
                     b.HasIndex("PeerCount")
                         .HasDatabaseName("idx_torrents_peer_count");
 
-                    b.ToTable("torrents", (string)null);
+                    b.ToTable("torrents", null, t =>
+                        {
+                            t.HasCheckConstraint("CK_torrents_refetch", "retained_level = 2 OR NOT needs_refetch");
+
+                            t.HasCheckConstraint("CK_torrents_retained_level", "retained_level IN (2, 3)");
+                        });
+                });
+
+            modelBuilder.Entity("Cherry.Domain.Entities.TorrentExtensionSummary", b =>
+                {
+                    b.Property<string>("InfoHash")
+                        .HasMaxLength(40)
+                        .HasColumnType("character varying(40)")
+                        .HasColumnName("info_hash");
+
+                    b.Property<string>("Extension")
+                        .HasMaxLength(32)
+                        .HasColumnType("character varying(32)")
+                        .HasColumnName("extension");
+
+                    b.Property<int>("FileCount")
+                        .HasColumnType("integer")
+                        .HasColumnName("file_count");
+
+                    b.Property<long>("TotalLength")
+                        .HasColumnType("bigint")
+                        .HasColumnName("total_length");
+
+                    b.HasKey("InfoHash", "Extension");
+
+                    b.ToTable("torrent_extension_summaries", (string)null);
                 });
 
             modelBuilder.Entity("Cherry.Domain.Entities.TorrentFile", b =>
@@ -113,12 +266,6 @@ namespace Cherry.Infrastructure.Data.Migrations
 
                     b.HasIndex("InfoHash")
                         .HasDatabaseName("idx_torrent_files_info_hash");
-
-                    b.HasIndex("PathText")
-                        .HasDatabaseName("idx_torrent_files_path");
-
-                    NpgsqlIndexBuilderExtensions.HasMethod(b.HasIndex("PathText"), "GIN");
-                    NpgsqlIndexBuilderExtensions.HasOperators(b.HasIndex("PathText"), new[] { "gin_trgm_ops" });
 
                     b.ToTable("torrent_files", (string)null);
                 });

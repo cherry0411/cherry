@@ -7,6 +7,7 @@ using Xunit;
 
 namespace Cherry.Infrastructure.Tests.Repositories;
 
+[Collection("Postgres integration")]
 public sealed class TorrentRepositoryPostgresTests
 {
     [Fact]
@@ -20,11 +21,15 @@ public sealed class TorrentRepositoryPostgresTests
             .UseNpgsql(connectionString)
             .Options;
         await using var db = new AppDbContext(options);
+        await db.Database.ExecuteSqlRawAsync("CREATE EXTENSION IF NOT EXISTS pg_trgm");
+        await db.Database.MigrateAsync();
         var filter = new RecordingProcessedHashFilter();
         var repository = new TorrentRepository(db, processedHashFilter: filter);
-        var torrentHash = HashFor(1);
-        var rejectedHash = HashFor(2);
-        var missingHash = HashFor(3);
+        // Use per-run identities so the real PostgreSQL test is repeatable
+        // against a reused developer/CI database.
+        var torrentHash = HashFor(Guid.NewGuid());
+        var rejectedHash = HashFor(Guid.NewGuid());
+        var missingHash = HashFor(Guid.NewGuid());
 
         var firstInsert = await repository.BulkInsertTorrentsAsync(
             [Torrent(torrentHash)],
@@ -71,8 +76,8 @@ public sealed class TorrentRepositoryPostgresTests
         Files = [new TorrentFile { PathText = "test.bin", Length = 100 }]
     };
 
-    private static string HashFor(int value) =>
-        Convert.ToHexString(System.Security.Cryptography.SHA1.HashData(BitConverter.GetBytes(value)))
+    private static string HashFor(Guid value) =>
+        Convert.ToHexString(System.Security.Cryptography.SHA1.HashData(value.ToByteArray()))
             .ToLowerInvariant();
 
     private sealed class RecordingProcessedHashFilter : IProcessedHashFilter

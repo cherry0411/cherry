@@ -18,9 +18,5 @@ public class TorrentFileConfiguration : IEntityTypeConfiguration<TorrentFile>
 
         builder.HasIndex(x => x.InfoHash).HasDatabaseName("idx_torrent_files_info_hash");
 
-        builder.HasIndex(x => x.PathText)
-            .HasDatabaseName("idx_torrent_files_path")
-            .HasMethod("GIN")
-            .HasOperators("gin_trgm_ops");
     }
 }

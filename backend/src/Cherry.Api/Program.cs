@@ -60,6 +60,7 @@ builder.Services.AddHostedService(sp =>
     sp.GetRequiredService<ProcessedHashFilter>());
 builder.Services.AddSingleton<Cherry.Application.Services.PendingRequestTracker>();
 builder.Services.AddScoped<ITorrentRepository, TorrentRepository>();
+builder.Services.AddScoped<DurableIngestService>();
 builder.Services.AddScoped<SearchService>();
 builder.Services.AddScoped<StatsService>();
 builder.Services.AddSingleton<IngestService>();
@@ -86,6 +87,7 @@ builder.Services.AddSwaggerGen(options =>
 var app = builder.Build();
 
 var apiKey = builder.Configuration["ApiKey"];
+const string durableCrawlerPath = "/api/v1/torrents/batch/durable";
 var protectedCrawlerPaths = new[]
 {
     "/api/v1/torrents/batch",
@@ -95,7 +97,28 @@ var protectedCrawlerPaths = new[]
 
 app.Use(async (context, next) =>
 {
-    if (!string.IsNullOrWhiteSpace(apiKey) &&
+    var normalizedPath = context.Request.Path.Value?.TrimEnd('/');
+    if (string.Equals(normalizedPath, durableCrawlerPath, StringComparison.OrdinalIgnoreCase))
+    {
+        if (string.IsNullOrWhiteSpace(apiKey))
+        {
+            context.Response.StatusCode = StatusCodes.Status503ServiceUnavailable;
+            await context.Response.WriteAsJsonAsync(new
+            {
+                error = "Durable crawler ingestion is disabled until ApiKey is configured"
+            });
+            return;
+        }
+
+        var provided = context.Request.Headers["X-API-Key"].ToString();
+        if (!string.Equals(provided, apiKey, StringComparison.Ordinal))
+        {
+            context.Response.StatusCode = StatusCodes.Status401Unauthorized;
+            await context.Response.WriteAsJsonAsync(new { error = "Invalid API key" });
+            return;
+        }
+    }
+    else if (!string.IsNullOrWhiteSpace(apiKey) &&
         protectedCrawlerPaths.Any(path => context.Request.Path.Equals(path, StringComparison.OrdinalIgnoreCase)))
     {
         var provided = context.Request.Headers["X-API-Key"].ToString();

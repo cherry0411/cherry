@@ -18,6 +18,8 @@ public record TorrentDto(
     bool IsPrivate,
     int PeerCount,
     DateTime CreatedAt,
+    string RetainedLevel,
+    bool NeedsRefetch,
     List<TorrentFileDto>? Files
 );
 
