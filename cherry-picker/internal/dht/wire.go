@@ -156,11 +156,30 @@ func getUTMetaSize(data []byte) (utMetadata int, metadataSize int, err error) {
 	return
 }
 
+// PeerSource 标记一个 metadata 下载请求的 peer 来源，用于按来源分解 wire
+// 漏斗（诊断用，不改变下载行为）。核心假设：announce_peer 的 peer 刚刚主动
+// 联系过本节点（NAT pinhole 打开、当前存活），其 dial→connect 成功率应显著
+// 高于第三方 get_peers 响应里 report 的 values（可能陈旧/已死）。这个计数器
+// 就是用来证实或证伪该假设的。
+type PeerSource uint8
+
+const (
+	// PeerSourceUnknown 表示来源未标注（默认零值，兼容旧调用）。
+	PeerSourceUnknown PeerSource = iota
+	// PeerSourceGetPeers 来自 get_peers 响应中的 values（第三方转述的 peer）。
+	PeerSourceGetPeers
+	// PeerSourceAnnounce 来自 announce_peer（peer 主动联系本节点，存活证据最强）。
+	PeerSourceAnnounce
+	// peerSourceCount 是来源枚举的基数，用于定长计数数组。
+	peerSourceCount
+)
+
 // Request 表示一个 metadata 下载请求的上下文。
 type Request struct {
 	InfoHash []byte
 	IP       string
 	Port     int
+	Source   PeerSource
 }
 
 // Response 包含请求上下文和下载到的 metadata 内容。
@@ -180,6 +199,53 @@ type WireStats struct {
 	DownloadOK      atomic.Int64 // metadata 下载并校验成功
 	DownloadFailed  atomic.Int64 // 握手后 metadata 下载或校验失败
 	Blacklisted     atomic.Int64 // 被黑名单跳过的请求数
+
+	// 按 peer 来源分解的漏斗计数（诊断用）。下标为 PeerSource。
+	// 用于验证 announce_peer 来源是否比 get_peers values 有更高的
+	// dial/connect 成功率——这是"刷新 peer 而非刷新 infohash"策略的前提。
+	//
+	// 完整漏斗（每级都按来源分解，才能定位 supply 在哪一步流失）：
+	//   queued → (blacklisted | inflightDeduped | dialAttempts)
+	//   dialAttempts → dialOK → downloadOK
+	// queued 是进入 handleRequest 的请求；blacklisted/inflightDeduped 是
+	// 拨号前就被丢弃的两条路径（坏 peer 保护 / 同 (hash,peer) 正在下载）。
+	queuedBySource          [peerSourceCount]atomic.Int64
+	blacklistedBySource     [peerSourceCount]atomic.Int64
+	inflightDedupedBySource [peerSourceCount]atomic.Int64
+	dialAttemptsBySource    [peerSourceCount]atomic.Int64
+	dialOKBySource          [peerSourceCount]atomic.Int64
+	downloadOKBySource      [peerSourceCount]atomic.Int64
+}
+
+// SourceFunnel 是某一 peer 来源的完整漏斗快照。
+type SourceFunnel struct {
+	Queued          int64
+	Blacklisted     int64
+	InflightDeduped int64
+	DialAttempts    int64
+	DialOK          int64
+	DownloadOK      int64
+}
+
+// FunnelBySource 返回各 peer 来源的漏斗快照，供上层按来源比较转化率。
+func (wire *Wire) FunnelBySource() map[PeerSource]SourceFunnel {
+	out := make(map[PeerSource]SourceFunnel, peerSourceCount)
+	for s := PeerSource(0); s < peerSourceCount; s++ {
+		out[s] = SourceFunnel{
+			Queued:          wire.Stats.queuedBySource[s].Load(),
+			Blacklisted:     wire.Stats.blacklistedBySource[s].Load(),
+			InflightDeduped: wire.Stats.inflightDedupedBySource[s].Load(),
+			DialAttempts:    wire.Stats.dialAttemptsBySource[s].Load(),
+			DialOK:          wire.Stats.dialOKBySource[s].Load(),
+			DownloadOK:      wire.Stats.downloadOKBySource[s].Load(),
+		}
+	}
+	return out
+}
+
+// BlacklistStats 返回黑名单诊断快照。
+func (wire *Wire) BlacklistStats() BlacklistStats {
+	return wire.blackList.stats()
 }
 
 // Wire 表示 peer wire 协议下载器。
@@ -231,9 +297,15 @@ func NewWire(blackListSize, requestQueueSize, workerQueueSize int) *Wire {
 }
 
 // Request 将请求放入队列。队列满时直接丢弃（调用方是 UDP 包处理 goroutine，不能阻塞）。
+// 来源标记为 Unknown，保留给不关心来源分解的旧调用方。
 func (wire *Wire) Request(infoHash []byte, ip string, port int) {
+	wire.RequestFromSource(infoHash, ip, port, PeerSourceUnknown)
+}
+
+// RequestFromSource 与 Request 相同，但标注 peer 来源用于漏斗分解。
+func (wire *Wire) RequestFromSource(infoHash []byte, ip string, port int, source PeerSource) {
 	select {
-	case wire.requests <- Request{InfoHash: infoHash, IP: ip, Port: port}:
+	case wire.requests <- Request{InfoHash: infoHash, IP: ip, Port: port, Source: source}:
 	default:
 		wire.Stats.QueueDropped.Add(1)
 	}
@@ -365,13 +437,19 @@ func (wire *Wire) fetchMetadata(r Request, key string) {
 
 	infoHash := r.InfoHash
 	address := genAddress(r.IP, r.Port)
+	src := r.Source
+	if src >= peerSourceCount {
+		src = PeerSourceUnknown
+	}
 
 	wire.Stats.DialAttempts.Add(1)
+	wire.Stats.dialAttemptsBySource[src].Add(1)
 	dial, err := net.DialTimeout("tcp", address, 500*time.Millisecond)
 	if err != nil {
 		return
 	}
 	wire.Stats.DialOK.Add(1)
+	wire.Stats.dialOKBySource[src].Add(1)
 	stage = wireStageHandshake
 	conn := dial.(*net.TCPConn)
 	conn.SetLinger(0)
@@ -496,6 +574,7 @@ func (wire *Wire) fetchMetadata(r Request, key string) {
 				}
 
 				wire.Stats.DownloadOK.Add(1)
+				wire.Stats.downloadOKBySource[src].Add(1)
 				wire.responses <- Response{
 					Request:      r,
 					MetadataInfo: metadataInfo,
@@ -538,6 +617,15 @@ func (wire *Wire) runWorker(workerID int) {
 }
 
 func (wire *Wire) handleRequest(r Request) {
+	src := r.Source
+	if src >= peerSourceCount {
+		src = PeerSourceUnknown
+	}
+	// queued：进入处理的请求（无效 infohash 不计，它不是真实 supply）。
+	if len(r.InfoHash) == 20 {
+		wire.Stats.queuedBySource[src].Add(1)
+	}
+
 	key := strings.Join([]string{
 		string(r.InfoHash), genAddress(r.IP, r.Port),
 	}, ":")
@@ -545,11 +633,15 @@ func (wire *Wire) handleRequest(r Request) {
 	if len(r.InfoHash) != 20 || wire.blackList.in(r.IP, r.Port) {
 		if len(r.InfoHash) == 20 {
 			wire.Stats.Blacklisted.Add(1)
+			wire.Stats.blacklistedBySource[src].Add(1)
 		}
 		return
 	}
 
+	// inflight dedup：同一 (infohash, peer) 已在下载中，LRU.Set 返回 false。
+	// 这是"重复 supply"而非"流失 supply"，单独计数以便和黑名单区分。
 	if !wire.queue.Set(key) {
+		wire.Stats.inflightDedupedBySource[src].Add(1)
 		return
 	}
 

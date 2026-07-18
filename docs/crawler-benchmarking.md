@@ -128,6 +128,34 @@ Use these decision rules:
    drops materially rise—even if local download count improves.
 3. Treat startup peak, local `wire_ok`, and per-process `meta_sent` only as funnel
    diagnostics.
+   - The `peer_source_funnel` section of `result.json` splits the
+     dial→connect→download funnel by peer source. `announce_*` counters come from
+     `announce_peer` senders (they just contacted this node, so their NAT pinhole
+     is open and they are provably alive right now); `getpeers_*` counters come
+     from third-party `get_peers` "values" (reported by another node, possibly
+     stale or dead). `announce_connect_rate_advantage` is
+     `announce_connect_rate / getpeers_connect_rate`.
+   - Decision rule for prioritizing announce-sourced peers (hypothesis B8): an
+     advantage materially above 1 means announce peers convert dials into
+     connections better, so preferring them should lift the connect-rate half of
+     the observed sustained-rate decay. This is a non-depleting mechanical
+     diagnostic and may be screened on short runs; it does not by itself
+     constitute a durable win. These counters are zero for legacy logs produced
+     before the instrumentation existed, so old runs remain analyzable.
+   - `peer_source_funnel` also splits the **pre-dial** stage per source:
+     `*_queued` → (`*_blacklisted` | `*_inflight_deduped` | `*_dial`).
+     `*_blacklisted_rate` and `*_inflight_rate` are fractions of queued. A funnel
+     that starves with a low dial rate but a high blacklisted or inflight share
+     means supply is being *discarded* (bad-peer bans or same-(hash,peer) already
+     downloading), not that peers are merely unreachable — a different fix than a
+     conversion problem.
+   - The `blacklist_health` section reports `size`/`max` (gauges, last observed),
+     `fill_ratio`, and accumulated `insert_rejected`/`expired_evicted`. The wire
+     blacklist silently no-ops inserts once `size >= max` (default 131072), so a
+     `fill_ratio` near 1 with rising `insert_rejected` is a blind spot: bad peers
+     stop being banned and keep consuming dial workers, depressing the connect
+     rate independently of peer supply. Treat a saturated blacklist as a
+     diagnostic finding, not a healthy steady state.
 4. Diagnose long-run decay using the slope of unique/hour against uptime, not a
    peak or a single average.
 5. Change one causal mechanism at a time. Parameter bundles are allowed only for

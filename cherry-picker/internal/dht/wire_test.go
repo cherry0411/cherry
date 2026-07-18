@@ -92,3 +92,147 @@ func TestWireCountsPreDialQueueDrop(t *testing.T) {
 		t.Fatalf("RequestDepth = %d, want 1", got)
 	}
 }
+
+// TestWireFunnelAttributesDialBySource confirms the per-source funnel counter
+// attributes a dial attempt to the request's PeerSource. This is the metric
+// used to test whether announce_peer peers out-connect get_peers "values".
+func TestWireFunnelAttributesDialBySource(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := listener.Addr().(*net.TCPAddr)
+	if err := listener.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	wire := NewWire(64, 1, 1)
+	wire.handleRequest(Request{
+		InfoHash: make([]byte, 20),
+		IP:       addr.IP.String(),
+		Port:     addr.Port,
+		Source:   PeerSourceAnnounce,
+	})
+
+	funnel := wire.FunnelBySource()
+	if got := funnel[PeerSourceAnnounce].DialAttempts; got != 1 {
+		t.Fatalf("announce DialAttempts = %d, want 1", got)
+	}
+	if got := funnel[PeerSourceGetPeers].DialAttempts; got != 0 {
+		t.Fatalf("get_peers DialAttempts = %d, want 0", got)
+	}
+	// Global counter must still agree with the sum of per-source counters.
+	if got := wire.Stats.DialAttempts.Load(); got != 1 {
+		t.Fatalf("global DialAttempts = %d, want 1", got)
+	}
+}
+
+// TestWireRequestFromSourceEnqueuesSource confirms the source tag survives the
+// request channel, and that an out-of-range source is clamped (no panic / no
+// out-of-bounds array write) in the dial accounting.
+func TestWireRequestFromSourceEnqueuesSource(t *testing.T) {
+	wire := NewWire(64, 4, 1)
+	wire.RequestFromSource(make([]byte, 20), "127.0.0.1", 1, PeerSourceGetPeers)
+	select {
+	case r := <-wire.requests:
+		if r.Source != PeerSourceGetPeers {
+			t.Fatalf("enqueued Source = %d, want %d", r.Source, PeerSourceGetPeers)
+		}
+	default:
+		t.Fatal("request was not enqueued")
+	}
+
+	// Out-of-range source must be clamped to Unknown by fetchMetadata, not panic.
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := listener.Addr().(*net.TCPAddr)
+	_ = listener.Close()
+	wire.handleRequest(Request{
+		InfoHash: make([]byte, 20),
+		IP:       addr.IP.String(),
+		Port:     addr.Port,
+		Source:   PeerSource(250), // out of range
+	})
+	if got := wire.FunnelBySource()[PeerSourceUnknown].DialAttempts; got != 1 {
+		t.Fatalf("clamped-source DialAttempts on Unknown = %d, want 1", got)
+	}
+}
+
+// TestWireFunnelQueuedAndBlacklistedBySource confirms the pre-dial funnel
+// stages (queued, blacklisted) are attributed per source, so a starving
+// funnel can be localized to supply loss rather than conversion.
+func TestWireFunnelQueuedAndBlacklistedBySource(t *testing.T) {
+	wire := NewWire(64, 4, 1)
+	ip, port := "203.0.113.7", 6881
+	wire.blackList.insert(ip, port)
+
+	wire.handleRequest(Request{
+		InfoHash: make([]byte, 20),
+		IP:       ip,
+		Port:     port,
+		Source:   PeerSourceGetPeers,
+	})
+
+	funnel := wire.FunnelBySource()
+	if got := funnel[PeerSourceGetPeers].Queued; got != 1 {
+		t.Fatalf("get_peers Queued = %d, want 1", got)
+	}
+	if got := funnel[PeerSourceGetPeers].Blacklisted; got != 1 {
+		t.Fatalf("get_peers Blacklisted = %d, want 1", got)
+	}
+	if got := funnel[PeerSourceGetPeers].DialAttempts; got != 0 {
+		t.Fatalf("get_peers DialAttempts = %d, want 0 (blacklisted before dial)", got)
+	}
+}
+
+// TestWireInflightDedupBySource confirms a second request for the same
+// (infohash, peer) already in flight is counted as inflight-dedup, not as lost
+// or blacklisted supply.
+func TestWireInflightDedupBySource(t *testing.T) {
+	wire := NewWire(64, 4, 4)
+	infoHash := make([]byte, 20)
+	key := genAddress("198.51.100.9", 6881)
+	// Simulate an in-flight download by pre-occupying the dedup key.
+	wire.queue.Set(string(infoHash) + ":" + key)
+
+	wire.handleRequest(Request{
+		InfoHash: infoHash,
+		IP:       "198.51.100.9",
+		Port:     6881,
+		Source:   PeerSourceAnnounce,
+	})
+
+	funnel := wire.FunnelBySource()
+	if got := funnel[PeerSourceAnnounce].InflightDeduped; got != 1 {
+		t.Fatalf("announce InflightDeduped = %d, want 1", got)
+	}
+	if got := funnel[PeerSourceAnnounce].DialAttempts; got != 0 {
+		t.Fatalf("announce DialAttempts = %d, want 0 (deduped before dial)", got)
+	}
+}
+
+// TestBlacklistStatsExposeFullRejectAndSize confirms the blacklist reports its
+// size, capacity, and silent full-rejects — the previously invisible black hole
+// at Len>=maxSize.
+func TestBlacklistStatsExposeFullRejectAndSize(t *testing.T) {
+	wire := NewWire(2, 4, 1) // maxSize = 2
+	wire.blackList.insert("1.1.1.1", 1)
+	wire.blackList.insert("2.2.2.2", 2)
+	wire.blackList.insert("3.3.3.3", 3) // rejected: full
+
+	stats := wire.BlacklistStats()
+	if stats.MaxSize != 2 {
+		t.Fatalf("MaxSize = %d, want 2", stats.MaxSize)
+	}
+	if stats.Size != 2 {
+		t.Fatalf("Size = %d, want 2", stats.Size)
+	}
+	if stats.InsertAccepted != 2 {
+		t.Fatalf("InsertAccepted = %d, want 2", stats.InsertAccepted)
+	}
+	if stats.InsertRejected != 1 {
+		t.Fatalf("InsertRejected = %d, want 1 (full-reject must be visible)", stats.InsertRejected)
+	}
+}

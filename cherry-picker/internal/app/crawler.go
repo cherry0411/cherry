@@ -163,6 +163,26 @@ type statsSnapshot struct {
 	wireDownloadOK          int64
 	wireDownloadFailed      int64
 	wireBlacklisted         int64
+
+	// 按 peer 来源分解的漏斗（announce_peer vs get_peers values）。
+	wireAnnounceQueued    int64
+	wireAnnounceBlacklist int64
+	wireAnnounceInflight  int64
+	wireAnnounceDial      int64
+	wireAnnounceDialOK    int64
+	wireAnnounceDownload  int64
+	wireGetPeersQueued    int64
+	wireGetPeersBlacklist int64
+	wireGetPeersInflight  int64
+	wireGetPeersDial      int64
+	wireGetPeersDialOK    int64
+	wireGetPeersDownload  int64
+
+	// 黑名单诊断（当前值，非累计增量；size/max 直接反映盲点）。
+	wireBlacklistSize     int64
+	wireBlacklistMax      int64
+	wireBlacklistRejected int64
+	wireBlacklistExpired  int64
 }
 
 const (
@@ -290,7 +310,7 @@ func (a *Application) Run(ctx context.Context) error {
 		if a.cfg.Role != "metadata" {
 			a.submitPeerEvent(events, ihHex, peer.IP.String(), peer.Port, "get_peers_response", stats, now)
 		}
-		a.queueMetadataRequest(downloader, ihHex, peer.IP.String(), peer.Port, stats, checkQueue)
+		a.queueMetadataRequest(downloader, ihHex, peer.IP.String(), peer.Port, dht.PeerSourceGetPeers, stats, checkQueue)
 	}
 	onAnnouncePeer := func(infoHash, ip string, port int) {
 		now := time.Now().UTC()
@@ -298,7 +318,7 @@ func (a *Application) Run(ctx context.Context) error {
 		if a.cfg.Role != "metadata" {
 			a.submitPeerEvent(events, ihHex, ip, port, "announce_peer", stats, now)
 		}
-		a.queueMetadataRequest(downloader, ihHex, ip, port, stats, checkQueue)
+		a.queueMetadataRequest(downloader, ihHex, ip, port, dht.PeerSourceAnnounce, stats, checkQueue)
 	}
 
 	addrs, err := a.listenAddrs()
@@ -1013,7 +1033,7 @@ func (a *Application) submitPeerEvent(events chan<- pipeline.Event, ihHex, ip st
 	}, stats.peerEventsDropped.Add, stats.peerEventsSent.Add)
 }
 
-func (a *Application) queueMetadataRequest(downloader *dht.Wire, ihHex, ip string, port int, stats *runtimeStats, checkQueue chan<- string) {
+func (a *Application) queueMetadataRequest(downloader *dht.Wire, ihHex, ip string, port int, source dht.PeerSource, stats *runtimeStats, checkQueue chan<- string) {
 	if !a.cfg.Metadata.Enabled {
 		return
 	}
@@ -1050,7 +1070,7 @@ func (a *Application) queueMetadataRequest(downloader *dht.Wire, ihHex, ip strin
 	}
 
 	stats.metadataRequestsQueued.Add(1)
-	downloader.Request(infoHashBytes, ip, port)
+	downloader.RequestFromSource(infoHashBytes, ip, port, source)
 }
 
 func (a *Application) incPeerCount(ihHex string) {
@@ -1207,6 +1227,26 @@ func (a *Application) emitStats(ctx context.Context, events chan<- pipeline.Even
 				wireDownloadFailed:      downloader.Stats.DownloadFailed.Load(),
 				wireBlacklisted:         downloader.Stats.Blacklisted.Load(),
 			}
+			funnel := downloader.FunnelBySource()
+			announce := funnel[dht.PeerSourceAnnounce]
+			getPeers := funnel[dht.PeerSourceGetPeers]
+			current.wireAnnounceQueued = announce.Queued
+			current.wireAnnounceBlacklist = announce.Blacklisted
+			current.wireAnnounceInflight = announce.InflightDeduped
+			current.wireAnnounceDial = announce.DialAttempts
+			current.wireAnnounceDialOK = announce.DialOK
+			current.wireAnnounceDownload = announce.DownloadOK
+			current.wireGetPeersQueued = getPeers.Queued
+			current.wireGetPeersBlacklist = getPeers.Blacklisted
+			current.wireGetPeersInflight = getPeers.InflightDeduped
+			current.wireGetPeersDial = getPeers.DialAttempts
+			current.wireGetPeersDialOK = getPeers.DialOK
+			current.wireGetPeersDownload = getPeers.DownloadOK
+			blStats := downloader.BlacklistStats()
+			current.wireBlacklistSize = int64(blStats.Size)
+			current.wireBlacklistMax = int64(blStats.MaxSize)
+			current.wireBlacklistRejected = blStats.InsertRejected
+			current.wireBlacklistExpired = blStats.ExpiredEvicted
 			a.logRuntimeDelta(current, previous)
 			previous = current
 			if !a.shouldEmitWorkerStats() {
@@ -1256,6 +1296,23 @@ func (a *Application) emitStats(ctx context.Context, events chan<- pipeline.Even
 				"wire_download_ok":          uint64(current.wireDownloadOK),
 				"wire_download_failed":      uint64(current.wireDownloadFailed),
 				"wire_blacklisted":          uint64(current.wireBlacklisted),
+				"wire_announce_queued":      uint64(current.wireAnnounceQueued),
+				"wire_announce_blacklisted": uint64(current.wireAnnounceBlacklist),
+				"wire_announce_inflight":    uint64(current.wireAnnounceInflight),
+				"wire_announce_dial":        uint64(current.wireAnnounceDial),
+				"wire_announce_dial_ok":     uint64(current.wireAnnounceDialOK),
+				"wire_announce_download":    uint64(current.wireAnnounceDownload),
+				"wire_getpeers_queued":      uint64(current.wireGetPeersQueued),
+				"wire_getpeers_blacklisted": uint64(current.wireGetPeersBlacklist),
+				"wire_getpeers_inflight":    uint64(current.wireGetPeersInflight),
+				"wire_getpeers_dial":        uint64(current.wireGetPeersDial),
+				"wire_getpeers_dial_ok":     uint64(current.wireGetPeersDialOK),
+				"wire_getpeers_download":    uint64(current.wireGetPeersDownload),
+				// 黑名单诊断为当前瞬时值（gauge），非窗口增量。
+				"wire_blacklist_size":       uint64(current.wireBlacklistSize),
+				"wire_blacklist_max":        uint64(current.wireBlacklistMax),
+				"wire_blacklist_rejected":   uint64(current.wireBlacklistRejected),
+				"wire_blacklist_expired":    uint64(current.wireBlacklistExpired),
 			}
 			current.metadataLocale.addWorkerStats(workerStats)
 			a.submitEvent(events, pipeline.Event{
@@ -1276,7 +1333,7 @@ func (a *Application) logRuntimeDelta(current, previous statsSnapshot) {
 	netOutKBps := (current.dhtBytesSent - previous.dhtBytesSent) / 1024 / interval
 	localeDelta := current.metadataLocale.subtract(previous.metadataLocale)
 	a.logger.Printf(
-		"runtime 30s: dht_recv=%d handled=%d dropped=%d decode_err=%d net_in=%dKB/s net_out=%dKB/s nodes=%d node_add=%d node_rm=%d refresh_q=%d lookup_queue=%d lookup_drop=%d lookup_sent=%d follow_sent=%d sample_q=%d sample_resp=%d sample_hash=%d sample_unique=%d peer_sent=%d peer_drop=%d peer_dedup=%d meta_req=%d meta_req_dedup=%d meta_sent=%d meta_drop=%d meta_dedup=%d meta_filtered=%d meta_locale_n=%d meta_han=%d meta_kana=%d meta_hangul=%d meta_zh_proxy=%d check_drop=%d paused=%v wire_q_drop=%d wire_dial=%d wire_conn=%d wire_dial_fail=%d wire_hs=%d wire_hs_fail=%d wire_ok=%d wire_dl_fail=%d wire_bl=%d",
+		"runtime 30s: dht_recv=%d handled=%d dropped=%d decode_err=%d net_in=%dKB/s net_out=%dKB/s nodes=%d node_add=%d node_rm=%d refresh_q=%d lookup_queue=%d lookup_drop=%d lookup_sent=%d follow_sent=%d sample_q=%d sample_resp=%d sample_hash=%d sample_unique=%d peer_sent=%d peer_drop=%d peer_dedup=%d meta_req=%d meta_req_dedup=%d meta_sent=%d meta_drop=%d meta_dedup=%d meta_filtered=%d meta_locale_n=%d meta_han=%d meta_kana=%d meta_hangul=%d meta_zh_proxy=%d check_drop=%d paused=%v wire_q_drop=%d wire_dial=%d wire_conn=%d wire_dial_fail=%d wire_hs=%d wire_hs_fail=%d wire_ok=%d wire_dl_fail=%d wire_bl=%d ann_q=%d ann_bl=%d ann_inflight=%d ann_dial=%d ann_conn=%d ann_ok=%d gp_q=%d gp_bl=%d gp_inflight=%d gp_dial=%d gp_conn=%d gp_ok=%d bl_size=%d bl_max=%d bl_reject=%d bl_expired=%d",
 		current.dhtPacketsReceived-previous.dhtPacketsReceived,
 		current.dhtPacketsHandled-previous.dhtPacketsHandled,
 		current.dhtPacketsDropped-previous.dhtPacketsDropped,
@@ -1320,6 +1377,23 @@ func (a *Application) logRuntimeDelta(current, previous statsSnapshot) {
 		current.wireDownloadOK-previous.wireDownloadOK,
 		current.wireDownloadFailed-previous.wireDownloadFailed,
 		current.wireBlacklisted-previous.wireBlacklisted,
+		current.wireAnnounceQueued-previous.wireAnnounceQueued,
+		current.wireAnnounceBlacklist-previous.wireAnnounceBlacklist,
+		current.wireAnnounceInflight-previous.wireAnnounceInflight,
+		current.wireAnnounceDial-previous.wireAnnounceDial,
+		current.wireAnnounceDialOK-previous.wireAnnounceDialOK,
+		current.wireAnnounceDownload-previous.wireAnnounceDownload,
+		current.wireGetPeersQueued-previous.wireGetPeersQueued,
+		current.wireGetPeersBlacklist-previous.wireGetPeersBlacklist,
+		current.wireGetPeersInflight-previous.wireGetPeersInflight,
+		current.wireGetPeersDial-previous.wireGetPeersDial,
+		current.wireGetPeersDialOK-previous.wireGetPeersDialOK,
+		current.wireGetPeersDownload-previous.wireGetPeersDownload,
+		// 黑名单为瞬时 gauge：size/max 原样打印，reject/expired 打累计增量。
+		current.wireBlacklistSize,
+		current.wireBlacklistMax,
+		current.wireBlacklistRejected-previous.wireBlacklistRejected,
+		current.wireBlacklistExpired-previous.wireBlacklistExpired,
 	)
 }
 
@@ -1417,7 +1491,7 @@ func (a *Application) flushRejectLoop(ctx context.Context) {
 }
 
 // reportRejected POSTs a batch of filtered infohashes to the backend so they
-// are added to the persistent cuckoo filter.  Only runs when the exporter is
+// are added to the exact rejected-hash store. Only runs when the exporter is
 // HTTP (i.e. there is an actual backend to talk to).
 func (a *Application) reportRejected(hashes []string) {
 	if len(hashes) == 0 || a.cfg.Exporter.Kind != "http" {

@@ -98,6 +98,76 @@ class AnalyzerTests(unittest.TestCase):
         self.assertEqual(samples, [(2.0, 12.0)])
         self.assertEqual(rejected, 1)
 
+    def test_peer_source_funnel_computes_connect_rate_advantage(self):
+        # announce peers connect at 50% (500/1000), get_peers values at 20%
+        # (200/1000): advantage should be 2.5x.
+        rows = [{
+            "ann_dial": 1000, "ann_conn": 500, "ann_ok": 100,
+            "gp_dial": 1000, "gp_conn": 200, "gp_ok": 20,
+        }]
+        funnel = analyze.peer_source_funnel(rows)
+        self.assertAlmostEqual(funnel["announce_connect_rate"], 0.5)
+        self.assertAlmostEqual(funnel["getpeers_connect_rate"], 0.2)
+        self.assertAlmostEqual(funnel["announce_connect_rate_advantage"], 2.5)
+        self.assertAlmostEqual(funnel["announce_download_rate"], 0.1)
+
+    def test_peer_source_funnel_is_backward_compatible_with_legacy_logs(self):
+        # Legacy logs lack ann_/gp_ tokens: totals are 0 and rates are None,
+        # never a ZeroDivisionError.
+        rows = [{"meta_sent": 5}]
+        funnel = analyze.peer_source_funnel(rows)
+        self.assertEqual(funnel["announce_dial"], 0)
+        self.assertIsNone(funnel["announce_connect_rate"])
+        self.assertIsNone(funnel["announce_connect_rate_advantage"])
+
+    def test_runtime_parser_keeps_peer_source_funnel_counters(self):
+        with tempfile.TemporaryDirectory() as raw:
+            log = Path(raw) / "crawler.log"
+            log.write_text(
+                "prefix runtime 30s: wire_ok=10 ann_dial=100 ann_conn=40 "
+                "ann_ok=8 gp_dial=200 gp_conn=30 gp_ok=5 paused=false\n",
+                encoding="utf-8",
+            )
+            rows = analyze.parse_runtime(log, 0)
+            funnel = analyze.peer_source_funnel(rows)
+            self.assertEqual(funnel["announce_dial"], 100)
+            self.assertEqual(funnel["getpeers_connect"], 30)
+            self.assertAlmostEqual(funnel["announce_connect_rate"], 0.4)
+
+    def test_peer_source_funnel_reports_predial_supply_loss(self):
+        # 100 queued announce peers: 30 blacklisted, 10 inflight-deduped, 60
+        # dialed. Pre-dial loss must be visible and attributed per source.
+        rows = [{
+            "ann_q": 100, "ann_bl": 30, "ann_inflight": 10, "ann_dial": 60,
+            "ann_conn": 24, "ann_ok": 6,
+            "gp_q": 0, "gp_bl": 0, "gp_inflight": 0, "gp_dial": 0,
+        }]
+        funnel = analyze.peer_source_funnel(rows)
+        self.assertEqual(funnel["announce_queued"], 100)
+        self.assertAlmostEqual(funnel["announce_blacklisted_rate"], 0.3)
+        self.assertAlmostEqual(funnel["announce_inflight_rate"], 0.1)
+        # Legacy get_peers with zero queued must not divide by zero.
+        self.assertIsNone(funnel["getpeers_blacklisted_rate"])
+
+    def test_blacklist_health_reports_fill_and_rejects(self):
+        # size/max are gauges (last row wins); reject/expired accumulate.
+        rows = [
+            {"bl_size": 1000, "bl_max": 2000, "bl_reject": 0, "bl_expired": 5},
+            {"bl_size": 2000, "bl_max": 2000, "bl_reject": 40, "bl_expired": 7},
+        ]
+        health = analyze.blacklist_health(rows)
+        self.assertEqual(health["size"], 2000)
+        self.assertEqual(health["max"], 2000)
+        self.assertAlmostEqual(health["fill_ratio"], 1.0)
+        self.assertEqual(health["insert_rejected"], 40)
+        self.assertEqual(health["expired_evicted"], 12)
+
+    def test_blacklist_health_is_backward_compatible(self):
+        health = analyze.blacklist_health([{"meta_sent": 3}])
+        self.assertIsNone(health["size"])
+        self.assertIsNone(health["fill_ratio"])
+        self.assertEqual(health["insert_rejected"], 0)
+
 
 class ComparatorTests(unittest.TestCase):
     def test_ba_order_always_computes_b_minus_a(self):

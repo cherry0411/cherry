@@ -173,6 +173,87 @@ def split_oracle_rates(
     return mean(first), mean(second), rejected
 
 
+def _safe_ratio(numerator: float, denominator: float) -> float | None:
+    return numerator / denominator if denominator else None
+
+
+def peer_source_funnel(runtime_rows: list[dict[str, float]]) -> dict[str, float | None]:
+    """Split the dial->connect->download funnel by peer source.
+
+    announce_* counters come from announce_peer senders (open NAT pinhole,
+    provably alive); gp_* counters come from get_peers "values" (third-party
+    reported, possibly stale). Missing keys total to 0 for legacy logs, so this
+    is backward compatible and simply reports zeros/None then.
+    """
+    ann_queued = total(runtime_rows, "ann_q")
+    ann_bl = total(runtime_rows, "ann_bl")
+    ann_inflight = total(runtime_rows, "ann_inflight")
+    ann_dial = total(runtime_rows, "ann_dial")
+    ann_conn = total(runtime_rows, "ann_conn")
+    ann_ok = total(runtime_rows, "ann_ok")
+    gp_queued = total(runtime_rows, "gp_q")
+    gp_bl = total(runtime_rows, "gp_bl")
+    gp_inflight = total(runtime_rows, "gp_inflight")
+    gp_dial = total(runtime_rows, "gp_dial")
+    gp_conn = total(runtime_rows, "gp_conn")
+    gp_ok = total(runtime_rows, "gp_ok")
+    ann_connect_rate = _safe_ratio(ann_conn, ann_dial)
+    gp_connect_rate = _safe_ratio(gp_conn, gp_dial)
+    connect_rate_advantage = (
+        ann_connect_rate / gp_connect_rate
+        if ann_connect_rate is not None and gp_connect_rate else None
+    )
+    return {
+        # Pre-dial supply accounting: queued splits into blacklisted /
+        # inflight-deduped / dialed. A funnel that starves with a low dial rate
+        # but high blacklisted or inflight share means supply is being discarded,
+        # not merely unreachable.
+        "announce_queued": ann_queued,
+        "announce_blacklisted": ann_bl,
+        "announce_inflight_deduped": ann_inflight,
+        "announce_blacklisted_rate": _safe_ratio(ann_bl, ann_queued),
+        "announce_inflight_rate": _safe_ratio(ann_inflight, ann_queued),
+        "announce_dial": ann_dial,
+        "announce_connect": ann_conn,
+        "announce_download_ok": ann_ok,
+        "announce_connect_rate": ann_connect_rate,
+        "announce_download_rate": _safe_ratio(ann_ok, ann_dial),
+        "getpeers_queued": gp_queued,
+        "getpeers_blacklisted": gp_bl,
+        "getpeers_inflight_deduped": gp_inflight,
+        "getpeers_blacklisted_rate": _safe_ratio(gp_bl, gp_queued),
+        "getpeers_inflight_rate": _safe_ratio(gp_inflight, gp_queued),
+        "getpeers_dial": gp_dial,
+        "getpeers_connect": gp_conn,
+        "getpeers_download_ok": gp_ok,
+        "getpeers_connect_rate": gp_connect_rate,
+        "getpeers_download_rate": _safe_ratio(gp_ok, gp_dial),
+        # >1 means announce peers connect better than get_peers values, i.e.
+        # evidence for prioritizing announce-sourced peers (hypothesis B8).
+        "announce_connect_rate_advantage": connect_rate_advantage,
+    }
+
+
+def blacklist_health(runtime_rows: list[dict[str, float]]) -> dict[str, float | None]:
+    """Report blacklist saturation. size/max are gauges (last observed);
+    rejected/expired accumulate. A near-full blacklist that keeps rejecting
+    inserts is a diagnostic blind spot: it silently stops protecting workers.
+    Missing keys yield None/0 for legacy logs.
+    """
+    sizes = [row["bl_size"] for row in runtime_rows if "bl_size" in row]
+    maxes = [row["bl_max"] for row in runtime_rows if "bl_max" in row]
+    last_size = sizes[-1] if sizes else None
+    last_max = maxes[-1] if maxes else None
+    return {
+        "size": last_size,
+        "max": last_max,
+        "fill_ratio": _safe_ratio(last_size, last_max)
+        if last_size is not None and last_max else None,
+        "insert_rejected": total(runtime_rows, "bl_reject"),
+        "expired_evicted": total(runtime_rows, "bl_expired"),
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--run-id", required=True)
@@ -257,6 +338,18 @@ def main() -> None:
             "peak_window_metadata": max(local_windows) if local_windows else None,
             "median_window_metadata": statistics.median(local_windows) if local_windows else None,
         },
+        # Peer-source funnel: tests whether announce_peer peers (which just
+        # contacted us, so their NAT pinhole is open and they are provably
+        # alive) out-connect third-party get_peers "values". If
+        # announce_connect_rate is materially higher than getpeers_connect_rate,
+        # prioritizing announce-sourced peers should lift the connect-rate half
+        # of the observed sustained-rate decay. connect_rate = dial_ok/dial.
+        "peer_source_funnel": peer_source_funnel(runtime_rows),
+        # Blacklist saturation health: a near-full blacklist silently drops new
+        # inserts (Len>=max no-op), so bad peers keep consuming dial workers.
+        # fill_ratio near 1 with rising insert_rejected explains a decaying
+        # connect rate that is not caused by peer supply.
+        "blacklist_health": blacklist_health(runtime_rows),
         # Script-level signals are regional comparison proxies, not language
         # detection. In particular, Han-only Japanese/Korean names can satisfy
         # chinese_proxy; Kana and Hangul are reported separately so that bias is
