@@ -16,10 +16,10 @@
 
 解析时已经丢弃原始 BEP-9 info dictionary 中的 `pieces` 等字段。因此，即使完整保存当前事件，也**不能重建原始 `.torrent` 文件**，更不是原始 metadata 字节的无损归档。
 
-在进入实现前必须明确产品目标：
-
-1. 若只要求磁力链接搜索和文件详情，保存 normalized metadata 即可。
-2. 若要求重建 `.torrent` 或保留取证级原始数据，crawler 必须另外输出原始 info dictionary；该数据量和安全边界需单独评估。
+产品目标已经明确：只提供磁力链接搜索和有限文件详情，不要求重新解析、
+取证或重建 `.torrent`。因此永久 raw retention 固定为 0；原始 info dictionary
+只在 wire 内存中完成 SHA-1 校验和一次受限解析，随后立即释放，不进入 spool、
+中央 archive、PostgreSQL、Meilisearch 或备份。
 
 全文索引不是权威数据库，概率过滤器也不是 exact oracle。各层职责必须分离：
 
@@ -52,9 +52,43 @@ crawler A / crawler B
 
 两台 crawler 不应同时承载正式存储。跨区域 metadata 流量远小于 DHT 流量，中心存储地域应优先考虑 NVMe 性能、可靠性、备份成本和用户搜索延迟，而不是 crawler 所在地。
 
+### 2.1 当前实现如何承接目标架构
+
+本轮未提交的 exact-authority 改动是可直接部署的过渡底座，不需要等待 archive/Meili/heat 全部完成：
+
+| 链路 | 当前实现可保留部分 | 下一道正确性边界 |
+|---|---|---|
+| crawler → API | HTTP batch、512 条合批、hash 幂等 | metadata 进入内存 Channel 前先落本地 durable spool |
+| API ingest | 多请求合并为约 5k DB batch；只在 PG commit 后 ACK | 稳定 batch identity 和同事务 `ingest_receipts`，使响应丢失后的 ACK 结果也可重放 |
+| exact dedup | `torrents + rejected_hashes`、启动 exact replay、filter bypass | 版本化 metadata policy/decision；当前 P0 表先保持最小，不在本轮膨胀 |
+| metadata storage | 当前 PG `torrents + torrent_files` 完整承接 normalized metadata | 先保留 1M corpus，再迁 compact catalog + immutable zstd archive |
+| search | Meili 可选、PG fallback | PG 同事务 outbox；轮询 Meili task 到 `succeeded`，Meili 始终可重建 |
+| heat | `peer_count` 累计值 | 带 receipt 的 sighting batch + lazy-decay state + 量化 Meili 档位 |
+
+部署顺序必须让“尽快不丢数据”和“极限压缩”解耦：先把两台 crawler 的 normalized metadata 安全落入当前 PG，再用固定 corpus 选择压缩格式和 policy。不能为了等待最终 schema 继续让已抓到的 metadata 只停留在进程内存。
+
+### 2.2 Crawler durable spool 与幂等中央 ingest
+
+当前 `walSink` 只在 HTTP 重试失败后追加 JSONL，默认 `metadata-2c4g.json` 又未配置 `wal_dir`；它不能覆盖“下载成功后、第一次 HTTP 发送前进程崩溃”的窗口。追加后也没有 `fdatasync`，并会删除超过 24 小时的文件。因此它是 outage fallback，不是 durable WAL。
+
+下一版 spool 使用单写者、长度前缀、CRC 的追加 segment，并满足：
+
+- normalized metadata 在 crawler 标记为可丢弃前先进入 spool；按 25–100 ms 或 128–512 条 group commit 执行 `fdatasync`，避免每条同步写拖慢 2C4G crawler。
+- 每个 record/batch 带持久化的 `crawler_id + epoch + sequence`。中央 `ingest_receipts` 以这组三元组唯一，并与 catalog、archive staging/pointer、search outbox 在同一 PG transaction 提交。
+- 中央响应成功后，crawler 以原子 cursor/manifest 标记已确认；只能删除完全 ACK 的 sealed segment。不得按年龄静默删除，达到磁盘高水位时对 metadata downloader 施加背压并报警。
+- CRC、长度上限和截断尾恢复必须 fail-safe；损坏 record 进入 quarantine/DLQ，不能导致后续完整 record 永久不可读。
+- replay 允许 at-least-once。metadata 由 info hash 幂等；heat 使用独立 receipt，不能因重放翻倍。
+- benchmark sink/oracle 与 production spool 指标分开。性能实验仍以全局 persistent oracle 计数，spool 作为固定 treatment 单独做 AB/BA，不能把重放量计作新 metadata。
+
+建议首版保留现有 HTTP JSON 协议，只替换其前面的持久队列，降低迁移风险；取得 corpus 后再比较 length-prefixed binary/CBOR 与 zstd frame，避免同时改 wire、协议、数据库和 archive。
+
+`ingest_receipts` 最小字段为 `(crawler_id, epoch, sequence)` 主键、`payload_sha256`、accepted/duplicate/error counts 和 committed_at。同一 identity 重试且 payload checksum 相同则返回已保存结果；identity 相同而 checksum 不同必须 `409` 并报警。API key 应绑定允许的 crawler_id，不能接受调用方任意冒充。
+
+当前 `IngestService` 已能把多请求合并到一次 PG commit，但每个请求的 accepted/duplicate 是 commit 后在内存中分配。加入 receipt 时需要把 request ordinal 带进 repository，在**同一事务内**完成 `INSERT ... RETURNING` 的归属和 receipt 写入；不能先 commit metadata、再另开事务补 receipt。
+
 ## 3. P0 正确性阻断
 
-以下问题修复并通过故障注入前，现有 backend 不能作为生产 oracle 或无损存储。
+以下问题修复并通过故障注入前，现有 backend 不能作为生产 oracle 或无损存储。仓库中的 P0 exact-authority 改动已经覆盖 Cuckoo、metadata ACK 和 rejected hash；Meili durable outbox 仍是独立后续项。
 
 ### 3.1 CuckooFilter 不是可靠 oracle
 
@@ -62,20 +96,21 @@ crawler A / crawler B
 
 - `Add()` 未先检查 fingerprint 是否已存在，重复 hash 会继续占槽，而不是返回 duplicate。
 - `ComputeHash()` 独立生成 `i1/i2`，但踢出时用 `idx XOR hash(fingerprint)` 推导 alternate bucket。被移动的 fingerprint 可能落入 `MightContain()` 永远不检查的 bucket，从而产生 false negative。
-- ingest 在数据库 commit 前先写 filter；数据库失败会污染 filter 状态。
+- ingest 曾把 filter 的 `Add(false)` 直接当作 exact duplicate，16-bit fingerprint collision 会误丢 metadata。
 
 处理原则：
 
 - PostgreSQL 的 20 字节 hash 唯一键是 exact authority。
-- ingest 依赖 `ON CONFLICT`/唯一约束完成最终去重；只有 commit 成功后才更新概率过滤器。
+- ingest 依赖 `ON CONFLICT`/唯一约束完成最终去重，API 以 `RETURNING info_hash` 计算 accepted/duplicate。
+- 为消除“DB 已 commit、filter 尚未更新”的并发窗口，候选 hash 在事务前只做**正向 warm**；事务回滚最多留下 harmless false positive，任何 positive 仍必须查询 DB。若 filter 无法表示新 hash，则立即禁用 fast-path。
 - 概率过滤器判定“不存在”时可以跳过 DB 查询；判定“可能存在”时仍需精确确认，不能直接丢弃 metadata。
 - 为过滤器补充重复插入、接近满载、连续 eviction、并发保存/加载和无 false-negative 的性质测试。
 
-当前 100M filter 固定分配 `200,000,008` bytes（190.73 MiB），rejected filter 另占 19.07 MiB；保存快照还会短暂复制约 191 MiB。是否继续使用 Cuckoo 应由实际容量和性质测试决定。
+当前 100M filter 固定分配约 `200,000,000` bytes（190.73 MiB）；独立 rejected filter 已从生产 authority 移除。保存快照还会短暂复制约 191 MiB。快照不具备和 PostgreSQL commit 一致的 watermark，因此进程启动时一律先旁路 filter，从 exact store 后台全量重建；重建完成前 `/check` 直接查询 DB。
 
 ### 3.2 HTTP 成功不等于 durable ACK
 
-当前 API 在 metadata 只进入内存 Channel 后即返回成功，PG commit 在后台发生；API 在两者之间崩溃会丢失已确认数据。crawler fallback WAL 只在 HTTP 失败时写入，append 也没有 durability barrier。
+旧 API 在 metadata 只进入内存 Channel 后即返回成功，PG commit 在后台发生；API 在两者之间崩溃会丢失已确认数据。当前实现仍使用内存 Channel 合并多个请求以保留约 5k 行的批量效率，但每个请求由 `TaskCompletionSource` 等待共享 PG transaction commit，只有 commit 后才返回 accepted；响应丢失后的重试由 hash 唯一键幂等吸收。
 
 必须满足：
 
@@ -84,11 +119,26 @@ crawler A / crawler B
 3. retry 使用稳定 `crawler_id + epoch + sequence`；metadata 以 hash 天然幂等，热度计数必须通过 batch receipt 防止重试翻倍。
 4. 进程被 `kill -9`、磁盘写满、连接中断和响应丢失后，最终 exact count 必须不丢不重。
 
+### 3.2.1 Cuckoo/rejected 快照升级步骤
+
+1. 先备份 PostgreSQL，并应用 `20260718090000_AddRejectedHashes`；新表以 `bytea(20)` 主键紧凑保存 exact rejected hashes。
+2. 停止旧 API 后部署新版本。新版本会明确记录日志并忽略旧 `cuckoo.dat`，从 `torrents + rejected_hashes` 重建；`/health` 的 `processed_hash_fast_path_ready=false` 表示安全 DB bypass，不是服务故障。
+3. 旧 `rejected.dat` 只有 fingerprint，无法反演原 hash；新版本记录警告后丢弃。后果只是部分旧 rejected hash 被重新抓取，不会误丢 metadata。
+4. 等待日志出现 exact replay complete，并确认 `/health` fast-path ready。若容量不足或重建失败，ready 会保持 false，查询仍由 PostgreSQL 精确回答。
+5. 重建完成后会用带 magic/version/SHA-256/长度校验的新格式覆盖 `cuckoo.dat`。损坏或截断快照在直接加载模式下必须 fail-fast；生产启动策略仍不信任快照而是重建。
+6. 不得把旧 API 二进制直接回滚到新快照上：旧实现会静默空启动并错误使用空 filter。回滚必须同时禁用旧 filter 查询路径，或删除快照并使用已修复版本。
+
+运行时必须保证所有 `torrents` 和 `rejected_hashes` 的在线写入都经过当前 repository，使其在 DB commit 前先把 candidate 正向 warm 到同一个 live filter。离线导入、人工 SQL 或其他绕过 repository 的写入会破坏“filter negative 可安全跳过 DB”的不变量；执行这类维护前必须禁用 fast-path，完成后重启 API 并等待 exact replay 重新进入 ready。
+
+自动迁移现在遇到表冲突会 fail-fast，不再把全部 pending migration 伪装成已执行。历史上手工建表的实例必须先核对 schema，再显式建立正确的 EF baseline；禁止通过补写 `__EFMigrationsHistory` 跳过 `rejected_hashes` 等真实 DDL。
+
 ### 3.3 Meilisearch 同步缺少持久 outbox
 
 当前 Meili 队列只把 HTTP `202` 当成功，没有等待异步 task 的最终状态；失败重试耗尽后直接丢批次。peer count 更新也不会回写 Meili。
 
 必须在写 catalog 的同一 PG transaction 中写 search outbox。worker 批量提交后，只有当 Meilisearch task 变为 `succeeded` 才推进持久 cursor；失败应退避重试并暴露 backlog。Meili 全部删除后必须能只依赖 catalog/archive 重建。
+
+outbox 首版只存 `outbox_id, info_hash, operation, document_version, created_at`，文档从 compact catalog/archive 派生，避免重复保存 title/aliases。worker 崩溃在 Meili succeeded 与 PG advance 之间时允许按相同 primary key/version 重投。监控至少包含 oldest age、rows、retry count、Meili task latency 和 dead-letter count。
 
 ### 3.4 当前 `peer_count` 不是近期热度
 
@@ -143,6 +193,35 @@ torrents
 
 压缩级别、frame 大小和封存周期必须同时衡量 bytes/metadata、压缩 CPU、随机详情 P95 和重建吞吐。
 
+### 4.3 Zero-raw 与版本化 metadata policy
+
+永久 raw retention 为 **0%**。`pieces` 是高熵 SHA-1 列表，通常难以压缩，且对
+搜索和当前详情体验没有价值。crawler 在内存中验证
+`SHA1(raw_info) == info_hash` 后，使用有界解析器直接产出 policy 所需的 compact
+normalized record；raw bytes 随即释放。pre-send spool 也只写 policy 已裁决的
+normalized/summary/hash-only record，从源头避免 raw 的跨区传输、archive、备份和
+compaction 成本。
+
+archive record 只允许 `normalized_vN / summary_vN / hash_only_vN` 等显式
+`encoding_kind + schema_version`。删除 `pieces` 后的内容不是 raw，其 SHA-1 也不等于
+原 infohash；实现中不保留这种“伪 raw”中间格式。未来若 policy 放宽，只能对
+`hash_only/summary` 记录显式排队重新抓取，这是本产品为最低存储成本接受的取舍。
+
+metadata policy 必须是版本化、可 shadow 的配置模块。事件携带 `policy_id = SHA256(canonical_config)`、主动作、reason code 和提取特征；中央只接受已发布 policy，保留最终裁决权。主动作建议为：
+
+| 动作 | 保留内容 | 典型条件 | 搜索行为 |
+|---|---|---|---|
+| `full` | title、scalars、完整文件列表 | 正常规模且质量可接受 | title + bounded aliases |
+| `summary` | title、scalars、扩展名/大小汇总、至多 K 个代表 basename | 如 `files > 2000` 或路径总字节超限 | 保留 title，aliases 严格限额 |
+| `hash_only` | hash、policy/reason、首见/region | 高成本低价值但可能以后重抓 | 默认不索引 |
+| `reject` | exact hash、policy/reason、可选 revisit 时间 | 无效/恶意/明确不收录 | 不索引，并阻止重复抓取 |
+
+`files > 2000` 首选 `summary` 而不是直接 `reject`：下载成本已经发生，保留 title 和标量通常只需很少空间，也能维持标题搜索召回。是否进一步降为 `hash_only/reject` 必须由真实语料证明这些记录占用大量 bytes 且几乎没有搜索价值。
+
+边缘预检只能在下载前利用 hash 做 exact `/check`/短租约，无法仅凭 info hash 预知 file count。下载后应使用有深度、条目数和字符串长度上限的流式 bencode inspector，尽早决定 `full/summary`，避免为几万条路径构造完整对象。两区域可选用 30–120 秒的批量 claim lease 减少同时抓同一 hash；租约失效只造成重复抓取，不能阻止最终入库。
+
+当前 P0 `rejected_hashes(bytea(20))` 先保持紧凑，不能为了 policy 扩展拖延 exact authority 部署。后续独立迁移增加 `metadata_decisions(info_hash, action, policy_id, reason, retained_level, revisit_after)`；policy 放宽时 `/check` 必须能返回 `needs_refetch`，而不是让旧 reject 永久掩盖可重新收录的数据。
+
 ## 5. Meilisearch 瘦索引与中文搜索
 
 Meili 文档只保存搜索和排序必需字段：
@@ -168,6 +247,7 @@ Meili 文档只保存搜索和排序必需字段：
 5. ranking 先考虑 `words / typo / proximity / attribute / exactness`，量化热度只作 tie-breaker，不能把 `sort` 放在相关性之前。
 6. 是否保留 prefix search 由搜索质量/索引体积实验决定。Meili prefix 只匹配查询最后一个词的开头，不提供任意子串匹配。
 7. 自定义 dictionary/synonyms 会触发全量重建，必须版本化且低频发布。
+8. raw bencode、`pieces`、完整路径、policy 诊断字段和未被产品使用的 scalar 一律不进 Meili；`summary` 的 aliases 与 `full` 使用相同总字节/条目上限，避免超大 torrent 放大索引。
 
 Meilisearch 当前对中文使用 jieba-based segmentation 和 kvariant normalization，但不会自动提供汉字到拼音的召回。官方建议大规模多语言数据按语言拆索引；torrent 标题常混合中文、日文和 Latin，因此应比较“单索引 localized attributes”与“中文/其他双索引”，不能直接假定拆分一定更好。
 
@@ -194,6 +274,9 @@ score(now) = old_score * exp(-(now - last_seen) / tau) + new_sightings
 - 可按 region 保存小型分量，便于评估日本/其他区域的资源差异。
 - Meili 只存 0–255 或更粗的 `heat` 档位，每 15–60 分钟批量更新跨档文档。
 - 只在需要任意窗口趋势和长期原始 sighting 分析时引入 ClickHouse；搜索排序本身不需要它。
+- 两区域各自生成稳定 `crawler_id + epoch + heat_sequence`；中央先写 receipt 再应用批量增量，响应丢失后的重放不得重复加分。
+- policy 为 `hash_only/reject` 的项不进入搜索 heat working set；policy 改为 searchable 时从新的 sightings 起算，避免为不可搜索 hash 长期保留热状态。
+- 验收时先明确可接受的 heat 丢失窗口（建议不超过一次 60 秒 flush）和重启误差，再选择 PG checkpoint + 小型 WAL 或纯 PG batch upsert，不能把 metadata 的零丢失要求含糊套到所有原始 sightings。
 
 ## 7. 1M corpus 基准矩阵
 
@@ -214,7 +297,18 @@ score(now) = old_score * exp(-(now - last_seen) / tau) + new_sightings
 | D1 | compact PG | zstd frame archive | 推荐方案 |
 | D2 | SQLite `BLOB(20)`/WITHOUT ROWID 候选 | 同一 archive | 只比较极限空间，不预设迁移 |
 
-记录 raw corpus、catalog heap/index、archive、WAL、备份和 compaction 临时空间的独立字节数，不用单一“数据库大小”掩盖写放大。
+记录 catalog heap/index、normalized archive、WAL、备份和 compaction 临时空间的独立字节数，不用单一“数据库大小”掩盖写放大。
+
+另外对同一 1M corpus 重放 policy 矩阵：
+
+| 编号 | Policy | 要回答的问题 |
+|---|---|---|
+| P0 | 全部 `full` | bytes 与搜索质量上界 |
+| P1 | `files > 2000 -> summary` | 极端文件列表节省多少，文件名召回下降多少 |
+| P2 | path 总字节/嵌套深度/异常比例触发 `summary` | 是否比单一 file-count 阈值更稳健 |
+| P3 | 明确噪声 `hash_only/reject` | 额外节省是否值得 title 召回损失 |
+
+每个方案必须报告 action 占比、各 action 的 bytes/metadata、超大 torrent 占总 archive/Meili bytes 的比例、边缘解析 CPU/allocations、spool 写放大、压缩吞吐，以及相对 P0 的 Recall@20/nDCG@10。只报告总体平均值会掩盖 `files > 2000` 长尾。
 
 ### 7.2 搜索矩阵
 
@@ -233,15 +327,32 @@ score(now) = old_score * exp(-(now - last_seen) / tau) + new_sightings
 在目标服务器上至少满足：
 
 - live ingest 持续不低于 250 metadata/s，并连续运行 6 小时无无界 backlog。
+- 开启 pre-send durable spool 后，相同保留 cohort 的全局新 metadata/s 相对当前 champion 下降不超过 2%；2C4G 上 crawler CPU 增量不超过 5 个百分点、RSS 增量不超过 128 MiB，spool group-commit P99 不超过 250 ms。
+- `kill -9` 发生在 download→spool、spool→HTTP、PG commit→HTTP response 三个窗口时，重启后最终 exact hash 集与故障前已 durable 的 spool 集完全一致；允许重复投递，不允许缺失。
 - 10M 全量 catalog + Meili rebuild 不超过 12 小时。
 - 20 QPS 混合中文查询下 P95 <= 100 ms、P99 <= 250 ms。
 - 候选方案相对质量最佳方案的 nDCG@10 下降不超过 2%；不能只因节省空间接受更差搜索。
+- policy 候选必须同时报告 bytes saved 和搜索质量；`files > 2000 -> summary` 若不能节省至少 20% 的 files/archive bytes，或使 Recall@20 下降超过 1 个百分点，则不应仅凭直觉上线。
 - 正常 RAM < 70%，bulk build 峰值 < 85%，无 swap storm/OOM。
 - kill -9、断网、重复投递和响应丢失后，crawler receipt、catalog、archive manifest、outbox 和 Meili 最终计数可对账。
 - 完成一次从空机恢复：PG/catalog、archive manifest、heat 和 Meili 重建均通过 checksum/抽样详情校验。
 - 监控 Meili `databaseSize` 与 `usedDatabaseSize`；碎片达到约 30% 再 compact，并预留约一份索引的临时磁盘。
 
 Meili 自建版不会自动 compact，且 compaction 可能需要约等于索引大小的临时空间：[Compact an index](https://www.meilisearch.com/docs/capabilities/indexing/how_to/compact_an_index)。索引内存必须通过 `MEILI_MAX_INDEXING_MEMORY` 显式限制；默认上限约为可用内存的 2/3：[Configuration reference](https://www.meilisearch.com/docs/resources/self_hosting/configuration/reference)。
+
+### 7.4 故障注入矩阵
+
+| 注入点 | 必须观察到的结果 |
+|---|---|
+| download 完成、spool sync 前 `kill -9` | 该条不计入 durable set；不得损坏此前已 sync record |
+| spool sync 后、HTTP 前 `kill -9` | 重启从 cursor 重放，最终 PG exact set 包含该 hash |
+| PG commit 后、HTTP response 前断线 | 同一 receipt 重试返回已保存结果，不重复 heat，不丢 metadata |
+| archive append 后、catalog transaction 前崩溃 | 只允许产生可回收 orphan record，不允许 catalog 指向未 durable bytes |
+| Meili task succeeded 后、outbox advance 前崩溃 | 重启可幂等重投同一主键，最终 outbox 清空且文档只保留一个版本 |
+| crawler/central 磁盘写满 | 不返回成功、不按年龄删 spool；背压下载并暴露 remaining-bytes/ETA 告警 |
+| spool/segment 尾截断或单 record CRC 损坏 | 恢复到最后完整边界；损坏项 quarantine，后续 segment 仍可处理 |
+| policy 配置中途切换/旧 crawler 上报 | 每条 decision 仍绑定原 policy_id；未知 policy 被拒绝或隔离，不静默套用新规则 |
+| Meili 全删、PG/API 重启 | 仅凭 catalog/archive/outbox 重建相同 searchable set，并通过 judgment smoke test |
 
 ## 8. 容量预算与服务器触发点
 
@@ -283,9 +394,11 @@ Meili 自建版不会自动 compact，且 compaction 可能需要约等于索引
 
 ## 10. 实施顺序
 
-1. 修复 exact oracle、durable ACK、idempotent receipt 和 Meili outbox 的 P0 正确性。
-2. 建立 lossless 1M normalized corpus 与查询 judgment set。
-3. 跑完 D0–D2、S0–S4 矩阵，选择质量/空间 Pareto 最优点。
-4. 在独立 4C8G 存储机部署 compact catalog、archive、Meili 和 EWMA heat；crawler 继续只负责抓取。
-5. 用双 crawler 做 6 小时、24 小时和 7 天 soak，验证恢复、backlog、写放大和热度稳定性。
-6. 到 10M 时重新外推 100M，再决定是否升级服务器、拆 Meili 或增加 ClickHouse。
+1. **P0 exact bridge（当前改动）**：应用 `AddRejectedHashes`，部署 commit-before-ACK API，确认 exact replay ready/bypass；先把 normalized metadata 写入当前 PG schema。该阶段不等待 policy/archive。
+2. **P0 delivery**：crawler pre-send spool + stable sequence；PG 增加 `ingest_receipts`，并把每个请求的 receipt 与 metadata 同事务提交。先做 kill-9/断网矩阵，再让两台生产 crawler 切中央 HTTPS endpoint。
+3. **P0 search durability**：增加 key-only `search_outbox`；worker 提交后轮询 Meili task，幂等重试。当前内存 `MeiliIndexQueue` 只在过渡期保留，不能作为最终链路。
+4. **Corpus/policy shadow**：保留 1M 条 lossless normalized corpus，不保留 raw；对 `full/summary/hash_only/reject` 只记录 shadow decision，不改变线上保留，建立查询 judgment set。
+5. **Compact/archive migration**：新增 compact catalog/pointer 和 archive manifest；先写 durable archive/staging，再提交 pointer。按 info hash 回填旧 `torrent_files`，shadow-read 对比 checksum/详情，完成备份后才删除旧文件行。
+6. **Thin Meili shadow index**：跑 D0–D2、P0–P3、S0–S4，选择空间/质量 Pareto 点；用新 index UID 全量构建、查询对比后原子切换 alias，不原地赌博式改 settings。
+7. **Heat**：sighting batch 使用独立 receipt，lazy-decay state 定期 checkpoint；只把跨档 hash 更新到 Meili，禁止每次 sighting 写 PG+Meili。
+8. **Soak/扩容**：双 crawler 做 6 小时、24 小时和 7 天 soak；到 1M、10M 分别重新实测 bytes/metadata、backlog、重建时间和查询质量，再决定拆 Meili、扩大 NVMe 或增加 ClickHouse。
