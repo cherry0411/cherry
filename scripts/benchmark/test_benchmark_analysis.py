@@ -158,6 +158,27 @@ class AnalyzerTests(unittest.TestCase):
         self.assertEqual(analyze.json_counter_delta({"check_found": 10}, {"check_found": 17}, "check_found"), 7)
         self.assertIsNone(analyze.json_counter_delta({}, {"check_found": 17}, "check_found"))
 
+    def test_oracle_observer_health_exposes_backpressure_and_taint(self):
+        health = analyze.oracle_observer_health([
+            {"oracle_obs_q": 10, "oracle_obs_sent": 8, "oracle_obs_drop": 0,
+             "oracle_obs_http_fail": 0, "oracle_obs_depth": 2,
+             "oracle_obs_cap": 100, "oracle_obs_invalid": 0},
+            {"oracle_obs_q": 20, "oracle_obs_sent": 15, "oracle_obs_drop": 1,
+             "oracle_obs_http_fail": 2, "oracle_obs_depth": 25,
+             "oracle_obs_cap": 100, "oracle_obs_invalid": 1},
+        ])
+        self.assertTrue(health["enabled"])
+        self.assertEqual(health["dropped"], 1)
+        self.assertEqual(health["http_failures"], 2)
+        self.assertEqual(health["queue_fill_ratio_max"], 0.25)
+        self.assertTrue(health["tainted_since_start"])
+        self.assertFalse(health["evidence_valid"])
+
+    def test_legacy_log_has_no_oracle_observer_requirement(self):
+        health = analyze.oracle_observer_health([{"meta_sent": 10}])
+        self.assertFalse(health["enabled"])
+        self.assertIsNone(health["evidence_valid"])
+
     def test_oracle_gap_is_averaged_not_spiked(self):
         metrics = [
             {"elapsed_s": 300.0, "oracle_unique": 1000.0},
@@ -335,6 +356,19 @@ class ComparatorTests(unittest.TestCase):
     def test_udp_drop_fails_health_gate(self):
         errors, _ = compare.validate_run(record("A", "01", 10, udp=1), 3800, 0)
         self.assertTrue(any("udp_rcvbuf_errors" in error for error in errors))
+
+    def test_oracle_observation_failure_is_a_hard_health_gate(self):
+        item = record("A", "01", 10)
+        item["result"]["health"]["oracle_observer"] = {
+            "enabled": True, "evidence_valid": False, "dropped": 1,
+            "http_failures": 0, "tainted_since_start": True,
+        }
+        errors, _ = compare.validate_run(item, 3800, 0)
+        self.assertTrue(any("observation evidence invalid" in error for error in errors))
+
+    def test_legacy_run_without_observer_remains_valid(self):
+        errors, _ = compare.validate_run(record("A", "01", 10), 3800, 0)
+        self.assertFalse(any("observation" in error for error in errors))
 
     def test_incompatible_cohort_rejects_pair(self):
         errors, _ = compare.validate_pair(

@@ -13,6 +13,8 @@ import (
 
 const testHash = "0123456789abcdef0123456789abcdef01234567"
 const secondTestHash = "89abcdef0123456789abcdef0123456789abcdef"
+const thirdTestHash = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+const fourthTestHash = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 
 func TestStorePersistsGlobalUniqueness(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "hashes.bin")
@@ -82,6 +84,116 @@ func TestBatchAndCheckEndpoints(t *testing.T) {
 	}
 	if got := s.checkFound.Load(); got != 1 {
 		t.Fatalf("check found=%d", got)
+	}
+}
+
+func TestTypedObservationEndpointSplitsActionsAndCheckKnowsAll(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "typed.bin")
+	s, err := openStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.close()
+	body := `{"observations":[` +
+		`{"info_hash":"` + testHash + `","action":"full"},` +
+		`{"info_hash":"` + secondTestHash + `","action":"summary"},` +
+		`{"info_hash":"` + thirdTestHash + `","action":"hash_only"},` +
+		`{"info_hash":"` + fourthTestHash + `","action":"reject"}` +
+		`]}`
+	recorder := httptest.NewRecorder()
+	s.handleObservations(recorder, httptest.NewRequest(http.MethodPost, "/api/v1/oracle/observations", strings.NewReader(body)))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("observations status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+
+	recorder = httptest.NewRecorder()
+	s.handleCheck(recorder, httptest.NewRequest(http.MethodPost, "/api/v1/torrents/check",
+		strings.NewReader(`[`+strings.Join([]string{`"` + testHash + `"`, `"` + secondTestHash + `"`, `"` + thirdTestHash + `"`, `"` + fourthTestHash + `"`}, ",")+`]`)))
+	var found []string
+	if err := json.Unmarshal(recorder.Body.Bytes(), &found); err != nil {
+		t.Fatal(err)
+	}
+	if len(found) != 4 {
+		t.Fatalf("known actions=%v", found)
+	}
+
+	recorder = httptest.NewRecorder()
+	s.handleStats(recorder, httptest.NewRequest(http.MethodGet, "/stats", nil))
+	var stats map[string]any
+	if err := json.Unmarshal(recorder.Body.Bytes(), &stats); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"full_unique", "summary_unique", "hash_only_unique", "rejected_unique"} {
+		if stats[key] != float64(1) {
+			t.Fatalf("%s=%v stats=%v", key, stats[key], stats)
+		}
+	}
+	if stats["metadata_unique"] != float64(2) || stats["searchable_unique"] != float64(2) {
+		t.Fatalf("primary must count only full+summary: %v", stats)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	kinds := map[byte]bool{}
+	for i := 0; i < len(data); i += recordSize {
+		kinds[data[i]] = true
+	}
+	for _, kind := range []byte{recordFull, recordSummary, recordHashOnly, recordRejected} {
+		if !kinds[kind] {
+			t.Fatalf("typed record %q missing from %q", kind, data)
+		}
+	}
+}
+
+func TestObservationProtocolRejectsUnknownFieldsAndInvalidActionAtomically(t *testing.T) {
+	s, err := openStore(filepath.Join(t.TempDir(), "closed.bin"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.close()
+	for _, body := range []string{
+		`{"observations":[{"info_hash":"` + testHash + `","action":"full","title":"must-not-exist"}]}`,
+		`{"observations":[{"info_hash":"` + testHash + `","action":"raw"}]}`,
+	} {
+		recorder := httptest.NewRecorder()
+		s.handleObservations(recorder, httptest.NewRequest(http.MethodPost, "/api/v1/oracle/observations", strings.NewReader(body)))
+		if recorder.Code != http.StatusBadRequest {
+			t.Fatalf("body=%s status=%d response=%s", body, recorder.Code, recorder.Body.String())
+		}
+	}
+	if len(s.metadata)+len(s.summary)+len(s.hashOnly)+len(s.rejected) != 0 {
+		t.Fatal("invalid closed request wrote partial evidence")
+	}
+}
+
+func TestStoreReadsLegacyMRAndUpgradesByInformationPriority(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "legacy.bin")
+	first, _ := parseHash(testHash)
+	second, _ := parseHash(secondTestHash)
+	legacy := append([]byte{recordMetadata}, first[:]...)
+	legacy = append(legacy, recordRejected)
+	legacy = append(legacy, second[:]...)
+	if err := os.WriteFile(path, legacy, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s, err := openStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.close()
+	if len(s.metadata) != 1 || len(s.rejected) != 1 {
+		t.Fatalf("legacy M/R not loaded: full=%d reject=%d", len(s.metadata), len(s.rejected))
+	}
+	if accepted, _, err := s.add(recordSummary, []hashKey{second}); err != nil || accepted != 1 {
+		t.Fatalf("reject->summary upgrade accepted=%d err=%v", accepted, err)
+	}
+	if accepted, duplicates, err := s.add(recordHashOnly, []hashKey{first}); err != nil || accepted != 0 || duplicates != 1 {
+		t.Fatalf("full must beat hash_only: accepted=%d duplicates=%d err=%v", accepted, duplicates, err)
+	}
+	if len(s.metadata) != 1 || len(s.summary) != 1 || len(s.rejected) != 0 {
+		t.Fatalf("priority result full=%d summary=%d hash=%d reject=%d", len(s.metadata), len(s.summary), len(s.hashOnly), len(s.rejected))
 	}
 }
 

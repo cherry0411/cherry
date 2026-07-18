@@ -95,6 +95,9 @@ type Application struct {
 
 	// API 客户端（不再是全局变量）
 	apiClient *http.Client
+	// oracleObserver is present only when the production durable path mirrors
+	// post-fsync hash+typed-action evidence to a separate experiment oracle.
+	oracleObserver *export.OracleObserver
 }
 
 // runtimeStats 运行时统计（原子计数器）。
@@ -213,6 +216,15 @@ type statsSnapshot struct {
 	metaReqLRU    cache.LRUStats
 	metaResultLRU cache.LRUStats
 	remoteLRU     cache.LRUStats
+
+	// Frozen-oracle observation health. Any per-window drop or HTTP failure is
+	// a hard benchmark invalidation; depth/capacity expose approaching loss.
+	oracleObservationsQueued      uint64
+	oracleObservationsSent        uint64
+	oracleObservationsDropped     uint64
+	oracleObservationHTTPFailures uint64
+	oracleObservationDepth        int
+	oracleObservationCapacity     int
 }
 
 const (
@@ -342,6 +354,13 @@ func (a *Application) Run(ctx context.Context) error {
 				a.logger.Printf("durable spool close: %v", err)
 			}
 		}
+		if a.oracleObserver != nil {
+			closeCtx, closeCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			if err := a.oracleObserver.Close(closeCtx); err != nil {
+				a.logger.Printf("oracle observer close (experiment evidence incomplete): %v", err)
+			}
+			closeCancel()
+		}
 	}()
 
 	// Durable pre-send spool path: enabled for http export with a spool_dir.
@@ -377,6 +396,22 @@ func (a *Application) Run(ctx context.Context) error {
 		})
 		if err != nil {
 			return err
+		}
+		if strings.TrimSpace(a.cfg.Exporter.OracleEndpoint) != "" {
+			a.oracleObserver, err = export.NewOracleObserver(export.OracleObserverOptions{
+				Logger:       a.logger,
+				Endpoint:     a.cfg.Exporter.OracleEndpoint,
+				APIKey:       a.cfg.Exporter.OracleAPIKey,
+				RetryBackoff: a.cfg.Exporter.RetryBackoff,
+				HTTPTimeout:  a.cfg.Exporter.HTTPTimeout,
+			})
+			if err != nil {
+				return fmt.Errorf("start oracle observer: %w", err)
+			}
+			a.logger.Printf("oracle dual channel enabled: checks=%s observations=hash+action-only capacity=%d",
+				a.cfg.Exporter.OracleEndpoint, a.oracleObserver.Snapshot().Capacity)
+		} else {
+			a.logger.Printf("oracle dual channel disabled: checks fall back to exporter endpoint; no separate post-fsync observations")
 		}
 		deliveryCtx, stopDelivery := context.WithCancel(context.Background())
 		cancelDelivery = stopDelivery
@@ -1336,6 +1371,12 @@ func (a *Application) consumeMetadata(
 					}
 					return
 				}
+				// Production durability is already definitive. Oracle observation is
+				// intentionally non-blocking; any loss/failure is exposed in the
+				// runtime health stream and invalidates the experiment window.
+				if a.oracleObserver != nil {
+					a.oracleObserver.Submit(decision.Record)
+				}
 				stats.metadataEventsSent.Add(1)
 				if decision.Action != storagepolicy.ActionFull {
 					stats.metadataEventsFiltered.Add(1)
@@ -1364,67 +1405,77 @@ func (a *Application) emitStats(ctx context.Context, events chan<- pipeline.Even
 		case <-ticker.C:
 			packetStats := a.aggregatePacketStats()
 			dhtBlacklist := a.aggregateDHTBlacklistStats()
+			var oracleStats export.OracleObserverSnapshot
+			if a.oracleObserver != nil {
+				oracleStats = a.oracleObserver.Snapshot()
+			}
 			current := statsSnapshot{
-				infohashEventsSent:      stats.infohashEventsSent.Load(),
-				infohashEventsDropped:   stats.infohashEventsDropped.Load(),
-				infohashEventsDeduped:   stats.infohashEventsDeduped.Load(),
-				peerEventsSent:          stats.peerEventsSent.Load(),
-				peerEventsDropped:       stats.peerEventsDropped.Load(),
-				peerEventsDeduped:       stats.peerEventsDeduped.Load(),
-				metadataRequestsQueued:  stats.metadataRequestsQueued.Load(),
-				metadataRequestsDeduped: stats.metadataRequestsDeduped.Load(),
-				checkBatchesQueued:      stats.checkBatchesQueued.Load(),
-				checkBatchesDropped:     stats.checkBatchesDropped.Load(),
-				checkBatchesProcessed:   stats.checkBatchesProcessed.Load(),
-				activeLookupsQueued:     stats.activeLookupsQueued.Load(),
-				activeLookupsDropped:    stats.activeLookupsDropped.Load(),
-				activeLookupsSent:       stats.activeLookupsSent.Load(),
-				sampleQueriesSent:       stats.sampleQueriesSent.Load(),
-				sampleResponses:         stats.sampleResponses.Load(),
-				sampleHashesReceived:    stats.sampleHashesReceived.Load(),
-				sampleHashesQueued:      stats.sampleHashesQueued.Load(),
-				metadataEventsSent:      stats.metadataEventsSent.Load(),
-				metadataEventsDropped:   stats.metadataEventsDropped.Load(),
-				metadataEventsDeduped:   stats.metadataEventsDeduped.Load(),
-				metadataEventsFiltered:  stats.metadataEventsFiltered.Load(),
-				metadataLocale:          stats.metadataLocale.snapshot(),
-				dhtPacketsReceived:      packetStats.Received,
-				dhtPacketsEnqueued:      packetStats.Enqueued,
-				dhtPacketsDropped:       packetStats.Dropped,
-				dhtPacketsHandled:       packetStats.Handled,
-				dhtPacketDecodeErrors:   packetStats.DecodeErrors,
-				dhtBytesReceived:        packetStats.BytesReceived,
-				dhtBytesSent:            packetStats.BytesSent,
-				dhtFollowupsSent:        packetStats.FollowupsSent,
-				dhtRoutingNodes:         packetStats.RoutingNodes,
-				dhtNodesInserted:        packetStats.NodesInserted,
-				dhtNodesRemoved:         packetStats.NodesRemoved,
-				dhtRefreshQueries:       packetStats.RefreshQueries,
-				wireQueueDropped:        downloader.Stats.QueueDropped.Load(),
-				wireDialAttempts:        downloader.Stats.DialAttempts.Load(),
-				wireDialOK:              downloader.Stats.DialOK.Load(),
-				wireDialFailed:          downloader.Stats.DialFailed.Load(),
-				wireHandshakeOK:         downloader.Stats.HandshakeOK.Load(),
-				wireHandshakeFailed:     downloader.Stats.HandshakeFailed.Load(),
-				wireDownloadOK:          downloader.Stats.DownloadOK.Load(),
-				wireDownloadFailed:      downloader.Stats.DownloadFailed.Load(),
-				wireBlacklisted:         downloader.Stats.Blacklisted.Load(),
-				wireActiveWorkers:       int64(downloader.ActiveWorkers()),
-				wireMaxWorkers:          int64(downloader.MaxWorkers()),
-				wireBusyWorkers:         int64(downloader.BusyWorkers()),
-				wireRequestDepth:        int64(downloader.RequestDepth()),
-				wireRequestCap:          int64(downloader.RequestCapacity()),
-				wireResponseDepth:       int64(downloader.ResponseDepth()),
-				wireResponseCap:         int64(downloader.ResponseCapacity()),
-				dhtBlacklistSize:        int64(dhtBlacklist.Size),
-				dhtBlacklistMax:         int64(dhtBlacklist.MaxSize),
-				dhtBlacklistRejected:    dhtBlacklist.InsertRejected,
-				dhtBlacklistExpired:     dhtBlacklist.ExpiredEvicted,
-				infohashLRU:             a.infohashSeen.Snapshot(),
-				peerLRU:                 a.peerSeen.Snapshot(),
-				metaReqLRU:              a.metadataRequestSeen.Snapshot(),
-				metaResultLRU:           a.metadataResultSeen.Snapshot(),
-				remoteLRU:               a.remoteKnown.Snapshot(),
+				infohashEventsSent:            stats.infohashEventsSent.Load(),
+				infohashEventsDropped:         stats.infohashEventsDropped.Load(),
+				infohashEventsDeduped:         stats.infohashEventsDeduped.Load(),
+				peerEventsSent:                stats.peerEventsSent.Load(),
+				peerEventsDropped:             stats.peerEventsDropped.Load(),
+				peerEventsDeduped:             stats.peerEventsDeduped.Load(),
+				metadataRequestsQueued:        stats.metadataRequestsQueued.Load(),
+				metadataRequestsDeduped:       stats.metadataRequestsDeduped.Load(),
+				checkBatchesQueued:            stats.checkBatchesQueued.Load(),
+				checkBatchesDropped:           stats.checkBatchesDropped.Load(),
+				checkBatchesProcessed:         stats.checkBatchesProcessed.Load(),
+				activeLookupsQueued:           stats.activeLookupsQueued.Load(),
+				activeLookupsDropped:          stats.activeLookupsDropped.Load(),
+				activeLookupsSent:             stats.activeLookupsSent.Load(),
+				sampleQueriesSent:             stats.sampleQueriesSent.Load(),
+				sampleResponses:               stats.sampleResponses.Load(),
+				sampleHashesReceived:          stats.sampleHashesReceived.Load(),
+				sampleHashesQueued:            stats.sampleHashesQueued.Load(),
+				metadataEventsSent:            stats.metadataEventsSent.Load(),
+				metadataEventsDropped:         stats.metadataEventsDropped.Load(),
+				metadataEventsDeduped:         stats.metadataEventsDeduped.Load(),
+				metadataEventsFiltered:        stats.metadataEventsFiltered.Load(),
+				metadataLocale:                stats.metadataLocale.snapshot(),
+				dhtPacketsReceived:            packetStats.Received,
+				dhtPacketsEnqueued:            packetStats.Enqueued,
+				dhtPacketsDropped:             packetStats.Dropped,
+				dhtPacketsHandled:             packetStats.Handled,
+				dhtPacketDecodeErrors:         packetStats.DecodeErrors,
+				dhtBytesReceived:              packetStats.BytesReceived,
+				dhtBytesSent:                  packetStats.BytesSent,
+				dhtFollowupsSent:              packetStats.FollowupsSent,
+				dhtRoutingNodes:               packetStats.RoutingNodes,
+				dhtNodesInserted:              packetStats.NodesInserted,
+				dhtNodesRemoved:               packetStats.NodesRemoved,
+				dhtRefreshQueries:             packetStats.RefreshQueries,
+				wireQueueDropped:              downloader.Stats.QueueDropped.Load(),
+				wireDialAttempts:              downloader.Stats.DialAttempts.Load(),
+				wireDialOK:                    downloader.Stats.DialOK.Load(),
+				wireDialFailed:                downloader.Stats.DialFailed.Load(),
+				wireHandshakeOK:               downloader.Stats.HandshakeOK.Load(),
+				wireHandshakeFailed:           downloader.Stats.HandshakeFailed.Load(),
+				wireDownloadOK:                downloader.Stats.DownloadOK.Load(),
+				wireDownloadFailed:            downloader.Stats.DownloadFailed.Load(),
+				wireBlacklisted:               downloader.Stats.Blacklisted.Load(),
+				wireActiveWorkers:             int64(downloader.ActiveWorkers()),
+				wireMaxWorkers:                int64(downloader.MaxWorkers()),
+				wireBusyWorkers:               int64(downloader.BusyWorkers()),
+				wireRequestDepth:              int64(downloader.RequestDepth()),
+				wireRequestCap:                int64(downloader.RequestCapacity()),
+				wireResponseDepth:             int64(downloader.ResponseDepth()),
+				wireResponseCap:               int64(downloader.ResponseCapacity()),
+				dhtBlacklistSize:              int64(dhtBlacklist.Size),
+				dhtBlacklistMax:               int64(dhtBlacklist.MaxSize),
+				dhtBlacklistRejected:          dhtBlacklist.InsertRejected,
+				dhtBlacklistExpired:           dhtBlacklist.ExpiredEvicted,
+				infohashLRU:                   a.infohashSeen.Snapshot(),
+				peerLRU:                       a.peerSeen.Snapshot(),
+				metaReqLRU:                    a.metadataRequestSeen.Snapshot(),
+				metaResultLRU:                 a.metadataResultSeen.Snapshot(),
+				remoteLRU:                     a.remoteKnown.Snapshot(),
+				oracleObservationsQueued:      oracleStats.Queued,
+				oracleObservationsSent:        oracleStats.Sent,
+				oracleObservationsDropped:     oracleStats.Dropped,
+				oracleObservationHTTPFailures: oracleStats.HTTPFailures,
+				oracleObservationDepth:        oracleStats.Depth,
+				oracleObservationCapacity:     oracleStats.Capacity,
 			}
 			funnel := downloader.FunnelBySource()
 			announce := funnel[dht.PeerSourceAnnounce]
@@ -1508,21 +1559,27 @@ func (a *Application) emitStats(ctx context.Context, events chan<- pipeline.Even
 				"wire_getpeers_dial_ok":     uint64(current.wireGetPeersDialOK),
 				"wire_getpeers_download":    uint64(current.wireGetPeersDownload),
 				// 黑名单诊断为当前瞬时值（gauge），非窗口增量。
-				"wire_blacklist_size":     uint64(current.wireBlacklistSize),
-				"wire_blacklist_max":      uint64(current.wireBlacklistMax),
-				"wire_blacklist_rejected": uint64(current.wireBlacklistRejected),
-				"wire_blacklist_expired":  uint64(current.wireBlacklistExpired),
-				"wire_active_workers":     uint64(current.wireActiveWorkers),
-				"wire_max_workers":        uint64(current.wireMaxWorkers),
-				"wire_busy_workers":       uint64(current.wireBusyWorkers),
-				"wire_request_depth":      uint64(current.wireRequestDepth),
-				"wire_request_capacity":   uint64(current.wireRequestCap),
-				"wire_response_depth":     uint64(current.wireResponseDepth),
-				"wire_response_capacity":  uint64(current.wireResponseCap),
-				"dht_blacklist_size":      uint64(current.dhtBlacklistSize),
-				"dht_blacklist_max":       uint64(current.dhtBlacklistMax),
-				"dht_blacklist_rejected":  uint64(current.dhtBlacklistRejected),
-				"dht_blacklist_expired":   uint64(current.dhtBlacklistExpired),
+				"wire_blacklist_size":               uint64(current.wireBlacklistSize),
+				"wire_blacklist_max":                uint64(current.wireBlacklistMax),
+				"wire_blacklist_rejected":           uint64(current.wireBlacklistRejected),
+				"wire_blacklist_expired":            uint64(current.wireBlacklistExpired),
+				"wire_active_workers":               uint64(current.wireActiveWorkers),
+				"wire_max_workers":                  uint64(current.wireMaxWorkers),
+				"wire_busy_workers":                 uint64(current.wireBusyWorkers),
+				"wire_request_depth":                uint64(current.wireRequestDepth),
+				"wire_request_capacity":             uint64(current.wireRequestCap),
+				"wire_response_depth":               uint64(current.wireResponseDepth),
+				"wire_response_capacity":            uint64(current.wireResponseCap),
+				"dht_blacklist_size":                uint64(current.dhtBlacklistSize),
+				"dht_blacklist_max":                 uint64(current.dhtBlacklistMax),
+				"dht_blacklist_rejected":            uint64(current.dhtBlacklistRejected),
+				"dht_blacklist_expired":             uint64(current.dhtBlacklistExpired),
+				"oracle_observations_queued":        current.oracleObservationsQueued,
+				"oracle_observations_sent":          current.oracleObservationsSent,
+				"oracle_observations_dropped":       current.oracleObservationsDropped,
+				"oracle_observation_http_failures":  current.oracleObservationHTTPFailures,
+				"oracle_observation_queue_depth":    uint64(current.oracleObservationDepth),
+				"oracle_observation_queue_capacity": uint64(current.oracleObservationCapacity),
 			}
 			addLRUWorkerStats(workerStats, "infohash", current.infohashLRU)
 			addLRUWorkerStats(workerStats, "peer", current.peerLRU)
@@ -1616,7 +1673,7 @@ func (a *Application) logRuntimeDelta(current, previous statsSnapshot) {
 func formatRuntimeGauges(current, previous statsSnapshot) string {
 	var b strings.Builder
 	fmt.Fprintf(&b,
-		" wire_active=%d wire_max=%d wire_busy=%d wire_req_depth=%d wire_req_cap=%d wire_resp_depth=%d wire_resp_cap=%d dht_bl_size=%d dht_bl_max=%d dht_bl_reject=%d dht_bl_expired=%d",
+		" wire_active=%d wire_max=%d wire_busy=%d wire_req_depth=%d wire_req_cap=%d wire_resp_depth=%d wire_resp_cap=%d dht_bl_size=%d dht_bl_max=%d dht_bl_reject=%d dht_bl_expired=%d oracle_obs_q=%d oracle_obs_sent=%d oracle_obs_drop=%d oracle_obs_http_fail=%d oracle_obs_depth=%d oracle_obs_cap=%d oracle_obs_invalid=%t",
 		current.wireActiveWorkers,
 		current.wireMaxWorkers,
 		current.wireBusyWorkers,
@@ -1628,6 +1685,13 @@ func formatRuntimeGauges(current, previous statsSnapshot) string {
 		current.dhtBlacklistMax,
 		current.dhtBlacklistRejected-previous.dhtBlacklistRejected,
 		current.dhtBlacklistExpired-previous.dhtBlacklistExpired,
+		current.oracleObservationsQueued-previous.oracleObservationsQueued,
+		current.oracleObservationsSent-previous.oracleObservationsSent,
+		current.oracleObservationsDropped-previous.oracleObservationsDropped,
+		current.oracleObservationHTTPFailures-previous.oracleObservationHTTPFailures,
+		current.oracleObservationDepth,
+		current.oracleObservationCapacity,
+		current.oracleObservationsDropped > 0 || current.oracleObservationHTTPFailures > 0,
 	)
 	appendLRURuntimeFields(&b, "ih", current.infohashLRU, previous.infohashLRU)
 	appendLRURuntimeFields(&b, "peer", current.peerLRU, previous.peerLRU)
@@ -1917,11 +1981,29 @@ func (a *Application) aggregateDHTBlacklistStats() dht.BlacklistStats {
 }
 
 func (a *Application) baseURL() string {
-	url := a.cfg.Exporter.HTTPEndpoint
+	return baseURLFor(a.cfg.Exporter.HTTPEndpoint)
+}
+
+func baseURLFor(endpoint string) string {
+	url := strings.TrimRight(strings.TrimSpace(endpoint), "/")
 	if idx := strings.Index(url, "/api/"); idx > 0 {
 		return url[:idx]
 	}
 	return url
+}
+
+func (a *Application) oracleBaseURL() string {
+	if strings.TrimSpace(a.cfg.Exporter.OracleEndpoint) != "" {
+		return baseURLFor(a.cfg.Exporter.OracleEndpoint)
+	}
+	return a.baseURL()
+}
+
+func (a *Application) oracleAPIKey() string {
+	if strings.TrimSpace(a.cfg.Exporter.OracleEndpoint) != "" {
+		return a.cfg.Exporter.OracleAPIKey
+	}
+	return a.cfg.Exporter.APIKey
 }
 
 func durableMetadataEndpoint(endpoint string) string {
@@ -1980,14 +2062,14 @@ func (a *Application) checkBatchExists(hashes []string) {
 	// POST to avoid URL-length limits and URL-encoding overhead.
 	body, _ := json.Marshal(hashes)
 	req, err := http.NewRequest(http.MethodPost,
-		a.baseURL()+"/api/v1/torrents/check",
+		a.oracleBaseURL()+"/api/v1/torrents/check",
 		bytes.NewReader(body))
 	if err != nil {
 		return
 	}
 	req.Header.Set("Content-Type", "application/json")
-	if a.cfg.Exporter.APIKey != "" {
-		req.Header.Set("X-API-Key", a.cfg.Exporter.APIKey)
+	if key := a.oracleAPIKey(); key != "" {
+		req.Header.Set("X-API-Key", key)
 	}
 	resp, err := a.apiClient.Do(req)
 	if err != nil {

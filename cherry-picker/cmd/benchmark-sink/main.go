@@ -25,7 +25,12 @@ import (
 )
 
 const (
+	// M/R are the legacy on-disk encodings and remain readable forever. New
+	// typed observations use F/S/H/R. M is semantically equivalent to F.
 	recordMetadata byte = 'M'
+	recordFull     byte = 'F'
+	recordSummary  byte = 'S'
+	recordHashOnly byte = 'H'
 	recordRejected byte = 'R'
 	recordSize          = 21
 	maxRequestBody      = 128 << 20
@@ -35,20 +40,30 @@ type hashKey [20]byte
 
 type store struct {
 	mu               sync.RWMutex
-	metadata         map[hashKey]struct{}
+	metadata         map[hashKey]struct{} // full, including legacy M
+	summary          map[hashKey]struct{}
+	hashOnly         map[hashKey]struct{}
 	rejected         map[hashKey]struct{}
 	baselineMetadata int
+	baselineFull     int
+	baselineSummary  int
+	baselineHashOnly int
 	baselineRejected int
 	file             *os.File
 	started          time.Time
 
-	batchRequests  atomic.Uint64
-	checkRequests  atomic.Uint64
-	checkHashes    atomic.Uint64
-	checkFound     atomic.Uint64
-	rejectRequests atomic.Uint64
-	duplicates     atomic.Uint64
-	invalid        atomic.Uint64
+	batchRequests       atomic.Uint64
+	checkRequests       atomic.Uint64
+	checkHashes         atomic.Uint64
+	checkFound          atomic.Uint64
+	rejectRequests      atomic.Uint64
+	duplicates          atomic.Uint64
+	invalid             atomic.Uint64
+	observationRequests atomic.Uint64
+	observationFull     atomic.Uint64
+	observationSummary  atomic.Uint64
+	observationHashOnly atomic.Uint64
+	observationReject   atomic.Uint64
 }
 
 type crawlerEvent struct {
@@ -59,6 +74,15 @@ type crawlerEvent struct {
 
 type batchRequest struct {
 	Events []crawlerEvent `json:"events"`
+}
+
+type observation struct {
+	InfoHash string `json:"info_hash"`
+	Action   string `json:"action"`
+}
+
+type observationRequest struct {
+	Observations []observation `json:"observations"`
 }
 
 type stringListFlag []string
@@ -72,6 +96,9 @@ func (values *stringListFlag) Set(value string) error {
 type mergeStats struct {
 	MetadataAdded int
 	RejectedAdded int
+	FullAdded     int
+	SummaryAdded  int
+	HashOnlyAdded int
 }
 
 func main() {
@@ -92,8 +119,9 @@ func main() {
 		if err != nil {
 			logger.Fatal(err)
 		}
-		logger.Printf("finalized: production=%s overlays=%d metadata_added=%d rejected_added=%d",
-			*finalizeProduction, len(mergeOverlays), stats.MetadataAdded, stats.RejectedAdded)
+		logger.Printf("finalized: production=%s overlays=%d searchable_added=%d full_added=%d summary_added=%d hash_only_added=%d rejected_added=%d",
+			*finalizeProduction, len(mergeOverlays), stats.MetadataAdded,
+			stats.FullAdded, stats.SummaryAdded, stats.HashOnlyAdded, stats.RejectedAdded)
 		return
 	}
 	if len(mergeOverlays) != 0 {
@@ -107,6 +135,7 @@ func main() {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /api/v1/torrents/batch", s.handleBatch)
+	mux.HandleFunc("POST /api/v1/oracle/observations", s.handleObservations)
 	mux.HandleFunc("POST /api/v1/torrents/check", s.handleCheck)
 	mux.HandleFunc("POST /api/v1/torrents/reject", s.handleReject)
 	mux.HandleFunc("POST /api/v1/torrents/peers", emptyOK)
@@ -132,8 +161,9 @@ func main() {
 		_ = server.Shutdown(shutdownCtx)
 	}()
 
-	logger.Printf("started: listen=%s data=%s baseline=%s metadata=%d rejected=%d baseline_metadata=%d baseline_rejected=%d",
-		*listen, *data, *baseline, len(s.metadata), len(s.rejected), s.baselineMetadata, s.baselineRejected)
+	logger.Printf("started: listen=%s data=%s baseline=%s full=%d summary=%d hash_only=%d rejected=%d baseline_searchable=%d baseline_rejected=%d",
+		*listen, *data, *baseline, len(s.metadata), len(s.summary), len(s.hashOnly), len(s.rejected),
+		s.baselineMetadata, s.baselineRejected)
 	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		logger.Fatal(err)
 	}
@@ -206,19 +236,30 @@ func mergeStoresAtomically(productionPath string, overlayPaths []string) (mergeS
 			_ = merged.close()
 		}
 	}()
-	for _, kind := range []byte{recordMetadata, recordRejected} {
+	searchableBefore := len(merged.metadata) + len(merged.summary)
+	rejectedBefore := len(merged.rejected)
+	// Higher-information classifications win regardless of overlay order.
+	// Legacy M is equal to full F. Sources remain immutable.
+	for _, kind := range []byte{recordFull, recordMetadata, recordSummary, recordHashOnly, recordRejected} {
 		for _, overlay := range overlayPaths {
 			added, err := mergeRecordsOfKind(merged, overlay, kind)
 			if err != nil {
 				return mergeStats{}, fmt.Errorf("merge overlay %s: %w", overlay, err)
 			}
-			if kind == recordMetadata {
-				stats.MetadataAdded += added
-			} else {
+			switch kind {
+			case recordFull, recordMetadata:
+				stats.FullAdded += added
+			case recordSummary:
+				stats.SummaryAdded += added
+			case recordHashOnly:
+				stats.HashOnlyAdded += added
+			case recordRejected:
 				stats.RejectedAdded += added
 			}
 		}
 	}
+	stats.MetadataAdded = max(0, len(merged.metadata)+len(merged.summary)-searchableBefore)
+	stats.RejectedAdded = max(0, len(merged.rejected)-rejectedBefore)
 	if err := merged.close(); err != nil {
 		return mergeStats{}, fmt.Errorf("sync finalized oracle: %w", err)
 	}
@@ -279,7 +320,7 @@ func mergeRecordsOfKind(target *store, path string, wanted byte) (int, error) {
 		if err != nil {
 			return 0, err
 		}
-		if record[0] != recordMetadata && record[0] != recordRejected {
+		if !validRecordKind(record[0]) {
 			return 0, fmt.Errorf("corrupt store: record type %q", record[0])
 		}
 		if record[0] != wanted {
@@ -352,6 +393,8 @@ func openStoreWithBaseline(path, baselinePath string) (*store, error) {
 	}
 	s := &store{
 		metadata: make(map[hashKey]struct{}),
+		summary:  make(map[hashKey]struct{}),
+		hashOnly: make(map[hashKey]struct{}),
 		rejected: make(map[hashKey]struct{}),
 		file:     f,
 		started:  time.Now().UTC(),
@@ -371,7 +414,10 @@ func openStoreWithBaseline(path, baselinePath string) (*store, error) {
 			f.Close()
 			return nil, fmt.Errorf("close baseline: %w", err)
 		}
-		s.baselineMetadata = len(s.metadata)
+		s.baselineFull = len(s.metadata)
+		s.baselineSummary = len(s.summary)
+		s.baselineHashOnly = len(s.hashOnly)
+		s.baselineMetadata = s.baselineFull + s.baselineSummary
 		s.baselineRejected = len(s.rejected)
 	}
 	if err := s.load(); err != nil {
@@ -408,16 +454,83 @@ func (s *store) loadRecords(source io.Reader) error {
 		}
 		var key hashKey
 		copy(key[:], record[1:])
-		switch record[0] {
-		case recordMetadata:
-			s.metadata[key] = struct{}{}
-		case recordRejected:
-			s.rejected[key] = struct{}{}
-		default:
+		if !validRecordKind(record[0]) {
 			return fmt.Errorf("corrupt store: record type %q", record[0])
 		}
+		s.applyLoadedRecord(record[0], key)
 	}
 	return nil
+}
+
+func validRecordKind(kind byte) bool {
+	switch kind {
+	case recordMetadata, recordFull, recordSummary, recordHashOnly, recordRejected:
+		return true
+	default:
+		return false
+	}
+}
+
+func canonicalRecordKind(kind byte) byte {
+	if kind == recordMetadata {
+		return recordFull
+	}
+	return kind
+}
+
+func recordPriority(kind byte) int {
+	switch canonicalRecordKind(kind) {
+	case recordFull:
+		return 4
+	case recordSummary:
+		return 3
+	case recordHashOnly:
+		return 2
+	case recordRejected:
+		return 1
+	default:
+		return 0
+	}
+}
+
+func (s *store) currentKindLocked(key hashKey) byte {
+	if _, ok := s.metadata[key]; ok {
+		return recordFull
+	}
+	if _, ok := s.summary[key]; ok {
+		return recordSummary
+	}
+	if _, ok := s.hashOnly[key]; ok {
+		return recordHashOnly
+	}
+	if _, ok := s.rejected[key]; ok {
+		return recordRejected
+	}
+	return 0
+}
+
+func (s *store) applyLoadedRecord(kind byte, key hashKey) {
+	if recordPriority(kind) <= recordPriority(s.currentKindLocked(key)) {
+		return
+	}
+	s.applyKindLocked(kind, key)
+}
+
+func (s *store) applyKindLocked(kind byte, key hashKey) {
+	delete(s.metadata, key)
+	delete(s.summary, key)
+	delete(s.hashOnly, key)
+	delete(s.rejected, key)
+	switch canonicalRecordKind(kind) {
+	case recordFull:
+		s.metadata[key] = struct{}{}
+	case recordSummary:
+		s.summary[key] = struct{}{}
+	case recordHashOnly:
+		s.hashOnly[key] = struct{}{}
+	case recordRejected:
+		s.rejected[key] = struct{}{}
+	}
 }
 
 func (s *store) close() error {
@@ -495,6 +608,83 @@ func (s *store) handleBatch(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func observationKind(action string) (byte, bool) {
+	switch action {
+	case "full":
+		return recordFull, true
+	case "summary":
+		return recordSummary, true
+	case "hash_only":
+		return recordHashOnly, true
+	case "reject":
+		return recordRejected, true
+	default:
+		return 0, false
+	}
+}
+
+// handleObservations accepts a closed hash+typed-action union. Invalid hashes,
+// actions, unknown JSON fields, and trailing JSON reject the whole request;
+// partial evidence is never made to look like a valid experiment window.
+func (s *store) handleObservations(w http.ResponseWriter, r *http.Request) {
+	s.observationRequests.Add(1)
+	var request observationRequest
+	if err := decodeClosedBody(w, r, &request); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	best := make(map[hashKey]byte, len(request.Observations))
+	counts := make(map[byte]uint64, 4)
+	duplicates := 0
+	for i, item := range request.Observations {
+		key, ok := parseHash(item.InfoHash)
+		if !ok {
+			s.invalid.Add(1)
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": fmt.Sprintf("observation %d has invalid info_hash", i)})
+			return
+		}
+		kind, ok := observationKind(item.Action)
+		if !ok {
+			s.invalid.Add(1)
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": fmt.Sprintf("observation %d has invalid action", i)})
+			return
+		}
+		counts[kind]++
+		if previous, exists := best[key]; exists {
+			duplicates++
+			if recordPriority(kind) <= recordPriority(previous) {
+				continue
+			}
+		}
+		best[key] = kind
+	}
+	s.observationFull.Add(counts[recordFull])
+	s.observationSummary.Add(counts[recordSummary])
+	s.observationHashOnly.Add(counts[recordHashOnly])
+	s.observationReject.Add(counts[recordRejected])
+
+	accepted := 0
+	for _, kind := range []byte{recordFull, recordSummary, recordHashOnly, recordRejected} {
+		candidates := make([]hashKey, 0)
+		for key, candidateKind := range best {
+			if candidateKind == kind {
+				candidates = append(candidates, key)
+			}
+		}
+		added, repeated, err := s.add(kind, candidates)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+			return
+		}
+		accepted += added
+		duplicates += repeated
+	}
+	s.duplicates.Add(uint64(duplicates))
+	writeJSON(w, http.StatusOK, map[string]any{
+		"accepted": accepted, "duplicates": duplicates, "errors": 0,
+	})
+}
+
 func (s *store) handleCheck(w http.ResponseWriter, r *http.Request) {
 	s.checkRequests.Add(1)
 	var hashes []string
@@ -511,11 +701,7 @@ func (s *store) handleCheck(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		valid++
-		if _, ok := s.metadata[key]; ok {
-			found = append(found, strings.ToLower(value))
-			continue
-		}
-		if _, ok := s.rejected[key]; ok {
+		if s.currentKindLocked(key) != 0 {
 			found = append(found, strings.ToLower(value))
 		}
 	}
@@ -547,20 +733,15 @@ func (s *store) handleReject(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *store) add(kind byte, candidates []hashKey) (int, int, error) {
+	if !validRecordKind(kind) {
+		return 0, 0, fmt.Errorf("invalid record kind %q", kind)
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	target := s.metadata
-	if kind == recordRejected {
-		target = s.rejected
-	}
 	pending := make(map[hashKey]struct{}, len(candidates))
 	duplicates := 0
 	for _, key := range candidates {
-		if _, exists := s.metadata[key]; exists {
-			duplicates++
-			continue
-		}
-		if _, exists := s.rejected[key]; exists {
+		if recordPriority(s.currentKindLocked(key)) >= recordPriority(kind) {
 			duplicates++
 			continue
 		}
@@ -584,33 +765,54 @@ func (s *store) add(kind byte, candidates []hashKey) (int, int, error) {
 		return 0, duplicates, io.ErrShortWrite
 	}
 	for key := range pending {
-		target[key] = struct{}{}
+		s.applyKindLocked(kind, key)
 	}
 	return len(pending), duplicates, nil
 }
 
 func (s *store) handleStats(w http.ResponseWriter, _ *http.Request) {
 	s.mu.RLock()
-	metadata := len(s.metadata)
+	full := len(s.metadata)
+	summary := len(s.summary)
+	hashOnly := len(s.hashOnly)
+	metadata := full + summary
 	rejected := len(s.rejected)
 	baselineMetadata := s.baselineMetadata
 	baselineRejected := s.baselineRejected
+	baselineFull := s.baselineFull
+	baselineSummary := s.baselineSummary
+	baselineHashOnly := s.baselineHashOnly
 	s.mu.RUnlock()
 	writeJSON(w, http.StatusOK, map[string]any{
-		"started_at":               s.started,
-		"metadata_unique":          metadata,
-		"rejected_unique":          rejected,
-		"baseline_metadata_unique": baselineMetadata,
-		"baseline_rejected_unique": baselineRejected,
-		"overlay_metadata_unique":  metadata - baselineMetadata,
-		"overlay_rejected_unique":  rejected - baselineRejected,
-		"batch_requests":           s.batchRequests.Load(),
-		"check_requests":           s.checkRequests.Load(),
-		"check_hashes":             s.checkHashes.Load(),
-		"check_found":              s.checkFound.Load(),
-		"reject_requests":          s.rejectRequests.Load(),
-		"metadata_duplicates":      s.duplicates.Load(),
-		"invalid_hashes":           s.invalid.Load(),
+		"started_at":                s.started,
+		"metadata_unique":           metadata,
+		"searchable_unique":         metadata,
+		"full_unique":               full,
+		"summary_unique":            summary,
+		"hash_only_unique":          hashOnly,
+		"rejected_unique":           rejected,
+		"baseline_metadata_unique":  baselineMetadata,
+		"baseline_rejected_unique":  baselineRejected,
+		"baseline_full_unique":      baselineFull,
+		"baseline_summary_unique":   baselineSummary,
+		"baseline_hash_only_unique": baselineHashOnly,
+		"overlay_metadata_unique":   metadata - baselineMetadata,
+		"overlay_full_unique":       full - baselineFull,
+		"overlay_summary_unique":    summary - baselineSummary,
+		"overlay_hash_only_unique":  hashOnly - baselineHashOnly,
+		"overlay_rejected_unique":   rejected - baselineRejected,
+		"batch_requests":            s.batchRequests.Load(),
+		"check_requests":            s.checkRequests.Load(),
+		"check_hashes":              s.checkHashes.Load(),
+		"check_found":               s.checkFound.Load(),
+		"reject_requests":           s.rejectRequests.Load(),
+		"metadata_duplicates":       s.duplicates.Load(),
+		"invalid_hashes":            s.invalid.Load(),
+		"observation_requests":      s.observationRequests.Load(),
+		"observation_full":          s.observationFull.Load(),
+		"observation_summary":       s.observationSummary.Load(),
+		"observation_hash_only":     s.observationHashOnly.Load(),
+		"observation_reject":        s.observationReject.Load(),
 	})
 }
 
@@ -618,6 +820,23 @@ func decodeBody(w http.ResponseWriter, r *http.Request, target any) error {
 	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBody)
 	decoder := json.NewDecoder(r.Body)
 	return decoder.Decode(target)
+}
+
+func decodeClosedBody(w http.ResponseWriter, r *http.Request, target any) error {
+	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBody)
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(target); err != nil {
+		return err
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return errors.New("trailing JSON value")
+		}
+		return fmt.Errorf("trailing JSON: %w", err)
+	}
+	return nil
 }
 
 func writeJSON(w http.ResponseWriter, status int, value any) {

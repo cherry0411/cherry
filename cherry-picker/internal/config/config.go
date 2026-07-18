@@ -96,16 +96,23 @@ type FilterConfig struct {
 }
 
 type ExporterConfig struct {
-	Kind          string
-	FilePath      string
-	HTTPEndpoint  string
-	BatchSize     int
-	FlushInterval time.Duration
-	HTTPTimeout   time.Duration
-	HTTPRetries   int
-	RetryBackoff  time.Duration
-	WalDir        string // WAL 本地缓冲目录，空 = 不启用
-	APIKey        string // X-API-Key 认证头，空 = 不发送
+	Kind         string
+	FilePath     string
+	HTTPEndpoint string
+	// OracleEndpoint optionally separates the experiment uniqueness oracle
+	// from the production metadata endpoint. When empty, existence checks keep
+	// using HTTPEndpoint for full backward compatibility.
+	OracleEndpoint string
+	BatchSize      int
+	FlushInterval  time.Duration
+	HTTPTimeout    time.Duration
+	HTTPRetries    int
+	RetryBackoff   time.Duration
+	WalDir         string // WAL 本地缓冲目录，空 = 不启用
+	APIKey         string // X-API-Key 认证头，空 = 不发送
+	// OracleAPIKey authenticates only oracle checks/observations. It never
+	// replaces APIKey on the production durable metadata connection.
+	OracleAPIKey string
 	// CrawlerID 是 durable spool/receipt 协议的稳定身份。它必须跨进程重启
 	// 保持不变，不能复用默认带 PID 的 InstanceID。
 	CrawlerID string
@@ -191,20 +198,22 @@ func Load() (Config, error) {
 			RejectAboveFiles:      getenvInt("CHERRY_PICKER_POLICY_REJECT_FILES", 0),
 		},
 		Exporter: ExporterConfig{
-			Kind:          strings.ToLower(getenvDefault("CHERRY_PICKER_EXPORTER", "stdout")),
-			FilePath:      getenvDefault("CHERRY_PICKER_EXPORTER_FILE", ""),
-			HTTPEndpoint:  getenvDefault("CHERRY_PICKER_EXPORTER_URL", ""),
-			BatchSize:     getenvInt("CHERRY_PICKER_EXPORTER_BATCH", 512),
-			FlushInterval: getenvDuration("CHERRY_PICKER_EXPORTER_FLUSH", 500*time.Millisecond),
-			HTTPTimeout:   getenvDuration("CHERRY_PICKER_EXPORTER_TIMEOUT", 5*time.Second),
-			HTTPRetries:   getenvInt("CHERRY_PICKER_EXPORTER_HTTP_RETRIES", 3),
-			RetryBackoff:  getenvDuration("CHERRY_PICKER_EXPORTER_RETRY_BACKOFF", time.Second),
-			WalDir:        getenvDefault("CHERRY_PICKER_WAL_DIR", ""),
-			APIKey:        getenvDefault("CHERRY_API_KEY", ""),
-			CrawlerID:     strings.TrimSpace(os.Getenv("CHERRY_PICKER_CRAWLER_ID")),
-			Region:        strings.TrimSpace(os.Getenv("CHERRY_PICKER_REGION")),
-			SpoolDir:      getenvDefault("CHERRY_PICKER_SPOOL_DIR", ""),
-			SpoolMaxBytes: int64(getenvInt("CHERRY_PICKER_SPOOL_MAX_BYTES", 0)),
+			Kind:           strings.ToLower(getenvDefault("CHERRY_PICKER_EXPORTER", "stdout")),
+			FilePath:       getenvDefault("CHERRY_PICKER_EXPORTER_FILE", ""),
+			HTTPEndpoint:   getenvDefault("CHERRY_PICKER_EXPORTER_URL", ""),
+			OracleEndpoint: strings.TrimSpace(os.Getenv("CHERRY_PICKER_ORACLE_URL")),
+			BatchSize:      getenvInt("CHERRY_PICKER_EXPORTER_BATCH", 512),
+			FlushInterval:  getenvDuration("CHERRY_PICKER_EXPORTER_FLUSH", 500*time.Millisecond),
+			HTTPTimeout:    getenvDuration("CHERRY_PICKER_EXPORTER_TIMEOUT", 5*time.Second),
+			HTTPRetries:    getenvInt("CHERRY_PICKER_EXPORTER_HTTP_RETRIES", 3),
+			RetryBackoff:   getenvDuration("CHERRY_PICKER_EXPORTER_RETRY_BACKOFF", time.Second),
+			WalDir:         getenvDefault("CHERRY_PICKER_WAL_DIR", ""),
+			APIKey:         getenvDefault("CHERRY_API_KEY", ""),
+			OracleAPIKey:   strings.TrimSpace(os.Getenv("CHERRY_PICKER_ORACLE_API_KEY")),
+			CrawlerID:      strings.TrimSpace(os.Getenv("CHERRY_PICKER_CRAWLER_ID")),
+			Region:         strings.TrimSpace(os.Getenv("CHERRY_PICKER_REGION")),
+			SpoolDir:       getenvDefault("CHERRY_PICKER_SPOOL_DIR", ""),
+			SpoolMaxBytes:  int64(getenvInt("CHERRY_PICKER_SPOOL_MAX_BYTES", 0)),
 		},
 	}
 
@@ -288,20 +297,22 @@ func loadFromFile(path string) (Config, error) {
 			RejectAboveFiles:      raw.Filter.RejectAboveFiles,
 		},
 		Exporter: ExporterConfig{
-			Kind:          strings.ToLower(strings.TrimSpace(raw.Exporter.Kind)),
-			FilePath:      strings.TrimSpace(raw.Exporter.FilePath),
-			HTTPEndpoint:  strings.TrimSpace(raw.Exporter.HTTPEndpoint),
-			BatchSize:     raw.Exporter.BatchSize,
-			FlushInterval: parseDuration(raw.Exporter.FlushInterval),
-			HTTPTimeout:   parseDuration(raw.Exporter.HTTPTimeout),
-			HTTPRetries:   raw.Exporter.HTTPRetries,
-			RetryBackoff:  parseDuration(raw.Exporter.RetryBackoff),
-			WalDir:        strings.TrimSpace(raw.Exporter.WalDir),
-			APIKey:        strings.TrimSpace(raw.Exporter.APIKey),
-			CrawlerID:     strings.TrimSpace(raw.Exporter.CrawlerID),
-			Region:        strings.TrimSpace(raw.Exporter.Region),
-			SpoolDir:      strings.TrimSpace(raw.Exporter.SpoolDir),
-			SpoolMaxBytes: raw.Exporter.SpoolMaxBytes,
+			Kind:           strings.ToLower(strings.TrimSpace(raw.Exporter.Kind)),
+			FilePath:       strings.TrimSpace(raw.Exporter.FilePath),
+			HTTPEndpoint:   strings.TrimSpace(raw.Exporter.HTTPEndpoint),
+			OracleEndpoint: strings.TrimSpace(raw.Exporter.OracleEndpoint),
+			BatchSize:      raw.Exporter.BatchSize,
+			FlushInterval:  parseDuration(raw.Exporter.FlushInterval),
+			HTTPTimeout:    parseDuration(raw.Exporter.HTTPTimeout),
+			HTTPRetries:    raw.Exporter.HTTPRetries,
+			RetryBackoff:   parseDuration(raw.Exporter.RetryBackoff),
+			WalDir:         strings.TrimSpace(raw.Exporter.WalDir),
+			APIKey:         strings.TrimSpace(raw.Exporter.APIKey),
+			OracleAPIKey:   strings.TrimSpace(raw.Exporter.OracleAPIKey),
+			CrawlerID:      strings.TrimSpace(raw.Exporter.CrawlerID),
+			Region:         strings.TrimSpace(raw.Exporter.Region),
+			SpoolDir:       strings.TrimSpace(raw.Exporter.SpoolDir),
+			SpoolMaxBytes:  raw.Exporter.SpoolMaxBytes,
 		},
 	}
 
@@ -490,20 +501,22 @@ type fileMetadataConfig struct {
 }
 
 type fileExporterConfig struct {
-	Kind          string `json:"kind"`
-	FilePath      string `json:"file_path"`
-	HTTPEndpoint  string `json:"http_endpoint"`
-	BatchSize     int    `json:"batch_size"`
-	FlushInterval string `json:"flush_interval"`
-	HTTPTimeout   string `json:"http_timeout"`
-	HTTPRetries   int    `json:"http_retries"`
-	RetryBackoff  string `json:"retry_backoff"`
-	WalDir        string `json:"wal_dir"`
-	APIKey        string `json:"api_key"`
-	CrawlerID     string `json:"crawler_id"`
-	Region        string `json:"region"`
-	SpoolDir      string `json:"spool_dir"`
-	SpoolMaxBytes int64  `json:"spool_max_bytes"`
+	Kind           string `json:"kind"`
+	FilePath       string `json:"file_path"`
+	HTTPEndpoint   string `json:"http_endpoint"`
+	OracleEndpoint string `json:"oracle_endpoint"`
+	BatchSize      int    `json:"batch_size"`
+	FlushInterval  string `json:"flush_interval"`
+	HTTPTimeout    string `json:"http_timeout"`
+	HTTPRetries    int    `json:"http_retries"`
+	RetryBackoff   string `json:"retry_backoff"`
+	WalDir         string `json:"wal_dir"`
+	APIKey         string `json:"api_key"`
+	OracleAPIKey   string `json:"oracle_api_key"`
+	CrawlerID      string `json:"crawler_id"`
+	Region         string `json:"region"`
+	SpoolDir       string `json:"spool_dir"`
+	SpoolMaxBytes  int64  `json:"spool_max_bytes"`
 }
 
 // normalizeFilterConfig applies built-in defaults for any filter threshold that

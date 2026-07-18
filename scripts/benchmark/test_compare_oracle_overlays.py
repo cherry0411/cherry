@@ -45,13 +45,26 @@ class OverlayComparisonTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "trailing partial"):
                 overlays.read_overlay(path)
 
-    def test_rejects_cross_kind_duplicate(self):
+    def test_cross_kind_history_uses_information_priority(self):
         with tempfile.TemporaryDirectory() as raw:
             path = Path(raw) / "invalid.bin"
             value = bytes([9]) * 20
             write_records(path, [(b"M", value), (b"R", value)])
-            with self.assertRaisesRegex(ValueError, "both metadata and rejected"):
-                overlays.read_overlay(path)
+            result = overlays.read_overlay(path)
+            self.assertEqual(result["full"], {value})
+            self.assertEqual(result["rejected"], set())
+
+    def test_typed_actions_and_legacy_metadata_are_backward_compatible(self):
+        with tempfile.TemporaryDirectory() as raw:
+            path = Path(raw) / "typed.bin"
+            a, b, c, d = (bytes([n]) * 20 for n in range(1, 5))
+            write_records(path, [(b"M", a), (b"S", b), (b"H", c), (b"R", d)])
+            result = overlays.read_overlay(path)
+            self.assertEqual(result["full"], {a})
+            self.assertEqual(result["summary"], {b})
+            self.assertEqual(result["hash_only"], {c})
+            self.assertEqual(result["rejected"], {d})
+            self.assertEqual(result["metadata"], {a, b})
 
 
 if __name__ == "__main__":

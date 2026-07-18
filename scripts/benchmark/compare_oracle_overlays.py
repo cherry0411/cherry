@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Compare independent benchmark-sink overlays without attribution bias.
 
-Each sink overlay is a sequence of 21-byte records: one type byte (``M`` for
-metadata or ``R`` for a permanent rejection) followed by the raw 20-byte
-info-hash.  Regional crawlers deliberately write separate overlays so the same
-hash can be credited to both regions.  This reducer computes their exact
-intersection, union, and marginal contribution after the runs finish.
+Each sink overlay is a sequence of 21-byte records: one closed action byte
+(``F``/``S``/``H``/``R``) followed by the raw 20-byte info-hash. Legacy ``M``
+(searchable metadata) is read as ``F``. Regional crawlers deliberately write
+separate overlays so the same hash can be credited to both regions. This
+reducer computes exact intersection, union, and marginal contribution.
 """
 
 from __future__ import annotations
@@ -16,11 +16,15 @@ from pathlib import Path
 
 
 RECORD_SIZE = 21
-VALID_KINDS = {b"M": "metadata", b"R": "rejected"}
+VALID_KINDS = {
+    b"M": "full", b"F": "full", b"S": "summary",
+    b"H": "hash_only", b"R": "rejected",
+}
+PRIORITY = {"rejected": 1, "hash_only": 2, "summary": 3, "full": 4}
 
 
 def read_overlay(path: Path) -> dict[str, set[bytes]]:
-    records = {"metadata": set(), "rejected": set()}
+    classifications: dict[bytes, str] = {}
     with path.open("rb") as handle:
         offset = 0
         while chunk := handle.read(RECORD_SIZE):
@@ -32,17 +36,23 @@ def read_overlay(path: Path) -> dict[str, set[bytes]]:
             kind = VALID_KINDS.get(chunk[:1])
             if kind is None:
                 raise ValueError(f"{path}: invalid record type {chunk[:1]!r} at byte {offset}")
-            records[kind].add(chunk[1:])
+            value = chunk[1:]
+            previous = classifications.get(value)
+            if previous is None or PRIORITY[kind] > PRIORITY[previous]:
+                classifications[value] = kind
             offset += RECORD_SIZE
-    overlap = records["metadata"] & records["rejected"]
-    if overlap:
-        raise ValueError(f"{path}: {len(overlap)} hashes occur as both metadata and rejected")
+    records = {name: set() for name in PRIORITY}
+    for value, kind in classifications.items():
+        records[kind].add(value)
+    records["searchable"] = records["full"] | records["summary"]
+    # Backward-compatible alias used by older union automation.
+    records["metadata"] = records["searchable"]
     return records
 
 
 def compare(left: dict[str, set[bytes]], right: dict[str, set[bytes]]) -> dict:
-    result: dict[str, object] = {"schema_version": 1}
-    for kind in ("metadata", "rejected"):
+    result: dict[str, object] = {"schema_version": 2}
+    for kind in ("searchable", "full", "summary", "hash_only", "rejected"):
         a = left[kind]
         b = right[kind]
         intersection = a & b
@@ -60,6 +70,7 @@ def compare(left: dict[str, set[bytes]], right: dict[str, set[bytes]]) -> dict:
             "right_marginal_over_left": len(b - a) / len(b) if b else None,
             "left_marginal_over_right": len(a - b) / len(a) if a else None,
         }
+    result["metadata"] = result["searchable"]
     return result
 
 

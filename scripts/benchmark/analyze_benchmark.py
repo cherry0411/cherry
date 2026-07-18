@@ -184,6 +184,43 @@ def json_counter_delta(before: dict, after: dict, key: str) -> int | None:
     return max(0, int(b - a))
 
 
+def json_signed_delta(before: dict, after: dict, key: str) -> int | None:
+    a, b = before.get(key), after.get(key)
+    if not isinstance(a, (int, float)) or not isinstance(b, (int, float)):
+        return None
+    return int(b - a)
+
+
+def oracle_observer_health(runtime_rows: list[dict[str, float]]) -> dict[str, object]:
+    capacity = maximum(row.get("oracle_obs_cap", math.nan) for row in runtime_rows)
+    enabled = capacity is not None and capacity > 0
+    queued = total(runtime_rows, "oracle_obs_q")
+    sent = total(runtime_rows, "oracle_obs_sent")
+    dropped = total(runtime_rows, "oracle_obs_drop")
+    http_failures = total(runtime_rows, "oracle_obs_http_fail")
+    depth_max = maximum(row.get("oracle_obs_depth", math.nan) for row in runtime_rows)
+    tainted = maximum(row.get("oracle_obs_invalid", math.nan) for row in runtime_rows)
+    return {
+        "enabled": enabled,
+        "queued": queued if enabled else None,
+        "sent": sent if enabled else None,
+        "dropped": dropped if enabled else None,
+        "http_failures": http_failures if enabled else None,
+        "queue_depth_max": depth_max if enabled else None,
+        "queue_capacity": capacity if enabled else None,
+        "queue_fill_ratio_max": (
+            depth_max / capacity if enabled and depth_max is not None and capacity else None
+        ),
+        # The cumulative taint gauge preserves warmup failures whose delayed
+        # retries could otherwise be credited inside the measurement suffix.
+        "tainted_since_start": bool(tainted) if enabled and tainted is not None else None,
+        "evidence_valid": (
+            dropped == 0 and http_failures == 0 and not bool(tainted)
+            if enabled else None
+        ),
+    }
+
+
 def slope(points: list[tuple[float, float]]) -> float | None:
     if len(points) < 3:
         return None
@@ -465,6 +502,21 @@ def main() -> None:
         check_found_delta / check_hash_delta
         if check_hash_delta and check_found_delta is not None else None
     )
+    # Received action counters describe the post-policy durable decisions. Store
+    # class gauges may move in both directions when a richer action upgrades an
+    # older one, so both signed class changes and observation counts are kept.
+    action_observations = {
+        "full": json_counter_delta(before, after, "observation_full"),
+        "summary": json_counter_delta(before, after, "observation_summary"),
+        "hash_only": json_counter_delta(before, after, "observation_hash_only"),
+        "reject": json_counter_delta(before, after, "observation_reject"),
+    }
+    action_unique_changes = {
+        "full": json_signed_delta(before, after, "full_unique"),
+        "summary": json_signed_delta(before, after, "summary_unique"),
+        "hash_only": json_signed_delta(before, after, "hash_only_unique"),
+        "reject": json_signed_delta(before, after, "rejected_unique"),
+    }
 
     local_windows = [row.get("meta_sent", row.get("wire_ok", 0)) for row in runtime_rows]
     nodes = [row.get("nodes", math.nan) for row in runtime_rows]
@@ -504,6 +556,8 @@ def main() -> None:
             "transient_slope_unique_per_hour_per_uptime_hour": transient_slope,
             "first_half_unique_per_second": first_half_rate,
             "second_half_unique_per_second": second_half_rate,
+            "oracle_action_observations": action_observations,
+            "oracle_action_unique_changes": action_unique_changes,
         },
         "local_funnel": {
             "metadata_sent": total(runtime_rows, "meta_sent"),
@@ -582,6 +636,7 @@ def main() -> None:
             "oracle_samples_rejected": rejected_oracle_samples,
             "oracle_sample_coverage": oracle_sample_coverage,
             "oracle_sample_missing_rate": oracle_sample_missing_rate,
+            "oracle_observer": oracle_observer_health(runtime_rows),
         },
     }
     args.output.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8")

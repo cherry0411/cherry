@@ -123,6 +123,15 @@ def validate_run(
     missing = number(metric(record, "health", "oracle_sample_missing_rate"))
     if missing is not None and missing > 0.1:
         errors.append(f"oracle monitor missing rate {missing:.1%} > 10%")
+    observer = result.get("health", {}).get("oracle_observer", {})
+    if observer.get("enabled"):
+        if observer.get("evidence_valid") is not True:
+            errors.append(
+                "oracle observation evidence invalid "
+                f"(dropped={observer.get('dropped')}, "
+                f"http_failures={observer.get('http_failures')}, "
+                f"tainted={observer.get('tainted_since_start')})"
+            )
     return errors, warnings
 
 

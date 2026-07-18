@@ -1,8 +1,11 @@
 package app
 
 import (
+	"encoding/json"
 	"io"
 	"log"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
@@ -232,6 +235,48 @@ func TestDurableMetadataEndpointUpgradesLegacyBatchURL(t *testing.T) {
 		if got := durableMetadataEndpoint(input); got != want {
 			t.Errorf("durableMetadataEndpoint(%q)=%q, want %q", input, got, want)
 		}
+	}
+}
+
+func TestCheckBatchUsesIndependentOracleEndpointAndKey(t *testing.T) {
+	requests := make(chan *http.Request, 1)
+	oracle := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests <- r.Clone(r.Context())
+		_ = json.NewEncoder(w).Encode([]string{"0123456789abcdef0123456789abcdef01234567"})
+	}))
+	defer oracle.Close()
+	cfg := defaultTestConfig()
+	cfg.Exporter.Kind = "http"
+	cfg.Exporter.HTTPEndpoint = "https://storage.invalid/api/v1/torrents/batch"
+	cfg.Exporter.APIKey = "storage-secret"
+	cfg.Exporter.OracleEndpoint = oracle.URL + "/api/v1/oracle/observations"
+	cfg.Exporter.OracleAPIKey = "oracle-secret"
+	application := New(cfg, testLogger())
+	application.checkBatchExists([]string{"0123456789abcdef0123456789abcdef01234567"})
+	request := <-requests
+	if request.URL.Path != "/api/v1/torrents/check" || request.Header.Get("X-API-Key") != "oracle-secret" {
+		t.Fatalf("oracle request path=%s key=%q", request.URL.Path, request.Header.Get("X-API-Key"))
+	}
+	if !application.remoteKnown.Contains("0123456789abcdef0123456789abcdef01234567") {
+		t.Fatal("oracle check result was not applied")
+	}
+}
+
+func TestCheckBatchFallsBackToLegacyExporterEndpointAndKey(t *testing.T) {
+	requests := make(chan *http.Request, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests <- r.Clone(r.Context())
+		_ = json.NewEncoder(w).Encode([]string{})
+	}))
+	defer server.Close()
+	cfg := defaultTestConfig()
+	cfg.Exporter.HTTPEndpoint = server.URL + "/api/v1/torrents/batch"
+	cfg.Exporter.APIKey = "legacy-secret"
+	application := New(cfg, testLogger())
+	application.checkBatchExists([]string{"0123456789abcdef0123456789abcdef01234567"})
+	request := <-requests
+	if request.URL.Path != "/api/v1/torrents/check" || request.Header.Get("X-API-Key") != "legacy-secret" {
+		t.Fatalf("legacy request path=%s key=%q", request.URL.Path, request.Header.Get("X-API-Key"))
 	}
 }
 

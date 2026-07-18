@@ -30,11 +30,49 @@ The controller re-executes an immutable temporary snapshot of itself. Updating
 the deployed script while a long run is active therefore cannot alter its
 second half or invalidate its result.
 
-The included `benchmark-sink` persists only 21 bytes per processed infohash. It
-implements the crawler's batch/check/reject endpoints without PostgreSQL or the
-full API, so it is suitable as a global-uniqueness oracle on the 2C4G crawler
-host. Its CPU and RSS remain part of the host resource budget. The same endpoint
-can later be shared by multiple regions.
+The included `benchmark-sink` persists only 21 bytes per processed infohash. Its
+first byte is the closed retention action (`F` full, `S` summary, `H` hash-only,
+`R` reject); the remaining 20 bytes are the hash. Legacy `M`/`R` files remain
+readable, with `M` interpreted as full. It implements the crawler's
+batch/check/reject/observation endpoints without PostgreSQL or the full API, so
+it is suitable as a global-uniqueness oracle on the 2C4G crawler host. Its CPU
+and RSS remain part of the host resource budget. The same endpoint can later be
+shared by multiple regions. The primary searchable metric is always
+`full + summary`; hash-only and reject remain known to `/check` but are never
+counted as searchable metadata.
+
+### Production persistence plus frozen experimental oracle
+
+A durable crawler no longer has to choose between preserving downloaded
+metadata and keeping an experiment scientifically isolated:
+
+- `exporter.http_endpoint` and `api_key` remain the production durable ingest
+  connection. Full/summary/hash-only/reject records enter the local segment
+  spool and receive their production durability boundary there.
+- Optional `exporter.oracle_endpoint` and `oracle_api_key` are independent.
+  `/check` uses this oracle when configured; if it is empty, `/check` falls back
+  exactly to the old exporter endpoint/key behavior.
+- Only after `DurableIngestor.Submit` returns from group fsync does the crawler
+  enqueue an asynchronous observation containing exactly `info_hash` and one of
+  the four actions. The closed protocol has no field capable of carrying title,
+  files, pieces, raw bencode, crawler receipt, or production payload.
+- Oracle HTTP failure never blocks or rolls back the production durable ACK.
+  The observation queue is bounded and non-blocking. Every enqueue, delivery,
+  queue drop, HTTP failure, depth and capacity is logged every 30 seconds.
+  `oracle_obs_invalid=true` is a lifetime taint gauge, so a warm-up failure whose
+  delayed retry lands in measurement cannot appear valid. Any drop, HTTP
+  failure, or taint is a hard comparison failure in `compare_benchmarks.py`.
+- When the separate channel is not configured, startup logs its disabled state,
+  observation capacity is zero, and legacy runs remain analyzable without a new
+  health requirement. Shutdown attempts a bounded five-second drain; timeout
+  converts every unsent observation to explicit dropped evidence.
+
+`prepare_config.py` detects a non-empty durable `spool_dir`: it preserves the
+production `http_endpoint` and routes the run-local frozen sink to
+`oracle_endpoint`. Configs without a spool keep the legacy single-endpoint
+behavior. Sink stats and `result.json` include the four action splits and signed
+classification upgrades. Exact regional-overlay comparison understands both
+typed and legacy files.
 
 Three run modes deliberately answer different questions:
 
@@ -106,7 +144,8 @@ global-uniqueness oracle. Legacy manifests remain readable but produce an
 explicit warning when they lack treatment/template hashes.
 
 Each run first passes health gates for runtime-window coverage, RSS, kernel UDP
-drops, and oracle sample continuity. The comparison reports absolute deltas,
+drops, oracle sample continuity, and (when enabled) lossless oracle-observation
+delivery. The comparison reports absolute deltas,
 log-ratios, order-stratified effects, an exact sign test, and a deterministic
 paired-bootstrap confidence interval. A candidate is never called durable
 without at least six valid treatment pairs, five positive pairs, three valid
@@ -246,7 +285,8 @@ Isolation never merges results by default. Each experiment has a manifest,
 baseline digest, per-block overlay digests, controller logs, and a companion
 manifest digest under `bench/oracle-experiments/`. Add `--finalize-oracle` only
 after deciding that every completed block should enter production. Finalize
-validates all 21-byte records, merges metadata before rejections, builds and
+validates all 21-byte records, applies the deterministic information priority
+`full > summary > hash_only > reject`, builds and
 fsyncs a temporary production file, then replaces production. Source overlays
 remain preserved. If the production digest changes during the experiment,
 finalization refuses to run. Shared mode remains the default for compatibility;
