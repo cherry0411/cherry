@@ -176,7 +176,7 @@ PY
 
 log_file="${run_dir}/crawler.log"
 metrics_file="${run_dir}/host-metrics.csv"
-echo "utc,elapsed_s,cpu_pct,rss_kb,threads,rx_bytes,tx_bytes,oracle_unique" > "${metrics_file}"
+echo "utc,elapsed_s,cpu_pct,rss_kb,threads,rx_bytes,tx_bytes,udp_rcvbuf_errors,udp_sndbuf_errors,oracle_unique" > "${metrics_file}"
 start_epoch="$(date +%s)"
 
 env GOMAXPROCS=2 CHERRY_PICKER_MEM_LIMIT_MB=3072 CHERRY_PICKER_CONFIG="${effective_config}" \
@@ -186,15 +186,16 @@ echo "${crawler_pid}" > "${RUNTIME_ROOT}/run/crawler.pid"
 
 monitor() {
   while kill -0 "${crawler_pid}" 2>/dev/null; do
-    local now elapsed cpu rss threads rx tx oracle stats
+    local now elapsed cpu rss threads rx tx udp_rcv udp_snd oracle stats
     now="$(date +%s)"; elapsed=$((now - start_epoch))
     cpu="$(ps -p "${crawler_pid}" -o %cpu= 2>/dev/null | tr -d ' ' || true)"; cpu="${cpu:-0}"
     rss="$(awk '/VmRSS:/ {print $2}' "/proc/${crawler_pid}/status" 2>/dev/null || echo 0)"
     threads="$(awk '/Threads:/ {print $2}' "/proc/${crawler_pid}/status" 2>/dev/null || echo 0)"
     read -r rx tx < <(awk -F'[: ]+' '$1 != "lo" && NF > 10 {rx += $3; tx += $11} END {print rx+0, tx+0}' /proc/net/dev)
+    read -r udp_rcv udp_snd < <(awk '$1 == "Udp:" { if (++row == 1) { for (i=2; i<=NF; i++) col[$i]=i } else { print $(col["RcvbufErrors"]), $(col["SndbufErrors"]) } }' /proc/net/snmp)
     stats="$(curl -fsS "${sink_base}/stats" 2>/dev/null || echo '{}')"
     oracle="$(python3 -c 'import json,sys; print(json.load(sys.stdin).get("metadata_unique",0))' <<<"${stats}" 2>/dev/null || echo 0)"
-    printf '%s,%s,%s,%s,%s,%s,%s,%s\n' "$(date -u +%FT%TZ)" "${elapsed}" "${cpu}" "${rss}" "${threads}" "${rx}" "${tx}" "${oracle}" >> "${metrics_file}"
+    printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' "$(date -u +%FT%TZ)" "${elapsed}" "${cpu}" "${rss}" "${threads}" "${rx}" "${tx}" "${udp_rcv}" "${udp_snd}" "${oracle}" >> "${metrics_file}"
     sleep 30
   done
 }

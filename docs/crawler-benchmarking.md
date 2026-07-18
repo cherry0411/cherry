@@ -12,6 +12,7 @@ Every run has an immutable directory under `bench/runs/` containing:
 - binary SHA-256 plus the commit/source/config identifiers printed by the binary;
 - warm/cold identity mode, port, node-ID cohort, host/kernel/sysctl snapshot;
 - complete crawler log and 30-second CPU/RSS/network/oracle samples;
+- per-run kernel UDP receive/send buffer error deltas;
 - uniqueness-oracle snapshots at the exact measurement boundaries;
 - a normalized `result.json` and an append-only `bench/index.jsonl` record.
 

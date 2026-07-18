@@ -58,7 +58,10 @@ def parse_host_metrics(path: Path, warmup: float, total: float) -> list[dict[str
                 if elapsed < warmup or elapsed > total + 60:
                     continue
                 row: dict[str, float] = {"elapsed_s": elapsed}
-                for key in ("cpu_pct", "rss_kb", "threads", "rx_bytes", "tx_bytes", "oracle_unique"):
+                for key in (
+                    "cpu_pct", "rss_kb", "threads", "rx_bytes", "tx_bytes",
+                    "udp_rcvbuf_errors", "udp_sndbuf_errors", "oracle_unique",
+                ):
                     try:
                         row[key] = float(raw.get(key, ""))
                     except (TypeError, ValueError):
@@ -85,6 +88,13 @@ def mean(values) -> float | None:
 def maximum(values) -> float | None:
     values = finite(values)
     return max(values) if values else None
+
+
+def counter_delta(rows: list[dict[str, float]], key: str) -> int | None:
+    values = finite(row.get(key, math.nan) for row in rows)
+    if len(values) < 2:
+        return None
+    return max(0, int(values[-1] - values[0]))
 
 
 def slope(points: list[tuple[float, float]]) -> float | None:
@@ -183,6 +193,10 @@ def main() -> None:
             "rss_mb_mean": (mean(row.get("rss_kb") for row in metrics) or 0) / 1024,
             "rss_mb_max": (maximum(row.get("rss_kb") for row in metrics) or 0) / 1024,
             "threads_max": maximum(row.get("threads") for row in metrics),
+            "host_rx_bytes": counter_delta(metrics, "rx_bytes"),
+            "host_tx_bytes": counter_delta(metrics, "tx_bytes"),
+            "udp_rcvbuf_errors": counter_delta(metrics, "udp_rcvbuf_errors"),
+            "udp_sndbuf_errors": counter_delta(metrics, "udp_sndbuf_errors"),
         },
     }
     args.output.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8")
