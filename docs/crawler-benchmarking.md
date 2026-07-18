@@ -21,6 +21,11 @@ Every run has an immutable directory under `bench/runs/` containing:
   stream was already consumed by prior sequential runs;
 - a normalized `result.json` and an append-only `bench/index.jsonl` record.
 
+The index record includes SHA-256 and byte size for the effective config, raw
+crawler log, host metrics, environment snapshot, and both oracle boundaries.
+Small summaries can therefore be copied to source control while large raw
+artifacts remain verifiable on the benchmark host.
+
 The controller re-executes an immutable temporary snapshot of itself. Updating
 the deployed script while a long run is active therefore cannot alter its
 second half or invalidate its result.

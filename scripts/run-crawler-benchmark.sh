@@ -274,10 +274,22 @@ python3 "${SCRIPT_DIR}/benchmark/analyze_benchmark.py" \
   --sink-after "${run_dir}/sink-after.json" --warmup-seconds "${warmup_seconds}" \
   --measure-seconds "${measure_seconds}" --output "${run_dir}/result.json" | tee "${run_dir}/result.txt"
 
-python3 - "${run_dir}/manifest.json" "${run_dir}/result.json" "${RUNTIME_ROOT}/bench/index.jsonl" <<'PY'
-import json, sys
+python3 - "${run_dir}/manifest.json" "${run_dir}/result.json" "${RUNTIME_ROOT}/bench/index.jsonl" "${run_dir}" <<'PY'
+import hashlib, json, os, sys
 record = {"manifest": json.load(open(sys.argv[1], encoding="utf-8")),
           "result": json.load(open(sys.argv[2], encoding="utf-8"))}
+artifacts = {}
+for name in ("config.json", "crawler.log", "environment.txt", "host-metrics.csv",
+             "sink-before.json", "sink-after.json"):
+    path = os.path.join(sys.argv[4], name)
+    if not os.path.isfile(path):
+        continue
+    digest = hashlib.sha256()
+    with open(path, "rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    artifacts[name] = {"bytes": os.path.getsize(path), "sha256": digest.hexdigest()}
+record["artifacts"] = artifacts
 with open(sys.argv[3], "a", encoding="utf-8") as handle:
     handle.write(json.dumps(record, sort_keys=True) + "\n")
 PY
