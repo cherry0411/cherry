@@ -175,7 +175,7 @@ public sealed class HeatRuntimeMetrics
     private long _lastCommitTicks;
     private long _lastSealTicks;
     private long _lastProjectionTicks;
-    private string? _lastFailure;
+    private FailureSnapshot? _lastFailure;
 
     public void Accepted(int records, bool replay)
     {
@@ -199,29 +199,51 @@ public sealed class HeatRuntimeMetrics
         Interlocked.Exchange(ref _lastProjectionTicks, DateTime.UtcNow.Ticks);
     }
 
-    public void Fail(Exception exception) =>
-        Volatile.Write(ref _lastFailure, $"{exception.GetType().Name}: {exception.Message}"[..Math.Min(512, exception.GetType().Name.Length + exception.Message.Length + 2)]);
+    public void Fail(Exception exception, string? source = null)
+    {
+        var message = $"{exception.GetType().Name}: {exception.Message}";
+        Volatile.Write(ref _lastFailure,
+            new FailureSnapshot(message[..Math.Min(512, message.Length)], source));
+    }
 
-    public void ClearFailure() => Volatile.Write(ref _lastFailure, null);
+    public void ClearFailure(string? source = null)
+    {
+        while (true)
+        {
+            var current = Volatile.Read(ref _lastFailure);
+            if (current is null || (source is not null && current.Source != source)) return;
+            if (ReferenceEquals(
+                    Interlocked.CompareExchange(ref _lastFailure, null, current),
+                    current))
+                return;
+        }
+    }
 
-    public HeatMetricsSnapshot Snapshot(bool enabled) => new(
-        enabled,
-        Interlocked.Read(ref _acceptedBatches),
-        Interlocked.Read(ref _acceptedRecords),
-        Interlocked.Read(ref _replayedBatches),
-        Interlocked.Read(ref _rejectedBatches),
-        Interlocked.Read(ref _sealedDays),
-        Interlocked.Read(ref _projectedDocuments),
-        ReadTime(ref _lastCommitTicks),
-        ReadTime(ref _lastSealTicks),
-        ReadTime(ref _lastProjectionTicks),
-        Volatile.Read(ref _lastFailure));
+    public HeatMetricsSnapshot Snapshot(bool enabled)
+    {
+        var failure = Volatile.Read(ref _lastFailure);
+        return new HeatMetricsSnapshot(
+            enabled,
+            Interlocked.Read(ref _acceptedBatches),
+            Interlocked.Read(ref _acceptedRecords),
+            Interlocked.Read(ref _replayedBatches),
+            Interlocked.Read(ref _rejectedBatches),
+            Interlocked.Read(ref _sealedDays),
+            Interlocked.Read(ref _projectedDocuments),
+            ReadTime(ref _lastCommitTicks),
+            ReadTime(ref _lastSealTicks),
+            ReadTime(ref _lastProjectionTicks),
+            failure?.Message,
+            failure?.Source);
+    }
 
     private static DateTime? ReadTime(ref long ticks)
     {
         var value = Interlocked.Read(ref ticks);
         return value == 0 ? null : new DateTime(value, DateTimeKind.Utc);
     }
+
+    private sealed record FailureSnapshot(string Message, string? Source);
 }
 
 public sealed record HeatMetricsSnapshot(
@@ -235,4 +257,5 @@ public sealed record HeatMetricsSnapshot(
     DateTime? LastCommitAt,
     DateTime? LastSealAt,
     DateTime? LastProjectionAt,
-    string? LastFailure);
+    string? LastFailure,
+    string? LastFailureSource);

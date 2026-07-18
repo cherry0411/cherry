@@ -37,7 +37,7 @@ public sealed class HeatLifecycleWorker : BackgroundService
             catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested) { }
             catch (Exception exception)
             {
-                _metrics.Fail(exception);
+                _metrics.Fail(exception, "daily-lifecycle");
                 _logger.LogError(exception, "Heat day sealing pass failed");
             }
             await Task.Delay(TimeSpan.FromSeconds(_options.LifecyclePollSeconds), stoppingToken);
@@ -45,6 +45,12 @@ public sealed class HeatLifecycleWorker : BackgroundService
     }
 
     public async Task SealEligibleDaysAsync(CancellationToken cancellationToken)
+    {
+        await SealEligibleDaysCoreAsync(cancellationToken);
+        _metrics.ClearFailure("daily-lifecycle");
+    }
+
+    private async Task SealEligibleDaysCoreAsync(CancellationToken cancellationToken)
     {
         var start = _options.ParsedCoverageStartDay
             ?? throw new InvalidOperationException("Heat:CoverageStartDay is required when heat is enabled");

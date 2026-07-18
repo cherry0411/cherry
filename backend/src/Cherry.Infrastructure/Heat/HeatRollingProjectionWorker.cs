@@ -58,7 +58,7 @@ public sealed class HeatRollingProjectionWorker : BackgroundService
             catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested) { break; }
             catch (Exception exception)
             {
-                _metrics.Fail(exception);
+                _metrics.Fail(exception, "rolling-projection");
                 _logger.LogError(exception, "Rolling 24h heat projection failed");
             }
             await Task.Delay(TimeSpan.FromSeconds(_options.LifecyclePollSeconds), stoppingToken);
@@ -66,6 +66,13 @@ public sealed class HeatRollingProjectionWorker : BackgroundService
     }
 
     public async Task<bool> ProcessOnceAsync(CancellationToken cancellationToken = default)
+    {
+        var progressed = await ProcessOnceCoreAsync(cancellationToken);
+        _metrics.ClearFailure("rolling-projection");
+        return progressed;
+    }
+
+    private async Task<bool> ProcessOnceCoreAsync(CancellationToken cancellationToken)
     {
         // Only complete UTC buckets are eligible. Projecting the current hour
         // a few seconds after the boundary would freeze a misleading partial
@@ -104,7 +111,6 @@ public sealed class HeatRollingProjectionWorker : BackgroundService
             mapped.Select(row => (row.InfoHash, row.Count, row.Revision)).ToArray(),
             Unmapped(snapshot.Changes, mapped),
             cancellationToken);
-        _metrics.ClearFailure();
         return true;
     }
 

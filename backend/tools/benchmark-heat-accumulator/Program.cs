@@ -6,7 +6,7 @@ using Cherry.Infrastructure.Heat;
 using Microsoft.Data.Sqlite;
 using Microsoft.Extensions.Logging.Abstractions;
 
-var batchCount = args.Length > 0 ? int.Parse(args[0]) : 8;
+var batchCount = args.Length > 0 ? int.Parse(args[0]) : 32;
 var hashesPerBatch = args.Length > 1 ? int.Parse(args[1]) : 4_096;
 var actorsPerHash = args.Length > 2 ? int.Parse(args[2]) : 1;
 if (batchCount <= 0 || hashesPerBatch <= 0 || actorsPerHash <= 0)
@@ -47,6 +47,10 @@ try
     GC.Collect(2, GCCollectionMode.Forced, blocking: true, compacting: true);
     GC.WaitForPendingFinalizers();
     GC.Collect(2, GCCollectionMode.Forced, blocking: true, compacting: true);
+    using var process = Process.GetCurrentProcess();
+    process.Refresh();
+    var baselineWorkingSetBytes = process.WorkingSet64;
+    await using var workingSetSampler = new WorkingSetSampler(process);
     var allocatedBefore = GC.GetTotalAllocatedBytes(precise: true);
     var gen2Before = GC.CollectionCount(2);
     var latencies = new double[batchCount];
@@ -122,6 +126,9 @@ try
             await ScalarAsync(connection, "SELECT COUNT(*) FROM receipts") != batchCount + 4)
             throw new InvalidDataException("daily SQLite row-count gate failed");
     }
+    var sampledPeakWorkingSetBytes = await workingSetSampler.StopAsync();
+    var sampledWorkingSetGrowthBytes = Math.Max(
+        0, sampledPeakWorkingSetBytes - baselineWorkingSetBytes);
 
     Array.Sort(latencies);
     var totalSeconds = timer.Elapsed.TotalSeconds;
@@ -130,12 +137,17 @@ try
     var minimumRecordsPerSecond = expectedPairs >= 32_768 ? 8_000d : 0d;
     const double maximumAllocatedBytesPerRecord = 750d;
     const long maximumPeakWorkingSetBytes = 512L * 1024 * 1024;
+    var productionSizedBatch = recordsPerBatch <= 4_096;
+    var maximumSampledWorkingSetGrowthBytes = productionSizedBatch
+        ? 32L * 1024 * 1024
+        : 128L * 1024 * 1024;
     var throughputGatePassed = recordsPerSecond >= minimumRecordsPerSecond;
     var allocationGatePassed = allocatedBytesPerRecord <= maximumAllocatedBytesPerRecord;
-    using var process = Process.GetCurrentProcess();
     process.Refresh();
     var peakWorkingSetBytes = process.PeakWorkingSet64;
     var workingSetGatePassed = peakWorkingSetBytes <= maximumPeakWorkingSetBytes;
+    var workingSetGrowthGatePassed =
+        sampledWorkingSetGrowthBytes <= maximumSampledWorkingSetGrowthBytes;
     var storeBytes = Directory.EnumerateFiles(directory, "*.sqlite3*")
         .Sum(path => new FileInfo(path).Length);
     Console.WriteLine(JsonSerializer.Serialize(new
@@ -143,6 +155,9 @@ try
         path = "HeatAccumulatorService daily FULL + rolling FULL",
         scope = "directional local regression gate; not a Linux/cgroup/2C4G capacity forecast",
         hashDistribution = "uniform SHA-1; input batches are prebuilt outside timed/allocation region",
+        memoryGateProfile = productionSizedBatch
+            ? "production-sized batches; strict across cumulative writes"
+            : "maximum-protocol diagnostic; includes the unchanged rolling store",
         batchCount,
         hashesPerBatch,
         actorsPerHash,
@@ -175,6 +190,11 @@ try
         peakWorkingSetBytes,
         maximumPeakWorkingSetBytes,
         workingSetGatePassed,
+        baselineWorkingSetBytes,
+        sampledPeakWorkingSetBytes,
+        sampledWorkingSetGrowthBytes,
+        maximumSampledWorkingSetGrowthBytes,
+        workingSetGrowthGatePassed,
         storeBytes,
         bytesPerRecord = (double)storeBytes / expectedPairs
     }, new JsonSerializerOptions { WriteIndented = true }));
@@ -184,6 +204,8 @@ try
         throw new InvalidDataException("full accumulator allocation gate failed");
     if (!workingSetGatePassed)
         throw new InvalidDataException("full accumulator working-set gate failed");
+    if (!workingSetGrowthGatePassed)
+        throw new InvalidDataException("full accumulator working-set growth gate failed");
 }
 finally
 {
@@ -268,3 +290,64 @@ static async Task<long> ScalarAsync(SqliteConnection connection, string sql)
 
 static double Percentile(IReadOnlyList<double> sorted, double percentile) =>
     sorted[Math.Min(sorted.Count - 1, (int)Math.Ceiling(sorted.Count * percentile) - 1)];
+
+sealed class WorkingSetSampler : IAsyncDisposable
+{
+    private readonly Process _process;
+    private readonly CancellationTokenSource _stop = new();
+    private readonly Task _sampling;
+    private long _peak;
+    private int _stopped;
+
+    public WorkingSetSampler(Process process)
+    {
+        _process = process;
+        _peak = process.WorkingSet64;
+        _sampling = SampleAsync();
+    }
+
+    public async Task<long> StopAsync()
+    {
+        if (Interlocked.Exchange(ref _stopped, 1) == 0)
+        {
+            _stop.Cancel();
+            await _sampling;
+        }
+        return Interlocked.Read(ref _peak);
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        await StopAsync();
+        _stop.Dispose();
+    }
+
+    private async Task SampleAsync()
+    {
+        try
+        {
+            while (true)
+            {
+                _process.Refresh();
+                UpdatePeak(_process.WorkingSet64);
+                await Task.Delay(TimeSpan.FromMilliseconds(2), _stop.Token);
+            }
+        }
+        catch (OperationCanceledException) when (_stop.IsCancellationRequested)
+        {
+            _process.Refresh();
+            UpdatePeak(_process.WorkingSet64);
+        }
+    }
+
+    private void UpdatePeak(long value)
+    {
+        var current = Interlocked.Read(ref _peak);
+        while (value > current)
+        {
+            var observed = Interlocked.CompareExchange(ref _peak, value, current);
+            if (observed == current) return;
+            current = observed;
+        }
+    }
+}

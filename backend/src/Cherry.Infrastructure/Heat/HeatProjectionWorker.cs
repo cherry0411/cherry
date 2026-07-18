@@ -54,7 +54,7 @@ public sealed class HeatProjectionWorker : BackgroundService
             catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested) { break; }
             catch (Exception exception)
             {
-                _metrics.Fail(exception);
+                _metrics.Fail(exception, "daily-projection");
                 _logger.LogError(exception, "Heat projection pass failed");
                 await Task.Delay(TimeSpan.FromSeconds(_options.LifecyclePollSeconds), stoppingToken);
             }
@@ -62,6 +62,13 @@ public sealed class HeatProjectionWorker : BackgroundService
     }
 
     public async Task<bool> ProcessOnceAsync(CancellationToken cancellationToken = default)
+    {
+        var progressed = await ProcessOnceCoreAsync(cancellationToken);
+        _metrics.ClearFailure("daily-projection");
+        return progressed;
+    }
+
+    private async Task<bool> ProcessOnceCoreAsync(CancellationToken cancellationToken)
     {
         await using var projection =
             await _recoveryCoordinator.EnterProjectionAsync(cancellationToken);

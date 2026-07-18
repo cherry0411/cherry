@@ -1,7 +1,9 @@
 using System.Buffers.Binary;
 using System.Security.Cryptography;
 using Cherry.Infrastructure.Heat;
+using Cherry.Infrastructure.Search;
 using Microsoft.Data.Sqlite;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging.Abstractions;
 using Xunit;
 
@@ -194,21 +196,177 @@ public sealed class HeatAccumulatorServiceTests
         }
     }
 
+    [Fact]
+    public async Task LargeSparseBatchUsesBoundedTempWindowsAndRemainsExact()
+    {
+        const int records = 32_768;
+        var directory = TemporaryDirectory();
+        var service = Service(directory);
+        var now = DateTime.UtcNow;
+        var day = DateOnly.FromDateTime(now);
+        var groups = Enumerable.Range(0, records)
+            .Select(index => new ChhtHashGroup(Hash(index), [index + 1L]))
+            .ToArray();
+        await service.StartAsync(CancellationToken.None);
+        try
+        {
+            var result = await service.SubmitAsync(
+                Batch("large", day, (byte)now.Hour, 13, 1, groups, 10),
+                CancellationToken.None);
+
+            Assert.Equal(HeatAcceptStatus.Accepted, result.Status);
+            Assert.Equal(records, result.Inserted);
+            await using var sqlite = await OpenReadOnlyAsync(service.PathForDay(day));
+            Assert.Equal(records, await ScalarAsync(sqlite, "SELECT COUNT(*) FROM seen"));
+            Assert.Equal(records, await ScalarAsync(sqlite, "SELECT COUNT(*) FROM hashes"));
+        }
+        finally
+        {
+            await service.StopAsync(CancellationToken.None);
+            DeleteDirectory(directory);
+        }
+    }
+
+    [Fact]
+    public async Task LargeActorSetForOneHashCrossesObservationWindowsExactly()
+    {
+        const int records = 8_193;
+        var directory = TemporaryDirectory();
+        var service = Service(directory);
+        var now = DateTime.UtcNow;
+        var day = DateOnly.FromDateTime(now);
+        var actors = Enumerable.Range(1, 4_096)
+            .Select(index => (long)index)
+            .Concat([1L])
+            .Concat(Enumerable.Range(4_097, 4_096).Select(index => (long)index))
+            .ToArray();
+        await service.StartAsync(CancellationToken.None);
+        try
+        {
+            var result = await service.SubmitAsync(
+                Batch("large-actors", day, (byte)now.Hour, 14, 1,
+                    [new ChhtHashGroup(Hash(1), actors)], 11),
+                CancellationToken.None);
+
+            Assert.Equal(HeatAcceptStatus.Accepted, result.Status);
+            Assert.Equal(records, result.Received);
+            Assert.Equal(records - 1, result.Inserted);
+            await using var sqlite = await OpenReadOnlyAsync(service.PathForDay(day));
+            Assert.Equal(records - 1, await ScalarAsync(sqlite, "SELECT COUNT(*) FROM seen"));
+            Assert.Equal(1, await ScalarAsync(sqlite, "SELECT COUNT(*) FROM hashes"));
+        }
+        finally
+        {
+            await service.StopAsync(CancellationToken.None);
+            DeleteDirectory(directory);
+        }
+    }
+
+    [Fact]
+    public void FailureMetricsOnlyClearTheMatchingSuccessfulWorkerSource()
+    {
+        var metrics = new HeatRuntimeMetrics();
+        metrics.Fail(new OutOfMemoryException(), "daily-ingest");
+
+        var failed = metrics.Snapshot(enabled: true);
+        Assert.StartsWith("OutOfMemoryException:", failed.LastFailure);
+        Assert.Equal("daily-ingest", failed.LastFailureSource);
+
+        metrics.ClearFailure("rolling-projection");
+        Assert.Equal("daily-ingest", metrics.Snapshot(enabled: true).LastFailureSource);
+
+        metrics.ClearFailure("daily-ingest");
+        var cleared = metrics.Snapshot(enabled: true);
+        Assert.Null(cleared.LastFailure);
+        Assert.Null(cleared.LastFailureSource);
+    }
+
+    [Fact]
+    public async Task LifecycleNoWorkClearsOnlyItsOwnFailureSource()
+    {
+        var directory = TemporaryDirectory();
+        var options = Options(
+            directory,
+            coverageStartDay: DateOnly.FromDateTime(DateTime.UtcNow)
+                .AddDays(1)
+                .ToString("yyyy-MM-dd"));
+        var metrics = new HeatRuntimeMetrics();
+        var accumulator = new HeatAccumulatorService(
+            options, metrics, NullLogger<HeatAccumulatorService>.Instance);
+        await using var provider = new ServiceCollection()
+            .AddSingleton(new HeatDaySealer(null!, options, metrics))
+            .BuildServiceProvider();
+        var worker = new HeatLifecycleWorker(
+            options,
+            accumulator,
+            provider.GetRequiredService<IServiceScopeFactory>(),
+            metrics,
+            NullLogger<HeatLifecycleWorker>.Instance);
+
+        metrics.Fail(new IOException("old"), "daily-lifecycle");
+        await worker.SealEligibleDaysAsync(CancellationToken.None);
+        Assert.Null(metrics.Snapshot(enabled: true).LastFailure);
+
+        metrics.Fail(new IOException("other"), "daily-projection");
+        await worker.SealEligibleDaysAsync(CancellationToken.None);
+        Assert.Equal("daily-projection", metrics.Snapshot(enabled: true).LastFailureSource);
+    }
+
+    [Fact]
+    public async Task RollingProjectionNoWorkClearsOnlyItsOwnFailureSource()
+    {
+        var directory = TemporaryDirectory();
+        var options = Options(directory);
+        var store = new HeatRollingStore(options);
+        var targetHour = HeatRollingStore.UnixHour(DateTime.UtcNow) - 1;
+        await store.CommitProjectionAsync(targetHour, [], [], CancellationToken.None);
+        var metrics = new HeatRuntimeMetrics();
+        var worker = new HeatRollingProjectionWorker(
+            store,
+            null!,
+            null!,
+            options,
+            metrics,
+            NullLogger<HeatRollingProjectionWorker>.Instance,
+            new SearchRecoveryCoordinator());
+        try
+        {
+            metrics.Fail(new IOException("old"), "rolling-projection");
+            Assert.False(await worker.ProcessOnceAsync());
+            Assert.Null(metrics.Snapshot(enabled: true).LastFailure);
+
+            metrics.Fail(new IOException("other"), "daily-projection");
+            Assert.False(await worker.ProcessOnceAsync());
+            Assert.Equal("daily-projection", metrics.Snapshot(enabled: true).LastFailureSource);
+        }
+        finally
+        {
+            DeleteDirectory(directory);
+        }
+    }
+
     private static HeatAccumulatorService Service(string directory, int commitBatchRequests = 1)
     {
-        var options = new HeatOptions
+        var options = Options(directory, commitBatchRequests);
+        return new HeatAccumulatorService(
+            options, new HeatRuntimeMetrics(), NullLogger<HeatAccumulatorService>.Instance);
+    }
+
+    private static HeatOptions Options(
+        string directory,
+        int commitBatchRequests = 1,
+        string? coverageStartDay = null) =>
+        new()
         {
             Enabled = true,
             DataDirectory = directory,
             DailyActorSecret = Convert.ToBase64String(DailySecret),
+            CoverageStartDay = coverageStartDay,
             ChannelCapacity = 8,
             CommitBatchRequests = commitBatchRequests,
             RollingMaxBytes = 1024L * 1024 * 1024,
             RollingMinFreeBytes = 0
         };
-        return new HeatAccumulatorService(
-            options, new HeatRuntimeMetrics(), NullLogger<HeatAccumulatorService>.Instance);
-    }
 
     private static ChhtBatch Batch(
         string crawler,
