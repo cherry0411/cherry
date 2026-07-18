@@ -108,6 +108,12 @@ public sealed class HeatRollingProjectionWorker : BackgroundService
                 await connection.OpenAsync(cancellationToken);
 
             var restartAtNewTarget = false;
+            // A dirty SQLite page is intentionally smaller than a Meili task.
+            // Most dirty hashes keep the same rolling count, so submitting one
+            // task per page caused severe LMDB write amplification. Acknowledge
+            // unchanged/unmapped rows immediately, while bounding only the
+            // genuinely changed documents in this in-memory buffer.
+            var pendingChanges = new List<MappedChange>(_options.ProjectionBatchSize);
             while (true)
             {
                 if (ClosedTargetHour() != targetHour)
@@ -121,30 +127,17 @@ public sealed class HeatRollingProjectionWorker : BackgroundService
                     restartAtNewTarget = true;
                     break;
                 }
-                var documents = mapped
+                var changed = mapped
                     .Where(row => row.Count != row.ProjectedCount)
                     .OrderBy(row => row.Id)
-                    .Select(row => new HourlyHeatProjectionDocument(row.Id, row.Count))
                     .ToArray();
-                if (documents.Length != 0)
-                {
-                    var task = await _meili.SubmitHourlyHeatDocumentsAsync(
-                        documents, _options.IndexUid, cancellationToken);
-                    await WaitForTaskAsync(task, cancellationToken);
-                    _metrics.Projected(documents.Length);
-                    // The old document may have landed, but without the SQLite
-                    // ACK its dirty revision is replayed immediately at the new
-                    // target and corrects the idempotent Meili document.
-                    if (ClosedTargetHour() != targetHour)
-                    {
-                        restartAtNewTarget = true;
-                        break;
-                    }
-                }
-
+                var unchanged = mapped
+                    .Where(row => row.Count == row.ProjectedCount)
+                    .Select(row => (row.InfoHash, row.Count, row.Revision))
+                    .ToArray();
                 await _store.CommitProjectionPageAsync(
                     targetHour,
-                    mapped.Select(row => (row.InfoHash, row.Count, row.Revision)).ToArray(),
+                    unchanged,
                     Unmapped(page.Changes, mapped),
                     cancellationToken);
                 if (ClosedTargetHour() != targetHour)
@@ -152,8 +145,27 @@ public sealed class HeatRollingProjectionWorker : BackgroundService
                     restartAtNewTarget = true;
                     break;
                 }
+
+                foreach (var row in changed)
+                {
+                    pendingChanges.Add(row);
+                    if (pendingChanges.Count == _options.ProjectionBatchSize &&
+                        !await FlushPendingChangesAsync(
+                            targetHour, pendingChanges, cancellationToken))
+                    {
+                        restartAtNewTarget = true;
+                        break;
+                    }
+                }
+                if (restartAtNewTarget) break;
                 if (!page.HasMore)
                 {
+                    if (!await FlushPendingChangesAsync(
+                            targetHour, pendingChanges, cancellationToken))
+                    {
+                        restartAtNewTarget = true;
+                        break;
+                    }
                     await _store.FinalizeProjectionAsync(targetHour, cancellationToken);
                     if (ClosedTargetHour() != targetHour)
                     {
@@ -175,6 +187,12 @@ public sealed class HeatRollingProjectionWorker : BackgroundService
                 }
                 if (page.Changes.Count == 0)
                 {
+                    if (!await FlushPendingChangesAsync(
+                            targetHour, pendingChanges, cancellationToken))
+                    {
+                        restartAtNewTarget = true;
+                        break;
+                    }
                     await _store.FinalizeProjectionAsync(targetHour, cancellationToken);
                     if (ClosedTargetHour() != targetHour)
                     {
@@ -186,6 +204,35 @@ public sealed class HeatRollingProjectionWorker : BackgroundService
             }
             if (restartAtNewTarget) continue;
         }
+    }
+
+    private async Task<bool> FlushPendingChangesAsync(
+        long targetHour,
+        List<MappedChange> pendingChanges,
+        CancellationToken cancellationToken)
+    {
+        if (pendingChanges.Count == 0) return true;
+        var documents = pendingChanges
+            .OrderBy(row => row.Id)
+            .Select(row => new HourlyHeatProjectionDocument(row.Id, row.Count))
+            .ToArray();
+        var task = await _meili.SubmitHourlyHeatDocumentsAsync(
+            documents, _options.IndexUid, cancellationToken);
+        await WaitForTaskAsync(task, cancellationToken);
+        _metrics.Projected(documents.Length);
+        // The old document may have landed, but without the SQLite ACK its
+        // dirty revision is replayed at the new target and corrects Meili.
+        if (ClosedTargetHour() != targetHour) return false;
+
+        await _store.CommitProjectionPageAsync(
+            targetHour,
+            pendingChanges
+                .Select(row => (row.InfoHash, row.Count, row.Revision))
+                .ToArray(),
+            [],
+            cancellationToken);
+        pendingChanges.Clear();
+        return ClosedTargetHour() == targetHour;
     }
 
     private static long ClosedTargetHour() =>
