@@ -15,9 +15,11 @@ func TestFormatRuntimeGaugesUsesGaugesAndCounterDeltas(t *testing.T) {
 		},
 	}
 	current := statsSnapshot{
+		wireTargetWorkers:    96,
 		wireActiveWorkers:    96,
 		wireMaxWorkers:       128,
 		wireBusyWorkers:      80,
+		wireWorkersPinned:    true,
 		wireRequestDepth:     123,
 		wireRequestCap:       1000,
 		wireResponseDepth:    5,
@@ -33,7 +35,7 @@ func TestFormatRuntimeGaugesUsesGaugesAndCounterDeltas(t *testing.T) {
 
 	line := formatRuntimeGauges(current, previous)
 	for _, want := range []string{
-		"wire_active=96", "wire_busy=80", "wire_req_depth=123",
+		"wire_target=96", "wire_active=96", "wire_busy=80", "wire_pinned=true", "wire_req_depth=123",
 		"dht_bl_size=900", "dht_bl_reject=4",
 		"lru_ih_len=90", "lru_ih_oldest_s=60", "lru_ih_hit=15",
 		"lru_ih_miss=10", "lru_ih_insert=10", "lru_ih_evict=5",
@@ -61,6 +63,31 @@ func TestAddLRUWorkerStatsKeepsCumulativeCounters(t *testing.T) {
 		"lru_remote_known_inserts":            13,
 		"lru_remote_known_evicts":             14,
 		"lru_remote_known_delete_misses":      15,
+	}
+	for key, value := range want {
+		if out[key] != value {
+			t.Errorf("worker stat %s = %d, want %d", key, out[key], value)
+		}
+	}
+}
+
+func TestAddWireWorkerStatsExposesTargetActiveCeilingAndPinned(t *testing.T) {
+	out := make(map[string]uint64)
+	addWireWorkerStats(out, statsSnapshot{
+		wireTargetWorkers: 96,
+		wireActiveWorkers: 96,
+		wireMaxWorkers:    128,
+		wireBusyWorkers:   80,
+		wireWorkersPinned: true,
+	})
+
+	want := map[string]uint64{
+		"wire_target_workers": 96,
+		"wire_active_workers": 96,
+		"wire_active_ceiling": 96,
+		"wire_max_workers":    128,
+		"wire_busy_workers":   80,
+		"wire_workers_pinned": 1,
 	}
 	for key, value := range want {
 		if out[key] != value {

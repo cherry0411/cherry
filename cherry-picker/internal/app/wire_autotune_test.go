@@ -1,6 +1,78 @@
 package app
 
-import "testing"
+import (
+	"context"
+	"testing"
+
+	"cherry-picker/internal/config"
+	"cherry-picker/internal/dht"
+)
+
+func TestWireWorkerControllerAutoTuneFalseDoesNotStartTuner(t *testing.T) {
+	cfg := config.Config{
+		AutoTune: false,
+		Metadata: config.MetadataConfig{
+			WorkerInitial: 96,
+			WorkerMin:     64,
+			WorkerMax:     128,
+		},
+	}
+	controller := newWireWorkerController(cfg)
+	downloader := dht.NewWire(128, 256, controller.maxWorkers)
+	controller.applyTarget(downloader, controller.initialWorkers)
+
+	app := &Application{cfg: cfg}
+	if started := app.startWireWorkerTuner(context.Background(), downloader, controller); started {
+		t.Fatal("auto_tune=false started the wire worker tuning goroutine")
+	}
+	if !controller.pinned {
+		t.Fatal("auto_tune=false must report a pinned worker policy")
+	}
+	if got := controller.TargetWorkers(); got != 96 {
+		t.Fatalf("target workers = %d, want 96", got)
+	}
+	if got := downloader.ActiveWorkers(); got != 96 {
+		t.Fatalf("active ceiling = %d, want 96", got)
+	}
+}
+
+func TestWireWorkerControllerExplicitFixedBoundsPinEvenWithAutoTune(t *testing.T) {
+	cfg := config.Config{
+		AutoTune: true,
+		Metadata: config.MetadataConfig{
+			WorkerInitial: 192,
+			WorkerMin:     192,
+			WorkerMax:     192,
+		},
+	}
+	controller := newWireWorkerController(cfg)
+	if !controller.pinned {
+		t.Fatal("initial=min=max must pin the worker policy")
+	}
+	if started := (&Application{cfg: cfg}).startWireWorkerTuner(context.Background(), dht.NewWire(128, 256, 192), controller); started {
+		t.Fatal("fixed worker bounds started the wire worker tuning goroutine")
+	}
+}
+
+func TestWireWorkerControllerAppliesObservableTargetAndActiveCeiling(t *testing.T) {
+	cfg := config.Config{
+		AutoTune: true,
+		Metadata: config.MetadataConfig{
+			WorkerInitial: 64,
+			WorkerMin:     32,
+			WorkerMax:     128,
+		},
+	}
+	controller := newWireWorkerController(cfg)
+	downloader := dht.NewWire(128, 256, controller.maxWorkers)
+	controller.applyTarget(downloader, 80)
+	if got := controller.TargetWorkers(); got != 80 {
+		t.Fatalf("target workers = %d, want 80", got)
+	}
+	if got := downloader.ActiveWorkers(); got != 80 {
+		t.Fatalf("active ceiling = %d, want 80", got)
+	}
+}
 
 func TestNextWireWorkerTargetKeepsUsefulWorkersAtHighCPU(t *testing.T) {
 	sample := wireTuneSample{

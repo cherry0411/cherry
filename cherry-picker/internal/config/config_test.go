@@ -85,8 +85,52 @@ func TestLoad2C4GMetadataProfile(t *testing.T) {
 		cfg.Discovery.LookupNodes != 2 || cfg.Discovery.LookupDHTs != 2 ||
 		cfg.Discovery.LookupRate != 300 || cfg.Discovery.LookupWorkers != 2 ||
 		cfg.Discovery.LookupFollowups != 8 || !cfg.Discovery.LookupSpread ||
-		cfg.Discovery.SampleInfohashes || cfg.Metadata.WorkerQueueSize != 1024 {
+		cfg.Discovery.SampleInfohashes || cfg.Metadata.WorkerQueueSize != 1024 ||
+		cfg.Metadata.WorkerInitial != 1024 || cfg.Metadata.WorkerMin != 128 ||
+		cfg.Metadata.WorkerMax != 1024 {
 		t.Fatalf("unexpected 2C4G profile: %+v", cfg)
+	}
+}
+
+func TestLoadFixedMetadataWorkersFromJSON(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "crawler.json")
+	if err := os.WriteFile(path, []byte(`{
+  "auto_tune": false,
+  "metadata": {
+    "enabled": true,
+    "worker_initial": 384,
+    "worker_min": 384,
+    "worker_max": 384
+  }
+}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CHERRY_PICKER_CONFIG", path)
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.AutoTune || cfg.Metadata.WorkerInitial != 384 || cfg.Metadata.WorkerMin != 384 ||
+		cfg.Metadata.WorkerMax != 384 || cfg.Metadata.WorkerQueueSize != 384 {
+		t.Fatalf("unexpected fixed worker config: auto_tune=%v metadata=%+v", cfg.AutoTune, cfg.Metadata)
+	}
+}
+
+func TestLoadFixedMetadataWorkersFromEnvironment(t *testing.T) {
+	t.Setenv("CHERRY_PICKER_CONFIG", "")
+	t.Setenv("CHERRY_PICKER_AUTO_TUNE", "false")
+	t.Setenv("CHERRY_PICKER_METADATA_WORKERS_INITIAL", "320")
+	t.Setenv("CHERRY_PICKER_METADATA_WORKERS_MIN", "320")
+	t.Setenv("CHERRY_PICKER_METADATA_WORKERS_MAX", "320")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.AutoTune || cfg.Metadata.WorkerInitial != 320 || cfg.Metadata.WorkerMin != 320 ||
+		cfg.Metadata.WorkerMax != 320 || cfg.Metadata.WorkerQueueSize != 320 {
+		t.Fatalf("unexpected fixed worker env config: auto_tune=%v metadata=%+v", cfg.AutoTune, cfg.Metadata)
 	}
 }
 

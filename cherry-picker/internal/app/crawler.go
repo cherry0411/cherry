@@ -200,9 +200,11 @@ type statsSnapshot struct {
 	// Wire queue/worker gauges. The existing stage counters above are
 	// cumulative; these instantaneous depths explain which stage is applying
 	// backpressure in each 30-second window.
+	wireTargetWorkers int64
 	wireActiveWorkers int64
 	wireMaxWorkers    int64
 	wireBusyWorkers   int64
+	wireWorkersPinned bool
 	wireRequestDepth  int64
 	wireRequestCap    int64
 	wireResponseDepth int64
@@ -517,14 +519,20 @@ func (a *Application) Run(ctx context.Context) error {
 	lookupQueue := make(chan string, a.cfg.Discovery.LookupQueue)
 	sampleLookupQueue := make(chan string, a.cfg.Discovery.LookupQueue)
 
-	// peer wire metadata 下载器
-	downloader := dht.NewWire(a.cfg.Metadata.BlackListSize, a.cfg.Metadata.RequestQueueSize, a.cfg.Metadata.WorkerQueueSize)
+	// peer wire metadata 下载器。物理 goroutine 数由 max 决定，initial 是
+	// 当前 admission ceiling；固定实验不会启动任何 worker 调节 goroutine。
+	wireWorkers := newWireWorkerController(a.cfg)
+	downloader := dht.NewWire(a.cfg.Metadata.BlackListSize, a.cfg.Metadata.RequestQueueSize, wireWorkers.maxWorkers)
+	wireWorkers.applyTarget(downloader, wireWorkers.initialWorkers)
+	wireTunerStarted := false
 	if a.cfg.Metadata.Enabled {
 		a.startMetadataConsumers(ctx, downloader, events, durableIngestor, durableErrors, stats)
 		go downloader.Run()
-		go a.tuneWireWorkers(ctx, downloader)
+		wireTunerStarted = a.startWireWorkerTuner(ctx, downloader, wireWorkers)
 	}
-	a.logger.Printf("metadata workers: %d, queue: %d", a.cfg.Metadata.WorkerQueueSize, a.cfg.Metadata.RequestQueueSize)
+	a.logger.Printf("metadata workers: %d, queue: %d, initial=%d min=%d max=%d pinned=%t tuner=%t",
+		wireWorkers.maxWorkers, a.cfg.Metadata.RequestQueueSize, wireWorkers.initialWorkers,
+		wireWorkers.minWorkers, wireWorkers.maxWorkers, wireWorkers.pinned, wireTunerStarted)
 
 	// 共享回调（所有 DHT 实例共用同一套 handler，共享下载器和 LRU）
 	onGetPeers := func(infoHash, ip string, port int) {
@@ -617,7 +625,7 @@ func (a *Application) Run(ctx context.Context) error {
 		a.metadataRequestSeen.Cap(), a.metadataResultSeen.Cap(), a.remoteKnown.Cap())
 
 	// 后台 goroutines
-	go a.emitStats(ctx, events, stats, downloader)
+	go a.emitStats(ctx, events, stats, downloader, wireWorkers)
 	go a.flushPeerCountsLoop(ctx)
 	go a.flushRejectLoop(ctx)
 	go a.pollPendingRequests(ctx)
@@ -1072,6 +1080,61 @@ type wireTuneSample struct {
 	paused                         bool
 }
 
+// wireWorkerController owns the experiment-visible wire-worker bounds. target
+// is separate from Wire.ActiveWorkers so metrics can prove both the requested
+// ceiling and the ceiling that the downloader has actually applied.
+type wireWorkerController struct {
+	initialWorkers int
+	minWorkers     int
+	maxWorkers     int
+	pinned         bool
+	target         atomic.Int64
+}
+
+func newWireWorkerController(cfg config.Config) *wireWorkerController {
+	maxWorkers := cfg.Metadata.WorkerMax
+	if maxWorkers <= 0 {
+		maxWorkers = cfg.Metadata.WorkerQueueSize
+	}
+	if maxWorkers <= 0 {
+		maxWorkers = 1
+	}
+
+	minWorkers := cfg.Metadata.WorkerMin
+	if minWorkers <= 0 {
+		minWorkers = clampInt(maxWorkers/8, 64, maxWorkers)
+		if maxWorkers < 64 {
+			minWorkers = 1
+		}
+	}
+	minWorkers = clampInt(minWorkers, 1, maxWorkers)
+
+	initialWorkers := cfg.Metadata.WorkerInitial
+	if initialWorkers <= 0 {
+		initialWorkers = maxWorkers
+	}
+	initialWorkers = clampInt(initialWorkers, minWorkers, maxWorkers)
+
+	controller := &wireWorkerController{
+		initialWorkers: initialWorkers,
+		minWorkers:     minWorkers,
+		maxWorkers:     maxWorkers,
+		pinned:         !cfg.AutoTune || (initialWorkers == minWorkers && minWorkers == maxWorkers),
+	}
+	controller.target.Store(int64(initialWorkers))
+	return controller
+}
+
+func (c *wireWorkerController) applyTarget(downloader *dht.Wire, target int) {
+	target = clampInt(target, c.minWorkers, c.maxWorkers)
+	c.target.Store(int64(target))
+	downloader.SetActiveWorkers(target)
+}
+
+func (c *wireWorkerController) TargetWorkers() int {
+	return int(c.target.Load())
+}
+
 // nextWireWorkerTarget keeps CPU saturation as an expansion gate, not a
 // contraction signal. A busy Go scheduler is expected while useful wire work
 // is available; shrinking solely because it is busy creates a positive
@@ -1108,15 +1171,23 @@ func nextWireWorkerTarget(sample wireTuneSample) int {
 	return clampInt(target, sample.minWorkers, sample.maxWorkers)
 }
 
-func (a *Application) tuneWireWorkers(ctx context.Context, downloader *dht.Wire) {
+// startWireWorkerTuner returns before creating a goroutine when the worker
+// policy is pinned. Keeping this gate outside tuneWireWorkers makes
+// auto_tune=false a true freeze rather than a tuner that happens to no-op.
+func (a *Application) startWireWorkerTuner(ctx context.Context, downloader *dht.Wire, controller *wireWorkerController) bool {
+	if controller.pinned {
+		return false
+	}
+	go a.tuneWireWorkers(ctx, downloader, controller)
+	return true
+}
+
+func (a *Application) tuneWireWorkers(ctx context.Context, downloader *dht.Wire, controller *wireWorkerController) {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 
-	maxWorkers := downloader.MaxWorkers()
-	minWorkers := clampInt(maxWorkers/8, 64, maxWorkers)
-	if maxWorkers < 64 {
-		minWorkers = 1
-	}
+	maxWorkers := controller.maxWorkers
+	minWorkers := controller.minWorkers
 
 	var prevDialAttempts, prevDialOK, prevHandshakeOK, prevDownloadOK int64
 
@@ -1155,7 +1226,7 @@ func (a *Application) tuneWireWorkers(ctx context.Context, downloader *dht.Wire)
 				cpuUtil: cpuUtil, paused: a.metaPaused.Load(),
 			})
 			if target != active {
-				downloader.SetActiveWorkers(target)
+				controller.applyTarget(downloader, target)
 				a.logger.Printf(
 					"wire autotune: active=%d target=%d req_depth=%d resp_depth=%d attempts=%d dial_ok=%d handshake_ok=%d download_ok=%d paused=%v",
 					active, target, reqDepth, respDepth, attemptsDelta, dialOKDelta, handshakeDelta, downloadDelta, a.metaPaused.Load())
@@ -1248,6 +1319,13 @@ func maxInt(left, right int) int {
 		return left
 	}
 	return right
+}
+
+func boolUint64(value bool) uint64 {
+	if value {
+		return 1
+	}
+	return 0
 }
 
 func clampUint64(value, minValue, maxValue uint64) uint64 {
@@ -1480,7 +1558,7 @@ func (a *Application) consumeMetadata(
 	}
 }
 
-func (a *Application) emitStats(ctx context.Context, events chan<- pipeline.Event, stats *runtimeStats, downloader *dht.Wire) {
+func (a *Application) emitStats(ctx context.Context, events chan<- pipeline.Event, stats *runtimeStats, downloader *dht.Wire, wireWorkers *wireWorkerController) {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 	var previous statsSnapshot
@@ -1544,9 +1622,11 @@ func (a *Application) emitStats(ctx context.Context, events chan<- pipeline.Even
 				wireDownloadOK:                downloader.Stats.DownloadOK.Load(),
 				wireDownloadFailed:            downloader.Stats.DownloadFailed.Load(),
 				wireBlacklisted:               downloader.Stats.Blacklisted.Load(),
+				wireTargetWorkers:             int64(wireWorkers.TargetWorkers()),
 				wireActiveWorkers:             int64(downloader.ActiveWorkers()),
 				wireMaxWorkers:                int64(downloader.MaxWorkers()),
 				wireBusyWorkers:               int64(downloader.BusyWorkers()),
+				wireWorkersPinned:             wireWorkers.pinned,
 				wireRequestDepth:              int64(downloader.RequestDepth()),
 				wireRequestCap:                int64(downloader.RequestCapacity()),
 				wireResponseDepth:             int64(downloader.ResponseDepth()),
@@ -1673,9 +1753,6 @@ func (a *Application) emitStats(ctx context.Context, events chan<- pipeline.Even
 				"wire_blacklist_max":                uint64(current.wireBlacklistMax),
 				"wire_blacklist_rejected":           uint64(current.wireBlacklistRejected),
 				"wire_blacklist_expired":            uint64(current.wireBlacklistExpired),
-				"wire_active_workers":               uint64(current.wireActiveWorkers),
-				"wire_max_workers":                  uint64(current.wireMaxWorkers),
-				"wire_busy_workers":                 uint64(current.wireBusyWorkers),
 				"wire_request_depth":                uint64(current.wireRequestDepth),
 				"wire_request_capacity":             uint64(current.wireRequestCap),
 				"wire_response_depth":               uint64(current.wireResponseDepth),
@@ -1711,6 +1788,7 @@ func (a *Application) emitStats(ctx context.Context, events chan<- pipeline.Even
 				"heat_spool_max_bytes":              uint64(current.heatSpoolMaxBytes),
 				"heat_spool_records":                current.heatSpoolRecords,
 			}
+			addWireWorkerStats(workerStats, current)
 			addLRUWorkerStats(workerStats, "infohash", current.infohashLRU)
 			addLRUWorkerStats(workerStats, "peer", current.peerLRU)
 			addLRUWorkerStats(workerStats, "metadata_request", current.metaReqLRU)
@@ -1803,10 +1881,12 @@ func (a *Application) logRuntimeDelta(current, previous statsSnapshot) {
 func formatRuntimeGauges(current, previous statsSnapshot) string {
 	var b strings.Builder
 	fmt.Fprintf(&b,
-		" wire_active=%d wire_max=%d wire_busy=%d wire_req_depth=%d wire_req_cap=%d wire_resp_depth=%d wire_resp_cap=%d dht_bl_size=%d dht_bl_max=%d dht_bl_reject=%d dht_bl_expired=%d oracle_obs_q=%d oracle_obs_sent=%d oracle_obs_drop=%d oracle_obs_http_fail=%d oracle_obs_depth=%d oracle_obs_cap=%d oracle_obs_invalid=%t heat_q=%d heat_drop=%d heat_durable=%d heat_lost=%d heat_spool_retry=%d heat_export=%d heat_export_retry=%d heat_perm_fail=%d heat_closed_records=%d heat_closed_batches=%d heat_depth=%d heat_cap=%d heat_spool_bytes=%d heat_spool_max=%d heat_spool_records=%d",
+		" wire_target=%d wire_active=%d wire_max=%d wire_busy=%d wire_pinned=%t wire_req_depth=%d wire_req_cap=%d wire_resp_depth=%d wire_resp_cap=%d dht_bl_size=%d dht_bl_max=%d dht_bl_reject=%d dht_bl_expired=%d oracle_obs_q=%d oracle_obs_sent=%d oracle_obs_drop=%d oracle_obs_http_fail=%d oracle_obs_depth=%d oracle_obs_cap=%d oracle_obs_invalid=%t heat_q=%d heat_drop=%d heat_durable=%d heat_lost=%d heat_spool_retry=%d heat_export=%d heat_export_retry=%d heat_perm_fail=%d heat_closed_records=%d heat_closed_batches=%d heat_depth=%d heat_cap=%d heat_spool_bytes=%d heat_spool_max=%d heat_spool_records=%d",
+		current.wireTargetWorkers,
 		current.wireActiveWorkers,
 		current.wireMaxWorkers,
 		current.wireBusyWorkers,
+		current.wireWorkersPinned,
 		current.wireRequestDepth,
 		current.wireRequestCap,
 		current.wireResponseDepth,
@@ -1870,6 +1950,17 @@ func addLRUWorkerStats(out map[string]uint64, name string, stats cache.LRUStats)
 	out[prefix+"inserts"] = stats.Inserts
 	out[prefix+"evicts"] = stats.Evicts
 	out[prefix+"delete_misses"] = stats.DeleteMisses
+}
+
+func addWireWorkerStats(out map[string]uint64, current statsSnapshot) {
+	out["wire_target_workers"] = uint64(current.wireTargetWorkers)
+	out["wire_active_workers"] = uint64(current.wireActiveWorkers)
+	// Explicit alias: ActiveWorkers is an admission ceiling, not a count of
+	// goroutines currently executing network work.
+	out["wire_active_ceiling"] = uint64(current.wireActiveWorkers)
+	out["wire_max_workers"] = uint64(current.wireMaxWorkers)
+	out["wire_busy_workers"] = uint64(current.wireBusyWorkers)
+	out["wire_workers_pinned"] = boolUint64(current.wireWorkersPinned)
 }
 
 func buildInfohashSourceKey(ihHex, source, ip string, port int) string {

@@ -65,7 +65,12 @@ type MetadataConfig struct {
 	Enabled          bool
 	BlackListSize    int
 	RequestQueueSize int
-	WorkerQueueSize  int
+	// WorkerQueueSize is the legacy name for the physical wire-worker ceiling.
+	// It remains populated for callers that have not migrated to WorkerMax.
+	WorkerQueueSize int
+	WorkerInitial   int
+	WorkerMin       int
+	WorkerMax       int
 }
 
 // FilterConfig controls which metadata is silently rejected before export.
@@ -200,6 +205,9 @@ func Load() (Config, error) {
 			BlackListSize:    getenvInt("CHERRY_PICKER_METADATA_BLACKLIST", 131072),
 			RequestQueueSize: getenvInt("CHERRY_PICKER_METADATA_REQUEST_QUEUE", defaultMetadataRequestQueue()),
 			WorkerQueueSize:  getenvInt("CHERRY_PICKER_METADATA_WORKERS", defaultMetadataWorkers()),
+			WorkerInitial:    getenvInt("CHERRY_PICKER_METADATA_WORKERS_INITIAL", 0),
+			WorkerMin:        getenvInt("CHERRY_PICKER_METADATA_WORKERS_MIN", 0),
+			WorkerMax:        getenvInt("CHERRY_PICKER_METADATA_WORKERS_MAX", 0),
 		},
 		Filter: FilterConfig{
 			MaxFileCount:          getenvInt("CHERRY_PICKER_FILTER_MAX_FILES", 0),
@@ -320,6 +328,9 @@ func loadFromFile(path string) (Config, error) {
 			BlackListSize:    raw.Metadata.BlackListSize,
 			RequestQueueSize: intOrDefault(raw.Metadata.RequestQueueSize, defaultMetadataRequestQueue()),
 			WorkerQueueSize:  intOrDefault(raw.Metadata.WorkerQueueSize, defaultMetadataWorkers()),
+			WorkerInitial:    raw.Metadata.WorkerInitial,
+			WorkerMin:        raw.Metadata.WorkerMin,
+			WorkerMax:        raw.Metadata.WorkerMax,
 		},
 		Filter: FilterConfig{
 			MaxFileCount:          raw.Filter.MaxFileCount,
@@ -437,8 +448,30 @@ func normalize(cfg Config) Config {
 	if cfg.Metadata.RequestQueueSize <= 0 {
 		cfg.Metadata.RequestQueueSize = defaultMetadataRequestQueue()
 	}
-	if cfg.Metadata.WorkerQueueSize <= 0 {
-		cfg.Metadata.WorkerQueueSize = defaultMetadataWorkers()
+	// worker_queue_size is the legacy spelling of worker_max. A new explicit
+	// worker_max wins; otherwise existing production configurations retain the
+	// exact old ceiling and initial active-worker count.
+	if cfg.Metadata.WorkerMax <= 0 {
+		cfg.Metadata.WorkerMax = cfg.Metadata.WorkerQueueSize
+	}
+	if cfg.Metadata.WorkerMax <= 0 {
+		cfg.Metadata.WorkerMax = defaultMetadataWorkers()
+	}
+	cfg.Metadata.WorkerQueueSize = cfg.Metadata.WorkerMax
+	if cfg.Metadata.WorkerMin <= 0 {
+		cfg.Metadata.WorkerMin = defaultMetadataWorkerMin(cfg.Metadata.WorkerMax)
+	}
+	if cfg.Metadata.WorkerMin > cfg.Metadata.WorkerMax {
+		cfg.Metadata.WorkerMin = cfg.Metadata.WorkerMax
+	}
+	if cfg.Metadata.WorkerInitial <= 0 {
+		cfg.Metadata.WorkerInitial = cfg.Metadata.WorkerMax
+	}
+	if cfg.Metadata.WorkerInitial < cfg.Metadata.WorkerMin {
+		cfg.Metadata.WorkerInitial = cfg.Metadata.WorkerMin
+	}
+	if cfg.Metadata.WorkerInitial > cfg.Metadata.WorkerMax {
+		cfg.Metadata.WorkerInitial = cfg.Metadata.WorkerMax
 	}
 	normalizeFilterConfig(&cfg.Filter)
 
@@ -569,6 +602,9 @@ type fileMetadataConfig struct {
 	BlackListSize    int  `json:"black_list_size"`
 	RequestQueueSize int  `json:"request_queue_size"`
 	WorkerQueueSize  int  `json:"worker_queue_size"`
+	WorkerInitial    int  `json:"worker_initial"`
+	WorkerMin        int  `json:"worker_min"`
+	WorkerMax        int  `json:"worker_max"`
 }
 
 type fileExporterConfig struct {
@@ -720,6 +756,20 @@ func defaultMetadataWorkers() int {
 	}
 	if value > 4096 {
 		return 4096
+	}
+	return value
+}
+
+func defaultMetadataWorkerMin(maxWorkers int) int {
+	if maxWorkers < 64 {
+		return 1
+	}
+	value := maxWorkers / 8
+	if value < 64 {
+		return 64
+	}
+	if value > maxWorkers {
+		return maxWorkers
 	}
 	return value
 }
