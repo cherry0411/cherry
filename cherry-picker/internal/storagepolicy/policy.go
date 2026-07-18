@@ -3,9 +3,6 @@
 package storagepolicy
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"path"
 	"sort"
@@ -46,8 +43,9 @@ const (
 	maxWireSummaryExts     = 128
 )
 
-// Config is canonicalized and hashed into PolicyID. Zero values are rejected;
-// callers should start with DefaultConfig and override explicit fields.
+// Config remains runtime-tunable, but its identity is deliberately not stored
+// in durable metadata. Callers should start with DefaultConfig and override
+// explicit fields.
 type Config struct {
 	Version               int `json:"version"`
 	SummaryAboveFiles     int `json:"summary_above_files"`
@@ -80,7 +78,6 @@ func DefaultConfig() Config {
 
 type Policy struct {
 	config Config
-	id     string
 }
 
 func New(config Config) (*Policy, error) {
@@ -110,12 +107,7 @@ func New(config Config) (*Policy, error) {
 			return nil, errors.New("storagepolicy: reject cap must exceed lower-retention caps")
 		}
 	}
-	canonical, err := json.Marshal(config)
-	if err != nil {
-		return nil, err
-	}
-	sum := sha256.Sum256(canonical)
-	return &Policy{config: config, id: hex.EncodeToString(sum[:])}, nil
+	return &Policy{config: config}, nil
 }
 
 func MustDefault() *Policy {
@@ -126,25 +118,19 @@ func MustDefault() *Policy {
 	return p
 }
 
-func (p *Policy) ID() string { return p.id }
-
 type Decision struct {
-	Action       Action
-	Reason       string
-	PolicyID     string
-	NeedsRefetch bool
-	Record       spool.Record
+	Action Action
+	Reason string
+	Record spool.Record
 }
 
 // Decide creates a bounded record. downgradeReason is an optional legacy
 // content-filter signal; in the compact policy it lowers full to summary rather
 // than discarding an already-downloaded title.
-func (p *Policy) Decide(infoHash string, firstSeen time.Time, region string, metadata *pipeline.Metadata, downgradeReason string) Decision {
+func (p *Policy) Decide(infoHash string, firstSeen time.Time, metadata *pipeline.Metadata, downgradeReason string) Decision {
 	record := spool.Record{
 		InfoHash:  strings.ToLower(strings.TrimSpace(infoHash)),
-		PolicyID:  p.id,
 		FirstSeen: utcOrZero(firstSeen),
-		Region:    boundedText(region, 64),
 	}
 	if metadata == nil || len(metadata.Files) == 0 {
 		return p.hashDecision(record, ActionHashOnly, ReasonInvalid)
@@ -182,7 +168,7 @@ func (p *Policy) Decide(infoHash string, firstSeen time.Time, region string, met
 	if summarize {
 		record.Encoding = spool.EncodingSummary
 		record.Summary = p.makeSummary(name, total, files)
-		return Decision{Action: ActionSummary, Reason: reason, PolicyID: p.id, Record: record}
+		return Decision{Action: ActionSummary, Reason: reason, Record: record}
 	}
 
 	normalizedFiles := make([]spool.File, len(files))
@@ -193,24 +179,31 @@ func (p *Policy) Decide(infoHash string, firstSeen time.Time, region string, met
 	record.Normalized = &spool.NormalizedMetadata{
 		Name: name, TotalLength: total, Files: normalizedFiles,
 	}
-	if metadata.PieceLength > 0 && uint64(metadata.PieceLength) <= uint64(^uint32(0)) {
-		record.Normalized.PieceLength = uint32(metadata.PieceLength)
-	}
-	return Decision{Action: ActionFull, Reason: ReasonFull, PolicyID: p.id, Record: record}
+	return Decision{Action: ActionFull, Reason: ReasonFull, Record: record}
 }
 
 func (p *Policy) hashDecision(record spool.Record, action Action, reason string) Decision {
 	record.Encoding = spool.EncodingHashOnly
 	if action == ActionReject {
 		record.Encoding = spool.EncodingReject
-		record.Reject = &spool.RejectMetadata{Reason: reason}
-	} else {
-		record.HashOnly = &spool.HashOnlyMetadata{Reason: reason}
 	}
-	// Every decision is exact for the policy version that produced it. A future
-	// policy-expansion job may explicitly mark selected rows for refetch; doing
-	// so here would immediately redownload the same hot hashes.
-	return Decision{Action: action, Reason: reason, PolicyID: p.id, Record: record}
+	record.DecisionCode = compactDecisionCode(action, reason)
+	return Decision{Action: action, Reason: reason, Record: record}
+}
+
+func compactDecisionCode(action Action, reason string) spool.DecisionCode {
+	switch {
+	case reason == ReasonInvalid:
+		return spool.DecisionInvalidMetadata
+	case action == ActionHashOnly && reason == ReasonHashOnlyCap:
+		return spool.DecisionHashOnlyFileCap
+	case action == ActionReject && reason == ReasonRejectCap:
+		return spool.DecisionRejectFileCap
+	case action == ActionReject:
+		return spool.DecisionReject
+	default:
+		return spool.DecisionHashOnly
+	}
 }
 
 func (p *Policy) makeSummary(name string, total uint64, files []projectedFile) *spool.SummaryMetadata {

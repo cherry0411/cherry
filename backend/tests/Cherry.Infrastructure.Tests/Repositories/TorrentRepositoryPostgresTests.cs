@@ -50,8 +50,12 @@ public sealed class TorrentRepositoryPostgresTests
         Assert.Empty(duplicateReject);
         Assert.Contains(torrentHash, filter.Recorded);
         Assert.Contains(rejectedHash, filter.Recorded);
+        var torrentId = await db.Torrents
+            .Where(item => item.InfoHash == torrentHash)
+            .Select(item => item.Id)
+            .SingleAsync();
         var legacyOutbox = await db.SearchOutbox.SingleAsync(
-            item => item.InfoHash == torrentHash);
+            item => item.TorrentId == torrentId);
         Assert.Equal(1, legacyOutbox.Generation);
         Assert.Equal(0, legacyOutbox.AttemptCount);
 
@@ -73,10 +77,8 @@ public sealed class TorrentRepositoryPostgresTests
     {
         InfoHash = infoHash,
         Name = "integration-test",
-        PieceLength = 16_384,
         TotalLength = 100,
         FileCount = 1,
-        Source = "test",
         Files = [new TorrentFile { PathText = "test.bin", Length = 100 }]
     };
 

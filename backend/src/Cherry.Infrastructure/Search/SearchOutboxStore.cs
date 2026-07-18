@@ -7,7 +7,7 @@ using NpgsqlTypes;
 namespace Cherry.Infrastructure.Search;
 
 public sealed record SearchOutboxClaim(
-    string InfoHash,
+    long TorrentId,
     long Generation,
     int AttemptCount,
     DateTime EnqueuedAt);
@@ -25,21 +25,21 @@ public sealed record SearchOutboxBacklog(
 public static class SearchOutboxWriter
 {
     public static async Task EnqueueAsync(
-        IEnumerable<string> infoHashes,
+        IEnumerable<long> torrentIds,
         NpgsqlConnection connection,
         NpgsqlTransaction transaction,
         CancellationToken cancellationToken)
     {
-        var hashes = infoHashes
-            .Distinct(StringComparer.Ordinal)
+        var ids = torrentIds
+            .Distinct()
             .ToArray();
-        if (hashes.Length == 0)
+        if (ids.Length == 0)
             return;
 
         await using var command = new NpgsqlCommand(
             """
             INSERT INTO search_outbox (
-                info_hash,
+                torrent_id,
                 generation,
                 enqueued_at,
                 available_at,
@@ -48,9 +48,9 @@ public static class SearchOutboxWriter
                 attempt_count,
                 last_error,
                 updated_at)
-            SELECT hash, 1, NOW(), NOW(), NULL, NULL, 0, NULL, NOW()
-              FROM unnest(@hashes::varchar[]) AS h(hash)
-            ON CONFLICT (info_hash) DO UPDATE
+            SELECT torrent_id, 1, NOW(), NOW(), NULL, NULL, 0, NULL, NOW()
+              FROM unnest(@torrent_ids::bigint[]) AS incoming(torrent_id)
+            ON CONFLICT (torrent_id) DO UPDATE
                 SET generation = search_outbox.generation + 1,
                     enqueued_at = NOW(),
                     available_at = NOW(),
@@ -62,7 +62,7 @@ public static class SearchOutboxWriter
             """,
             connection,
             transaction);
-        command.Parameters.AddWithValue("hashes", hashes);
+        command.Parameters.AddWithValue("torrent_ids", ids);
         await command.ExecuteNonQueryAsync(cancellationToken);
     }
 }
@@ -99,11 +99,11 @@ public sealed class SearchOutboxStore
             await using var command = new NpgsqlCommand(
                 """
                 WITH candidates AS (
-                    SELECT info_hash
+                    SELECT torrent_id
                       FROM search_outbox
                      WHERE available_at <= NOW()
                        AND (lease_until IS NULL OR lease_until <= NOW())
-                     ORDER BY available_at, info_hash
+                     ORDER BY available_at, torrent_id
                      FOR UPDATE SKIP LOCKED
                      LIMIT @batch_size)
                 UPDATE search_outbox AS item
@@ -111,8 +111,8 @@ public sealed class SearchOutboxStore
                        lease_until = NOW() + @lease_duration,
                        updated_at = NOW()
                   FROM candidates
-                 WHERE item.info_hash = candidates.info_hash
-                RETURNING item.info_hash,
+                 WHERE item.torrent_id = candidates.torrent_id
+                RETURNING item.torrent_id,
                           item.generation,
                           item.attempt_count,
                           item.enqueued_at
@@ -129,7 +129,7 @@ public sealed class SearchOutboxStore
                 while (await reader.ReadAsync(cancellationToken))
                 {
                     claims.Add(new SearchOutboxClaim(
-                        reader.GetString(0),
+                        reader.GetInt64(0),
                         reader.GetInt64(1),
                         reader.GetInt32(2),
                         reader.GetDateTime(3)));
@@ -153,10 +153,10 @@ public sealed class SearchOutboxStore
     {
         if (claims.Count == 0)
             return [];
-        var hashes = claims.Select(claim => claim.InfoHash).ToArray();
+        var ids = claims.Select(claim => claim.TorrentId).ToArray();
         return await _db.Torrents
             .AsNoTracking()
-            .Where(torrent => hashes.Contains(torrent.InfoHash))
+            .Where(torrent => ids.Contains(torrent.Id))
             .ToListAsync(cancellationToken);
     }
 
@@ -174,16 +174,16 @@ public sealed class SearchOutboxStore
         await using var command = new NpgsqlCommand(
             """
             DELETE FROM search_outbox AS item
-             USING unnest(@hashes::varchar[], @generations::bigint[])
-                       AS claim(info_hash, generation)
-             WHERE item.info_hash = claim.info_hash
+             USING unnest(@torrent_ids::bigint[], @generations::bigint[])
+                       AS claim(torrent_id, generation)
+             WHERE item.torrent_id = claim.torrent_id
                AND item.generation = claim.generation
                AND item.lease_owner = @owner
             """,
             connection);
         command.Parameters.AddWithValue(
-            "hashes",
-            claims.Select(claim => claim.InfoHash).ToArray());
+            "torrent_ids",
+            claims.Select(claim => claim.TorrentId).ToArray());
         command.Parameters.AddWithValue(
             "generations",
             claims.Select(claim => claim.Generation).ToArray());
@@ -213,9 +213,9 @@ public sealed class SearchOutboxStore
                    lease_owner = NULL,
                    lease_until = NULL,
                    updated_at = NOW()
-              FROM unnest(@hashes::varchar[], @generations::bigint[])
-                        AS claim(info_hash, generation)
-             WHERE item.info_hash = claim.info_hash
+              FROM unnest(@torrent_ids::bigint[], @generations::bigint[])
+                        AS claim(torrent_id, generation)
+             WHERE item.torrent_id = claim.torrent_id
                AND item.generation = claim.generation
                AND item.lease_owner = @owner
             """,
@@ -223,8 +223,8 @@ public sealed class SearchOutboxStore
         command.Parameters.AddWithValue("error", NpgsqlDbType.Varchar, BoundError(error));
         command.Parameters.AddWithValue("retry_delay", NpgsqlDbType.Interval, retryDelay);
         command.Parameters.AddWithValue(
-            "hashes",
-            claims.Select(claim => claim.InfoHash).ToArray());
+            "torrent_ids",
+            claims.Select(claim => claim.TorrentId).ToArray());
         command.Parameters.AddWithValue(
             "generations",
             claims.Select(claim => claim.Generation).ToArray());
@@ -237,7 +237,7 @@ public sealed class SearchOutboxStore
         return await _db.Database.ExecuteSqlRawAsync(
             """
             INSERT INTO search_outbox (
-                info_hash,
+                torrent_id,
                 generation,
                 enqueued_at,
                 available_at,
@@ -246,9 +246,9 @@ public sealed class SearchOutboxStore
                 attempt_count,
                 last_error,
                 updated_at)
-            SELECT info_hash, 1, NOW(), NOW(), NULL, NULL, 0, NULL, NOW()
+            SELECT id, 1, NOW(), NOW(), NULL, NULL, 0, NULL, NOW()
               FROM torrents
-            ON CONFLICT (info_hash) DO UPDATE
+            ON CONFLICT (torrent_id) DO UPDATE
                 SET generation = search_outbox.generation + 1,
                     enqueued_at = NOW(),
                     available_at = NOW(),

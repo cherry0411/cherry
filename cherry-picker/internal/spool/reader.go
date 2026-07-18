@@ -86,7 +86,7 @@ func (s *Spool) NextBatch(maxRecords int) (Batch, error) {
 		result, scanErr = scanSegment(segmentPath(s.opts.Dir, id), id, func(seg segmentID, _, _ int64, payload []byte) error {
 			rec, err := decodeRecord(payload)
 			if err != nil {
-				return fmt.Errorf("%w: invalid typed record in %s: %v", ErrCorruption, segmentName(seg), err)
+				return fmt.Errorf("%w: invalid typed record in %s: %w", ErrCorruption, segmentName(seg), err)
 			}
 			if rec.CrawlerID != crawlerID || rec.Epoch != epoch {
 				return fmt.Errorf("%w: identity mismatch in %s", ErrCorruption, segmentName(seg))

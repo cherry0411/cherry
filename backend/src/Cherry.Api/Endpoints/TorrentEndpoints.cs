@@ -56,14 +56,14 @@ public static class TorrentEndpoints
 
         group.MapPost("/decay-peers", DecayPeerCountsAsync)
             .WithName("DecayPeerCounts")
-            .WithSummary("衰减过期peer计数")
-            .WithDescription("Halves peer_count for torrents not updated in 7 days.")
+            .WithSummary("旧版热度接口兼容占位")
+            .WithDescription("Deprecated compatibility endpoint. Legacy peer_count is no longer persisted.")
             .Produces(200);
 
         group.MapPost("/peers", UpdatePeerCountsAsync)
             .WithName("UpdatePeerCounts")
-            .WithSummary("批量更新peer计数")
-            .WithDescription("POST {hashes: {info_hash: count, ...}} — batch update peer counts for ranking.")
+            .WithSummary("旧版热度接口兼容占位")
+            .WithDescription("Deprecated compatibility endpoint. Payload is accepted while identity-aware heat replaces peer_count.")
             .Produces(200);
 
         group.MapGet("/check", CheckExistsGetAsync)
@@ -134,7 +134,6 @@ public static class TorrentEndpoints
         if (name is null) return Results.BadRequest("No name in torrent");
         var nameStr = Encoding.UTF8.GetString(name).Trim();
         var length = Convert.ToInt64(info.GetValueOrDefault("length", 0L));
-        var pieceLength = Convert.ToInt64(info.GetValueOrDefault("piece length", 0L));
         var files = new List<TorrentFile>();
         var totalLen = length;
 
@@ -168,10 +167,8 @@ public static class TorrentEndpoints
             {
                 InfoHash = infoHash,
                 Name = nameStr,
-                PieceLength = (int)pieceLength,
                 TotalLength = totalLen,
                 FileCount = files.Count,
-                Source = "upload",
                 Files = files
             }
         };
@@ -340,18 +337,11 @@ public static class TorrentEndpoints
         return Results.Ok(pending.Select(r => r.InfoHash).ToList());
     }
 
-    private static async Task<IResult> DecayPeerCountsAsync(
-        ITorrentRepository repo,
-        CancellationToken ct)
-    {
-        await repo.DecayPeerCountsAsync(ct);
-        return Results.Ok(new { decayed = true });
-    }
+    private static IResult DecayPeerCountsAsync() =>
+        Results.Ok(new { decayed = false, deprecated = true });
 
-    private static async Task<IResult> UpdatePeerCountsAsync(
-        [FromBody] PeerCountsRequest? request,
-        ITorrentRepository repo,
-        CancellationToken ct)
+    private static IResult UpdatePeerCountsAsync(
+        [FromBody] PeerCountsRequest? request)
     {
         var hashes = request?.Hashes
             .Where(kv =>
@@ -360,9 +350,7 @@ public static class TorrentEndpoints
                 kv.Key.All(c => c is >= 'a' and <= 'f' or >= '0' and <= '9'))
             .ToDictionary(kv => kv.Key.ToLowerInvariant(), kv => kv.Value) ?? [];
 
-        if (hashes.Count == 0) return Results.Ok();
-        await repo.BatchUpdatePeerCountsAsync(hashes, ct);
-        return Results.Ok();
+        return Results.Ok(new { accepted = hashes.Count, persisted = false, deprecated = true });
     }
 
     private static async Task<IResult> CheckExistsGetAsync(

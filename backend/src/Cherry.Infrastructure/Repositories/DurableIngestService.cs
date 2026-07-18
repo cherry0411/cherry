@@ -97,7 +97,10 @@ public sealed class DurableIngestService
             var uniqueTorrents = validated.Torrents
                 .GroupBy(torrent => torrent.InfoHash, StringComparer.Ordinal)
                 .Select(group => group
-                    .OrderByDescending(torrent => torrent.RetainedLevel)
+                    // Prefer a complete normalized body over a bounded summary
+                    // if the same hash occurs twice inside one wire batch. This
+                    // is transient selection; no retention marker is persisted.
+                    .OrderByDescending(torrent => torrent.Files.Count == torrent.FileCount)
                     .First())
                 .ToList();
             var uniqueDecisions = validated.Decisions
@@ -105,7 +108,7 @@ public sealed class DurableIngestService
                     decision => Convert.ToHexString(decision.InfoHash),
                     StringComparer.Ordinal)
                 .Select(group => group
-                    .OrderByDescending(decision => decision.Action)
+                    .OrderByDescending(decision => IsReject(decision.DecisionCode))
                     .First())
                 .ToList();
 
@@ -124,7 +127,7 @@ public sealed class DurableIngestService
                     .Concat(uniqueDecisions.Select(decision =>
                         Convert.ToHexString(decision.InfoHash).ToLowerInvariant())));
 
-            var changedTorrentHashes = await InsertTorrentsAsync(
+            var insertedTorrents = await InsertTorrentsAsync(
                 uniqueTorrents,
                 connection,
                 transaction,
@@ -134,23 +137,27 @@ public sealed class DurableIngestService
                 connection,
                 transaction,
                 cancellationToken);
-            if (changedTorrentHashes.Count > 0)
+            if (insertedTorrents.Count > 0)
             {
-                await DeletePriorDetailsAsync(
-                    changedTorrentHashes,
-                    connection,
-                    transaction,
-                    cancellationToken);
+                foreach (var torrent in uniqueTorrents)
+                {
+                    if (!insertedTorrents.TryGetValue(torrent.InfoHash, out var torrentId))
+                        continue;
+                    foreach (var file in torrent.Files)
+                        file.TorrentId = torrentId;
+                    foreach (var extension in torrent.ExtensionSummaries)
+                        extension.TorrentId = torrentId;
+                }
             }
 
             var files = uniqueTorrents
-                .Where(torrent => changedTorrentHashes.Contains(torrent.InfoHash))
+                .Where(torrent => insertedTorrents.ContainsKey(torrent.InfoHash))
                 .SelectMany(torrent => torrent.Files)
                 .ToList();
             if (files.Count > 0)
                 await CopyFilesAsync(files, connection, cancellationToken);
             var extensions = uniqueTorrents
-                .Where(torrent => changedTorrentHashes.Contains(torrent.InfoHash))
+                .Where(torrent => insertedTorrents.ContainsKey(torrent.InfoHash))
                 .SelectMany(torrent => torrent.ExtensionSummaries)
                 .ToList();
             if (extensions.Count > 0)
@@ -163,12 +170,12 @@ public sealed class DurableIngestService
                 cancellationToken);
 
             await SearchOutboxWriter.EnqueueAsync(
-                changedTorrentHashes,
+                insertedTorrents.Values,
                 connection,
                 transaction,
                 cancellationToken);
 
-            var accepted = changedTorrentHashes.Count + changedDecisionHashes.Count;
+            var accepted = insertedTorrents.Count + changedDecisionHashes.Count;
             var duplicates = validated.EventCount - accepted;
             await UpdateReceiptAsync(
                 connection,
@@ -257,126 +264,51 @@ public sealed class DurableIngestService
             reader.GetInt32(4));
     }
 
-    private static async Task<HashSet<string>> InsertTorrentsAsync(
+    private static async Task<Dictionary<string, long>> InsertTorrentsAsync(
         List<Torrent> torrents,
         NpgsqlConnection connection,
         NpgsqlTransaction transaction,
         CancellationToken cancellationToken)
     {
         if (torrents.Count == 0)
-            return new HashSet<string>(StringComparer.Ordinal);
+            return new Dictionary<string, long>(StringComparer.Ordinal);
 
         await using var command = new NpgsqlCommand(
             """
             INSERT INTO torrents (
                 info_hash,
                 name,
-                piece_length,
                 total_length,
                 file_count,
-                is_private,
-                source,
-                policy_id,
-                region,
-                retained_level,
-                needs_refetch,
-                created_at,
-                updated_at)
-            SELECT * FROM unnest(
-                @hashes::varchar[],
+                created_at)
+            SELECT decode(hash, 'hex'), name, total_length, file_count, created_at
+              FROM unnest(
+                @hashes::text[],
                 @names::text[],
-                @piece_lengths::int[],
                 @total_lengths::bigint[],
                 @file_counts::int[],
-                @is_private::bool[],
-                @sources::varchar[],
-                @policy_ids::varchar[],
-                @regions::varchar[],
-                @retained_levels::smallint[],
-                @needs_refetch::bool[],
-                @created_at::timestamptz[],
-                @updated_at::timestamptz[])
-            ON CONFLICT (info_hash) DO UPDATE
-                SET name = EXCLUDED.name,
-                    piece_length = EXCLUDED.piece_length,
-                    total_length = EXCLUDED.total_length,
-                    file_count = EXCLUDED.file_count,
-                    is_private = EXCLUDED.is_private,
-                    source = EXCLUDED.source,
-                    policy_id = EXCLUDED.policy_id,
-                    region = EXCLUDED.region,
-                    retained_level = EXCLUDED.retained_level,
-                    needs_refetch = EXCLUDED.needs_refetch,
-                    created_at = LEAST(torrents.created_at, EXCLUDED.created_at),
-                    updated_at = NOW()
-              WHERE torrents.retained_level < EXCLUDED.retained_level
-            RETURNING info_hash
+                @created_at::timestamptz[])
+                   AS incoming(hash, name, total_length, file_count, created_at)
+            ON CONFLICT (info_hash) DO NOTHING
+            RETURNING id, encode(info_hash, 'hex')
             """,
             connection,
             transaction);
 
         command.Parameters.AddWithValue("hashes", torrents.Select(t => t.InfoHash).ToArray());
         command.Parameters.AddWithValue("names", torrents.Select(t => t.Name).ToArray());
-        command.Parameters.AddWithValue("piece_lengths", torrents.Select(t => t.PieceLength).ToArray());
         command.Parameters.AddWithValue("total_lengths", torrents.Select(t => t.TotalLength).ToArray());
         command.Parameters.AddWithValue("file_counts", torrents.Select(t => t.FileCount).ToArray());
-        command.Parameters.AddWithValue("is_private", torrents.Select(t => t.IsPrivate).ToArray());
-        command.Parameters.Add(new NpgsqlParameter<string?[]>(
-            "sources",
-            NpgsqlDbType.Array | NpgsqlDbType.Varchar)
-        {
-            Value = torrents.Select(t => t.Source).ToArray()
-        });
-        command.Parameters.Add(new NpgsqlParameter<string?[]>(
-            "policy_ids",
-            NpgsqlDbType.Array | NpgsqlDbType.Varchar)
-        {
-            Value = torrents.Select(t => t.PolicyId).ToArray()
-        });
-        command.Parameters.Add(new NpgsqlParameter<string?[]>(
-            "regions",
-            NpgsqlDbType.Array | NpgsqlDbType.Varchar)
-        {
-            Value = torrents.Select(t => t.Region).ToArray()
-        });
-        command.Parameters.AddWithValue(
-            "retained_levels",
-            NpgsqlDbType.Array | NpgsqlDbType.Smallint,
-            torrents.Select(t => (short)t.RetainedLevel).ToArray());
-        command.Parameters.AddWithValue(
-            "needs_refetch",
-            torrents.Select(t => t.NeedsRefetch).ToArray());
         command.Parameters.AddWithValue(
             "created_at",
             NpgsqlDbType.Array | NpgsqlDbType.TimestampTz,
             torrents.Select(t => t.CreatedAt).ToArray());
-        command.Parameters.AddWithValue(
-            "updated_at",
-            NpgsqlDbType.Array | NpgsqlDbType.TimestampTz,
-            torrents.Select(t => t.UpdatedAt).ToArray());
 
-        var inserted = new HashSet<string>(StringComparer.Ordinal);
+        var inserted = new Dictionary<string, long>(StringComparer.Ordinal);
         await using var reader = await command.ExecuteReaderAsync(cancellationToken);
         while (await reader.ReadAsync(cancellationToken))
-            inserted.Add(reader.GetString(0));
+            inserted.Add(reader.GetString(1), reader.GetInt64(0));
         return inserted;
-    }
-
-    private static async Task DeletePriorDetailsAsync(
-        HashSet<string> infoHashes,
-        NpgsqlConnection connection,
-        NpgsqlTransaction transaction,
-        CancellationToken cancellationToken)
-    {
-        await using var command = new NpgsqlCommand(
-            """
-            DELETE FROM torrent_files WHERE info_hash = ANY(@hashes);
-            DELETE FROM torrent_extension_summaries WHERE info_hash = ANY(@hashes);
-            """,
-            connection,
-            transaction);
-        command.Parameters.AddWithValue("hashes", infoHashes.ToArray());
-        await command.ExecuteNonQueryAsync(cancellationToken);
     }
 
     private static async Task<HashSet<string>> InsertDecisionsAsync(
@@ -392,47 +324,17 @@ public sealed class DurableIngestService
             """
             INSERT INTO metadata_decisions (
                 info_hash,
-                action,
-                retained_level,
-                needs_refetch,
-                policy_id,
-                reason,
-                first_seen,
-                region,
-                updated_at)
-            SELECT decode(hash, 'hex'),
-                   action,
-                   retained_level,
-                   needs_refetch,
-                   policy_id,
-                   reason,
-                   first_seen,
-                   region,
-                   NOW()
+                decision_code)
+            SELECT decode(hash, 'hex'), decision_code
               FROM unnest(
                   @hashes::text[],
-                  @actions::smallint[],
-                  @retained_levels::smallint[],
-                  @needs_refetch::bool[],
-                  @policy_ids::varchar[],
-                  @reasons::varchar[],
-                  @first_seen::timestamptz[],
-                   @regions::varchar[])
-                   AS d(hash, action, retained_level, needs_refetch, policy_id, reason, first_seen, region)
+                  @decision_codes::smallint[])
+                   AS d(hash, decision_code)
              WHERE NOT EXISTS (
                        SELECT 1
                          FROM torrents AS torrent
-                        WHERE torrent.info_hash = d.hash)
-            ON CONFLICT (info_hash) DO UPDATE
-                SET action = EXCLUDED.action,
-                    retained_level = EXCLUDED.retained_level,
-                    needs_refetch = EXCLUDED.needs_refetch,
-                    policy_id = EXCLUDED.policy_id,
-                    reason = EXCLUDED.reason,
-                    first_seen = COALESCE(metadata_decisions.first_seen, EXCLUDED.first_seen),
-                    region = EXCLUDED.region,
-                    updated_at = NOW()
-              WHERE metadata_decisions.action < EXCLUDED.action
+                        WHERE torrent.info_hash = decode(d.hash, 'hex'))
+            ON CONFLICT (info_hash) DO NOTHING
             RETURNING encode(info_hash, 'hex')
             """,
             connection,
@@ -441,35 +343,9 @@ public sealed class DurableIngestService
             "hashes",
             decisions.Select(d => Convert.ToHexString(d.InfoHash).ToLowerInvariant()).ToArray());
         command.Parameters.AddWithValue(
-            "actions",
+            "decision_codes",
             NpgsqlDbType.Array | NpgsqlDbType.Smallint,
-            decisions.Select(d => (short)d.Action).ToArray());
-        command.Parameters.AddWithValue(
-            "retained_levels",
-            NpgsqlDbType.Array | NpgsqlDbType.Smallint,
-            decisions.Select(d => (short)d.RetainedLevel).ToArray());
-        command.Parameters.AddWithValue(
-            "needs_refetch",
-            decisions.Select(d => d.NeedsRefetch).ToArray());
-        command.Parameters.Add(new NpgsqlParameter<string?[]>(
-            "policy_ids",
-            NpgsqlDbType.Array | NpgsqlDbType.Varchar)
-        {
-            Value = decisions.Select(d => d.PolicyId).ToArray()
-        });
-        command.Parameters.AddWithValue("reasons", decisions.Select(d => d.Reason).ToArray());
-        command.Parameters.Add(new NpgsqlParameter<DateTime?[]>(
-            "first_seen",
-            NpgsqlDbType.Array | NpgsqlDbType.TimestampTz)
-        {
-            Value = decisions.Select(d => d.FirstSeen).ToArray()
-        });
-        command.Parameters.Add(new NpgsqlParameter<string?[]>(
-            "regions",
-            NpgsqlDbType.Array | NpgsqlDbType.Varchar)
-        {
-            Value = decisions.Select(d => d.Region).ToArray()
-        });
+            decisions.Select(d => (short)d.DecisionCode).ToArray());
 
         var changed = new HashSet<string>(StringComparer.Ordinal);
         await using var reader = await command.ExecuteReaderAsync(cancellationToken);
@@ -484,12 +360,12 @@ public sealed class DurableIngestService
         CancellationToken cancellationToken)
     {
         await using var writer = await connection.BeginBinaryImportAsync(
-            "COPY torrent_files (info_hash, path_text, length) FROM STDIN (FORMAT BINARY)",
+            "COPY torrent_files (torrent_id, path_text, length) FROM STDIN (FORMAT BINARY)",
             cancellationToken);
         foreach (var file in files)
         {
             await writer.StartRowAsync(cancellationToken);
-            await writer.WriteAsync(file.InfoHash, NpgsqlDbType.Varchar, cancellationToken);
+            await writer.WriteAsync(file.TorrentId, NpgsqlDbType.Bigint, cancellationToken);
             await writer.WriteAsync(file.PathText, NpgsqlDbType.Text, cancellationToken);
             await writer.WriteAsync(file.Length, NpgsqlDbType.Bigint, cancellationToken);
         }
@@ -502,12 +378,12 @@ public sealed class DurableIngestService
         CancellationToken cancellationToken)
     {
         await using var writer = await connection.BeginBinaryImportAsync(
-            "COPY torrent_extension_summaries (info_hash, extension, file_count, total_length) FROM STDIN (FORMAT BINARY)",
+            "COPY torrent_extension_summaries (torrent_id, extension, file_count, total_length) FROM STDIN (FORMAT BINARY)",
             cancellationToken);
         foreach (var extension in extensions)
         {
             await writer.StartRowAsync(cancellationToken);
-            await writer.WriteAsync(extension.InfoHash, NpgsqlDbType.Varchar, cancellationToken);
+            await writer.WriteAsync(extension.TorrentId, NpgsqlDbType.Bigint, cancellationToken);
             await writer.WriteAsync(extension.Extension, NpgsqlDbType.Varchar, cancellationToken);
             await writer.WriteAsync(extension.FileCount, NpgsqlDbType.Integer, cancellationToken);
             await writer.WriteAsync(extension.TotalLength, NpgsqlDbType.Bigint, cancellationToken);
@@ -592,4 +468,7 @@ public sealed class DurableIngestService
         string LastPayloadSha256,
         int LastAccepted,
         int LastDuplicates);
+
+    private static bool IsReject(MetadataDecisionCode code) =>
+        code is MetadataDecisionCode.Reject or MetadataDecisionCode.RejectFileCap;
 }

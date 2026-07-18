@@ -52,7 +52,7 @@ public class TorrentRepository : ITorrentRepository
 
         // Use a transaction so torrents and their files are inserted atomically.
         await using var tx = await conn.BeginTransactionAsync(ct);
-        HashSet<string> insertedHashes;
+        Dictionary<string, long> insertedTorrents;
         try
         {
             await ExactHashTransactionLock.AcquireAsync(
@@ -62,7 +62,7 @@ public class TorrentRepository : ITorrentRepository
                 ct);
 
             // Step 1: INSERT torrents via unnest arrays �� no temp table needed.
-            insertedHashes = await InsertTorrentsAsync(unique, conn, tx, ct);
+            insertedTorrents = await InsertTorrentsAsync(unique, conn, tx, ct);
             await ExactHashTransactionLock.DeleteDecisionsForTorrentsAsync(
                 unique.Select(torrent => torrent.InfoHash).ToArray(),
                 conn,
@@ -73,10 +73,10 @@ public class TorrentRepository : ITorrentRepository
             var files = new List<TorrentFile>();
             foreach (var t in unique)
             {
-                if (!insertedHashes.Contains(t.InfoHash)) continue;
+                if (!insertedTorrents.TryGetValue(t.InfoHash, out var torrentId)) continue;
                 foreach (var f in t.Files)
                 {
-                    f.InfoHash = t.InfoHash;
+                    f.TorrentId = torrentId;
                     files.Add(f);
                 }
             }
@@ -86,7 +86,7 @@ public class TorrentRepository : ITorrentRepository
 
             // The marker commits atomically with authoritative metadata. The
             // crawler/API response never waits for Meilisearch itself.
-            await SearchOutboxWriter.EnqueueAsync(insertedHashes, conn, tx, ct);
+            await SearchOutboxWriter.EnqueueAsync(insertedTorrents.Values, conn, tx, ct);
 
             await tx.CommitAsync(ct);
         }
@@ -96,7 +96,7 @@ public class TorrentRepository : ITorrentRepository
             throw;
         }
 
-        return insertedHashes;
+        return insertedTorrents.Keys.ToHashSet(StringComparer.Ordinal);
     }
 
     public async Task<IReadOnlySet<string>> AddRejectedHashesAsync(
@@ -113,59 +113,73 @@ public class TorrentRepository : ITorrentRepository
         if (conn.State != System.Data.ConnectionState.Open)
             await conn.OpenAsync(ct);
 
-        await using var cmd = new NpgsqlCommand(
-            """
-            INSERT INTO rejected_hashes (info_hash)
-            SELECT decode(hash, 'hex')
-              FROM unnest(@hashes::text[]) AS t(hash)
-            ON CONFLICT (info_hash) DO NOTHING
-            RETURNING encode(info_hash, 'hex')
-            """, conn);
-        cmd.Parameters.AddWithValue("hashes", unique);
+        await using var tx = await conn.BeginTransactionAsync(ct);
+        try
+        {
+            await ExactHashTransactionLock.AcquireAsync(unique, conn, tx, ct);
+            await using var cmd = new NpgsqlCommand(
+                """
+                INSERT INTO metadata_decisions (info_hash, decision_code)
+                SELECT decode(hash, 'hex'), @decision_code
+                  FROM unnest(@hashes::text[]) AS incoming(hash)
+                 WHERE NOT EXISTS (
+                           SELECT 1 FROM torrents
+                            WHERE info_hash = decode(incoming.hash, 'hex'))
+                ON CONFLICT (info_hash) DO NOTHING
+                RETURNING encode(info_hash, 'hex')
+                """, conn, tx);
+            cmd.Parameters.AddWithValue("hashes", unique);
+            cmd.Parameters.AddWithValue(
+                "decision_code",
+                NpgsqlDbType.Smallint,
+                (short)MetadataDecisionCode.Reject);
 
-        var inserted = new HashSet<string>(StringComparer.Ordinal);
-        await using var reader = await cmd.ExecuteReaderAsync(ct);
-        while (await reader.ReadAsync(ct))
-            inserted.Add(reader.GetString(0));
-
-        return inserted;
+            var inserted = new HashSet<string>(StringComparer.Ordinal);
+            await using var reader = await cmd.ExecuteReaderAsync(ct);
+            while (await reader.ReadAsync(ct))
+                inserted.Add(reader.GetString(0));
+            await reader.DisposeAsync();
+            await tx.CommitAsync(ct);
+            return inserted;
+        }
+        catch
+        {
+            await tx.RollbackAsync(CancellationToken.None);
+            throw;
+        }
     }
 
-    private static async Task<HashSet<string>> InsertTorrentsAsync(
+    private static async Task<Dictionary<string, long>> InsertTorrentsAsync(
         List<Torrent> torrents, NpgsqlConnection conn, NpgsqlTransaction tx, CancellationToken ct)
     {
         await using var cmd = new NpgsqlCommand(
             """
-            INSERT INTO torrents (info_hash, name, piece_length, total_length, file_count, is_private, source)
-            SELECT * FROM unnest(
-                @hashes::varchar[],
+            INSERT INTO torrents (info_hash, name, total_length, file_count, created_at)
+            SELECT decode(hash, 'hex'), name, total_length, file_count, created_at
+              FROM unnest(
+                @hashes::text[],
                 @names::text[],
-                @pieceLengths::int[],
                 @totalLengths::bigint[],
                 @fileCounts::int[],
-                @isPrivates::bool[],
-                @sources::varchar[]
-            ) AS t(info_hash, name, piece_length, total_length, file_count, is_private, source)
+                @createdAt::timestamptz[]
+            ) AS t(hash, name, total_length, file_count, created_at)
             ON CONFLICT (info_hash) DO NOTHING
-            RETURNING info_hash
+            RETURNING id, encode(info_hash, 'hex')
             """, conn, tx);
 
-        cmd.Parameters.AddWithValue("hashes",      torrents.Select(t => t.InfoHash).ToArray());
-        cmd.Parameters.AddWithValue("names",        torrents.Select(t => t.Name).ToArray());
-        cmd.Parameters.AddWithValue("pieceLengths", torrents.Select(t => t.PieceLength).ToArray());
+        cmd.Parameters.AddWithValue("hashes", torrents.Select(t => t.InfoHash).ToArray());
+        cmd.Parameters.AddWithValue("names", torrents.Select(t => t.Name).ToArray());
         cmd.Parameters.AddWithValue("totalLengths", torrents.Select(t => t.TotalLength).ToArray());
-        cmd.Parameters.AddWithValue("fileCounts",   torrents.Select(t => t.FileCount).ToArray());
-        cmd.Parameters.AddWithValue("isPrivates",   torrents.Select(t => t.IsPrivate).ToArray());
-        // Use explicit NpgsqlDbType so Npgsql correctly maps nullable varchar[] without type ambiguity.
-        cmd.Parameters.Add(new NpgsqlParameter<string?[]>("sources", NpgsqlDbType.Array | NpgsqlDbType.Varchar)
-        {
-            Value = torrents.Select(t => t.Source).ToArray()
-        });
+        cmd.Parameters.AddWithValue("fileCounts", torrents.Select(t => t.FileCount).ToArray());
+        cmd.Parameters.AddWithValue(
+            "createdAt",
+            NpgsqlDbType.Array | NpgsqlDbType.TimestampTz,
+            torrents.Select(t => t.CreatedAt).ToArray());
 
-        var result = new HashSet<string>();
+        var result = new Dictionary<string, long>(StringComparer.Ordinal);
         await using var reader = await cmd.ExecuteReaderAsync(ct);
         while (await reader.ReadAsync(ct))
-            result.Add(reader.GetString(0));
+            result.Add(reader.GetString(1), reader.GetInt64(0));
         return result;
     }
 
@@ -173,14 +187,14 @@ public class TorrentRepository : ITorrentRepository
         List<TorrentFile> files, NpgsqlConnection conn, NpgsqlTransaction tx, CancellationToken ct)
     {
         await using var writer = await conn.BeginBinaryImportAsync(
-            "COPY torrent_files (info_hash, path_text, length) FROM STDIN (FORMAT BINARY)",
+            "COPY torrent_files (torrent_id, path_text, length) FROM STDIN (FORMAT BINARY)",
             ct);
         // Npgsql binary COPY is implicitly part of the current transaction on this connection.
 
         foreach (var f in files)
         {
             await writer.StartRowAsync(ct);
-            await writer.WriteAsync(f.InfoHash, ct);
+            await writer.WriteAsync(f.TorrentId, NpgsqlDbType.Bigint, ct);
             await writer.WriteAsync(f.PathText, ct);
             await writer.WriteAsync(f.Length, ct);
         }
@@ -197,7 +211,7 @@ public class TorrentRepository : ITorrentRepository
         if (torrent != null)
             torrent.Files = await _db.TorrentFiles
                 .AsNoTracking()
-                .Where(f => f.InfoHash == infoHash)
+                .Where(f => f.TorrentId == torrent.Id)
                 .ToListAsync(ct);
 
         return torrent;
@@ -213,16 +227,16 @@ public class TorrentRepository : ITorrentRepository
         if (result is not { Hits.Count: > 0 })
             return ([], result?.EstimatedTotalHits ?? 0);
 
-        var hashes = result.Hits.Select(h => h.InfoHash).ToList();
+        var ids = result.Hits.Select(h => h.Id).ToList();
         var dbItems = await _db.Torrents
             .AsNoTracking()
-            .Where(t => hashes.Contains(t.InfoHash))
+            .Where(t => ids.Contains(t.Id))
             .ToListAsync(ct);
 
         // O(n) dict-based reorder to preserve Meilisearch ranking.
-        var byHash = dbItems.ToDictionary(t => t.InfoHash);
-        var ordered = hashes
-            .Select(h => byHash.GetValueOrDefault(h))
+        var byId = dbItems.ToDictionary(t => t.Id);
+        var ordered = ids
+            .Select(id => byId.GetValueOrDefault(id))
             .Where(t => t != null)
             .Cast<Torrent>()
             .ToList();
@@ -230,43 +244,25 @@ public class TorrentRepository : ITorrentRepository
         return (ordered, result.EstimatedTotalHits);
     }
 
-    public async Task DecayPeerCountsAsync(CancellationToken ct = default)
-    {
-        await _db.Torrents
-            .Where(t => t.PeerCount > 0 && t.PeerUpdatedAt != null && t.PeerUpdatedAt < DateTime.UtcNow.AddDays(-7))
-            .ExecuteUpdateAsync(s => s.SetProperty(t => t.PeerCount, t => t.PeerCount / 2), ct);
-    }
-
-    public async Task BatchUpdatePeerCountsAsync(Dictionary<string, int> counts, CancellationToken ct = default)
-    {
-        if (counts.Count == 0) return;
-        var conn = (NpgsqlConnection)_db.Database.GetDbConnection();
-        if (conn.State != System.Data.ConnectionState.Open)
-            await conn.OpenAsync(ct);
-
-        // unnest-based UPDATE: no temp table, no extra round-trips, single statement.
-        await using var cmd = new NpgsqlCommand(
-            """
-            UPDATE torrents
-               SET peer_count      = torrents.peer_count + t.cnt,
-                   peer_updated_at = NOW()
-              FROM unnest(@hashes::varchar[], @counts::int[]) AS t(hash, cnt)
-             WHERE torrents.info_hash = t.hash
-            """, conn);
-
-        cmd.Parameters.AddWithValue("hashes", counts.Keys.ToArray());
-        cmd.Parameters.AddWithValue("counts", counts.Values.ToArray());
-        await cmd.ExecuteNonQueryAsync(ct);
-    }
-
     public async Task<List<string>> CheckExistsAsync(List<string> hashes, CancellationToken ct = default)
     {
         if (hashes.Count == 0) return [];
-        return await _db.Torrents
-            .AsNoTracking()
-            .Where(t => hashes.Contains(t.InfoHash))
-            .Select(t => t.InfoHash)
-            .ToListAsync(ct);
+        var conn = (NpgsqlConnection)_db.Database.GetDbConnection();
+        if (conn.State != System.Data.ConnectionState.Open)
+            await conn.OpenAsync(ct);
+        await using var cmd = new NpgsqlCommand(
+            """
+            SELECT encode(t.info_hash, 'hex')
+              FROM torrents AS t
+              JOIN unnest(@hashes::text[]) AS incoming(hash)
+                ON t.info_hash = decode(incoming.hash, 'hex')
+            """, conn);
+        cmd.Parameters.AddWithValue("hashes", hashes.ToArray());
+        var existing = new List<string>();
+        await using var reader = await cmd.ExecuteReaderAsync(ct);
+        while (await reader.ReadAsync(ct))
+            existing.Add(reader.GetString(0));
+        return existing;
     }
 
     public async Task<List<string>> CheckProcessedAsync(List<string> hashes, CancellationToken ct = default)
@@ -280,21 +276,16 @@ public class TorrentRepository : ITorrentRepository
 
         await using var cmd = new NpgsqlCommand(
             """
-            SELECT t.info_hash
-              FROM torrents AS t
-             WHERE NOT t.needs_refetch
-               AND t.info_hash = ANY(@hashes)
+            WITH incoming(hash) AS (SELECT unnest(@hashes::text[]))
+            SELECT incoming.hash
+              FROM incoming
+              JOIN torrents AS t
+                ON t.info_hash = decode(incoming.hash, 'hex')
             UNION
-            SELECT encode(r.info_hash, 'hex')
-              FROM rejected_hashes AS r
-              JOIN unnest(@hashes::text[]) AS h(hash)
-                ON r.info_hash = decode(h.hash, 'hex')
-            UNION
-            SELECT encode(d.info_hash, 'hex')
-              FROM metadata_decisions AS d
-              JOIN unnest(@hashes::text[]) AS h(hash)
-                ON d.info_hash = decode(h.hash, 'hex')
-             WHERE NOT d.needs_refetch
+            SELECT incoming.hash
+              FROM incoming
+              JOIN metadata_decisions AS d
+                ON d.info_hash = decode(incoming.hash, 'hex')
             """, conn);
         cmd.Parameters.AddWithValue("hashes", hashes.ToArray());
 
@@ -315,11 +306,9 @@ public class TorrentRepository : ITorrentRepository
 
         await using var cmd = new NpgsqlCommand(
             """
-            SELECT info_hash FROM torrents WHERE NOT needs_refetch
+            SELECT encode(info_hash, 'hex') FROM torrents
             UNION ALL
-            SELECT encode(info_hash, 'hex') FROM rejected_hashes
-            UNION ALL
-            SELECT encode(info_hash, 'hex') FROM metadata_decisions WHERE NOT needs_refetch
+            SELECT encode(info_hash, 'hex') FROM metadata_decisions
             """, conn);
         await using var reader = await cmd.ExecuteReaderAsync(
             System.Data.CommandBehavior.SequentialAccess,

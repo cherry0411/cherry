@@ -11,10 +11,13 @@ import (
 // cannot create a permanent non-retryable 400 at the head of the spool.
 const durableProtocolMaxEvents = 5_000
 
+const durableProtocolSchemaVersion = 2
+
 // DurableBatchRequest documents the durable ingest wire contract. The sender
 // writes Events as pre-marshaled JSON so PayloadSHA256 covers the exact bytes
 // present in the HTTP body, not a backend re-serialization.
 type DurableBatchRequest struct {
+	SchemaVersion int            `json:"schema_version"`
 	CrawlerID     string         `json:"crawler_id"`
 	Epoch         uint64         `json:"epoch"`
 	StartSequence uint64         `json:"start_sequence"`
@@ -26,28 +29,22 @@ type DurableBatchRequest struct {
 // DurableEvent is a closed, typed, zero-raw union. There is intentionally no
 // RawMessage escape hatch and no field for bencode, pieces, or piece hashes.
 type DurableEvent struct {
-	InfoHash   string                    `json:"info_hash"`
-	Encoding   spool.Encoding            `json:"encoding"`
-	PolicyID   string                    `json:"policy_id,omitempty"`
-	FirstSeen  time.Time                 `json:"first_seen,omitempty"`
-	Region     string                    `json:"region,omitempty"`
-	Normalized *spool.NormalizedMetadata `json:"normalized,omitempty"`
-	Summary    *spool.SummaryMetadata    `json:"summary,omitempty"`
-	HashOnly   *spool.HashOnlyMetadata   `json:"hash_only,omitempty"`
-	Reject     *spool.RejectMetadata     `json:"reject,omitempty"`
+	InfoHash     string                    `json:"info_hash"`
+	Encoding     spool.Encoding            `json:"encoding"`
+	DecisionCode spool.DecisionCode        `json:"decision_code,omitempty"`
+	FirstSeen    time.Time                 `json:"first_seen,omitempty"`
+	Normalized   *spool.NormalizedMetadata `json:"normalized,omitempty"`
+	Summary      *spool.SummaryMetadata    `json:"summary,omitempty"`
 }
 
 func durableEventFromRecord(record spool.Record) DurableEvent {
 	return DurableEvent{
-		InfoHash:   record.InfoHash,
-		Encoding:   record.Encoding,
-		PolicyID:   record.PolicyID,
-		FirstSeen:  record.FirstSeen,
-		Region:     record.Region,
-		Normalized: record.Normalized,
-		Summary:    record.Summary,
-		HashOnly:   record.HashOnly,
-		Reject:     record.Reject,
+		InfoHash:     record.InfoHash,
+		Encoding:     record.Encoding,
+		DecisionCode: record.DecisionCode,
+		FirstSeen:    record.FirstSeen,
+		Normalized:   record.Normalized,
+		Summary:      record.Summary,
 	}
 }
 

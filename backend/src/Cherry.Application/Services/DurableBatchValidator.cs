@@ -20,6 +20,8 @@ public static class DurableBatchValidator
 
     public static ValidatedDurableBatch ValidateAndMap(DurableBatchRequest request)
     {
+        if (request.SchemaVersion != 2)
+            throw Invalid("schema_version must be 2");
         ValidateBoundedText(request.CrawlerId, "crawler_id", 256, allowEmpty: false);
         if (request.Epoch == 0 || request.Epoch > long.MaxValue)
             throw Invalid("epoch must be between 1 and Int64.MaxValue");
@@ -39,17 +41,15 @@ public static class DurableBatchValidator
         if (request.EndSequence - request.StartSequence + 1 != (ulong)events.Count)
             throw Invalid("the inclusive sequence range must equal the number of events");
 
-        var source = TruncateRunes(request.CrawlerId!, 32);
         var torrents = new List<Torrent>(events.Count);
         var decisions = new List<MetadataDecision>(events.Count);
         for (var index = 0; index < events.Count; index++)
-            ValidateAndMapEvent(events[index], source, index, torrents, decisions);
+            ValidateAndMapEvent(events[index], index, torrents, decisions);
         return new ValidatedDurableBatch(torrents, decisions, events.Count);
     }
 
     private static void ValidateAndMapEvent(
         DurableBatchEvent? item,
-        string source,
         int index,
         List<Torrent> torrents,
         List<MetadataDecision> decisions)
@@ -60,57 +60,37 @@ public static class DurableBatchValidator
         if (!IsLowerHex(item.InfoHash, 40))
             throw Invalid($"{field}.info_hash must be 40 lowercase hexadecimal characters");
 
-        ValidateBoundedText(item.PolicyId, $"{field}.policy_id", 256, allowEmpty: true, required: false);
-        ValidateBoundedText(item.Region, $"{field}.region", 64, allowEmpty: true, required: false);
         if (item.FirstSeen is { Offset: var offset } && offset != TimeSpan.Zero)
             throw Invalid($"{field}.first_seen must use UTC");
-
-        var bodyCount = (item.Normalized is null ? 0 : 1) +
-                        (item.Summary is null ? 0 : 1) +
-                        (item.HashOnly is null ? 0 : 1) +
-                        (item.Reject is null ? 0 : 1);
-        if (bodyCount != 1)
-            throw Invalid($"{field} must contain exactly one normalized, summary, hash_only, or reject body");
 
         switch (item.Encoding)
         {
             case "normalized" when item.Normalized is not null &&
                                    item.Summary is null &&
-                                   item.HashOnly is null &&
-                                   item.Reject is null:
-                torrents.Add(MapNormalized(item, source, field));
+                                   item.DecisionCode == 0:
+                torrents.Add(MapNormalized(item, field));
                 return;
             case "summary" when item.Summary is not null &&
                                 item.Normalized is null &&
-                                item.HashOnly is null &&
-                                item.Reject is null:
-                torrents.Add(MapSummary(item, source, field));
+                                item.DecisionCode == 0:
+                torrents.Add(MapSummary(item, field));
                 return;
-            case "hash_only" when item.HashOnly is not null &&
-                                  item.Normalized is null &&
-                                  item.Summary is null &&
-                                  item.Reject is null:
-                decisions.Add(MapDecision(item, item.HashOnly.Reason, MetadataDecisionAction.HashOnly, field));
+            case "hash_only" when item.Normalized is null && item.Summary is null:
+                decisions.Add(MapDecision(item, item.DecisionCode, reject: false, field));
                 return;
-            case "reject" when item.Reject is not null &&
-                               item.Normalized is null &&
-                               item.Summary is null &&
-                               item.HashOnly is null:
-                decisions.Add(MapDecision(item, item.Reject.Reason, MetadataDecisionAction.Reject, field));
+            case "reject" when item.Normalized is null && item.Summary is null:
+                decisions.Add(MapDecision(item, item.DecisionCode, reject: true, field));
                 return;
             default:
-                throw Invalid($"{field}.encoding does not match its typed body");
+                throw Invalid($"{field}.encoding, body, and decision_code do not match");
         }
     }
 
-    private static Torrent MapNormalized(DurableBatchEvent item, string source, string field)
+    private static Torrent MapNormalized(DurableBatchEvent item, string field)
     {
         var normalized = item.Normalized!;
         ValidateBoundedText(normalized.Name, $"{field}.normalized.name", 16 * 1024, allowEmpty: true);
         ValidateLength(normalized.TotalLength, $"{field}.normalized.total_length");
-        if (normalized.PieceLength > int.MaxValue)
-            throw Invalid($"{field}.normalized.piece_length exceeds Int32.MaxValue");
-
         var files = normalized.Files
             ?? throw Invalid($"{field}.normalized.files is required");
         if (files.Count is 0 or > MaxFilesPerEvent)
@@ -136,18 +116,14 @@ public static class DurableBatchValidator
 
         return BaseTorrent(
             item,
-            source,
             normalized.Name!,
             normalized.TotalLength,
             mappedFiles.Count,
-            MetadataRetentionLevel.Normalized,
-            needsRefetch: false,
-            pieceLength: (int)normalized.PieceLength,
             mappedFiles,
             []);
     }
 
-    private static Torrent MapSummary(DurableBatchEvent item, string source, string field)
+    private static Torrent MapSummary(DurableBatchEvent item, string field)
     {
         var summary = item.Summary!;
         ValidateBoundedText(summary.Name, $"{field}.summary.name", 16 * 1024, allowEmpty: true);
@@ -209,47 +185,41 @@ public static class DurableBatchValidator
 
         return BaseTorrent(
             item,
-            source,
             summary.Name!,
             summary.TotalLength,
             checked((int)summary.FileCount),
-            MetadataRetentionLevel.Summary,
-            needsRefetch: false,
-            pieceLength: 0,
             mappedFiles,
             mappedExtensions);
     }
 
     private static MetadataDecision MapDecision(
         DurableBatchEvent item,
-        string? reason,
-        MetadataDecisionAction action,
+        short rawDecisionCode,
+        bool reject,
         string field)
     {
-        ValidateBoundedText(reason, $"{field}.{item.Encoding}.reason", 1024, allowEmpty: false);
+        if (!Enum.IsDefined(typeof(MetadataDecisionCode), rawDecisionCode))
+            throw Invalid($"{field}.{item.Encoding}.decision_code is not recognized");
+        var decisionCode = (MetadataDecisionCode)rawDecisionCode;
+        var matchesEncoding = reject
+            ? decisionCode is MetadataDecisionCode.Reject or MetadataDecisionCode.RejectFileCap
+            : decisionCode is MetadataDecisionCode.HashOnly or
+                MetadataDecisionCode.HashOnlyFileCap or
+                MetadataDecisionCode.InvalidMetadata;
+        if (!matchesEncoding)
+            throw Invalid($"{field}.{item.Encoding}.decision_code does not match its encoding");
         return new MetadataDecision
         {
             InfoHash = Convert.FromHexString(item.InfoHash!),
-            Action = action,
-            RetainedLevel = MetadataRetentionLevel.HashOnly,
-            NeedsRefetch = false,
-            PolicyId = item.PolicyId,
-            Reason = reason!,
-            FirstSeen = item.FirstSeen?.UtcDateTime,
-            Region = item.Region,
-            UpdatedAt = DateTime.UtcNow
+            DecisionCode = decisionCode
         };
     }
 
     private static Torrent BaseTorrent(
         DurableBatchEvent item,
-        string source,
         string name,
         ulong totalLength,
         int fileCount,
-        MetadataRetentionLevel retainedLevel,
-        bool needsRefetch,
-        int pieceLength,
         List<TorrentFile> files,
         List<TorrentExtensionSummary> extensions)
     {
@@ -258,16 +228,9 @@ public static class DurableBatchValidator
         {
             InfoHash = item.InfoHash!,
             Name = name,
-            PieceLength = pieceLength,
             TotalLength = checked((long)totalLength),
             FileCount = fileCount,
-            Source = source,
-            PolicyId = item.PolicyId,
-            Region = item.Region,
-            RetainedLevel = retainedLevel,
-            NeedsRefetch = needsRefetch,
             CreatedAt = observedAt,
-            UpdatedAt = observedAt,
             Files = files,
             ExtensionSummaries = extensions
         };
@@ -319,14 +282,6 @@ public static class DurableBatchValidator
     private static bool IsLowerHex(string? value, int expectedLength) =>
         value is { Length: var length } && length == expectedLength &&
         value.All(c => c is >= '0' and <= '9' or >= 'a' and <= 'f');
-
-    private static string TruncateRunes(string value, int maxRunes)
-    {
-        var builder = new StringBuilder();
-        foreach (var rune in value.EnumerateRunes().Take(maxRunes))
-            builder.Append(rune);
-        return builder.ToString();
-    }
 
     private static DurableBatchValidationException Invalid(string message) => new(message);
 }

@@ -1,5 +1,7 @@
 namespace Cherry.Domain.Entities;
 
+// Historical migration compatibility only. The compact runtime model does not
+// persist or expose a retention level.
 public enum MetadataRetentionLevel : short
 {
     HashOnly = 1,
@@ -7,27 +9,25 @@ public enum MetadataRetentionLevel : short
     Normalized = 3
 }
 
-public enum MetadataDecisionAction : short
+public enum MetadataDecisionCode : short
 {
     HashOnly = 1,
-    Reject = 2
+    Reject = 2,
+    HashOnlyFileCap = 3,
+    RejectFileCap = 4,
+    InvalidMetadata = 5
 }
 
 public sealed class MetadataDecision
 {
     public byte[] InfoHash { get; set; } = [];
-    public MetadataDecisionAction Action { get; set; }
-    public MetadataRetentionLevel RetainedLevel { get; set; } = MetadataRetentionLevel.HashOnly;
-    public bool NeedsRefetch { get; set; }
-    public string? PolicyId { get; set; }
-    public string Reason { get; set; } = string.Empty;
-    public DateTime? FirstSeen { get; set; }
-    public string? Region { get; set; }
-    public DateTime UpdatedAt { get; set; } = DateTime.UtcNow;
+    public MetadataDecisionCode DecisionCode { get; set; }
 }
 
 public sealed class TorrentExtensionSummary
 {
+    public long TorrentId { get; set; }
+    // Transient ingest correlation only. PostgreSQL stores the compact TorrentId.
     public string InfoHash { get; set; } = string.Empty;
     public string Extension { get; set; } = string.Empty;
     public int FileCount { get; set; }

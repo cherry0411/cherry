@@ -10,6 +10,7 @@ import (
 	"log"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -63,6 +64,7 @@ func appendTestRecords(t *testing.T, sp *spool.Spool, count int) {
 }
 
 type rawBatchRequest struct {
+	SchemaVersion int             `json:"schema_version"`
 	CrawlerID     string          `json:"crawler_id"`
 	Epoch         uint64          `json:"epoch"`
 	StartSequence uint64          `json:"start_sequence"`
@@ -98,8 +100,10 @@ func TestDeliverHashesExactEventsBytesAndCommits(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	runDeliverUntilDrained(t, exp, sp, ctx)
-	if got.CrawlerID != "crawler-test" || got.StartSequence != 1 || got.EndSequence != 2 {
-		t.Fatalf("identity=[%s %d-%d], want [crawler-test 1-2]", got.CrawlerID, got.StartSequence, got.EndSequence)
+	if got.SchemaVersion != durableProtocolSchemaVersion || got.CrawlerID != "crawler-test" ||
+		got.StartSequence != 1 || got.EndSequence != 2 {
+		t.Fatalf("schema=%d identity=[%s %d-%d], want schema=2 [crawler-test 1-2]",
+			got.SchemaVersion, got.CrawlerID, got.StartSequence, got.EndSequence)
 	}
 	_, acked, _, _, err := sp.CursorPosition()
 	if err != nil || acked != 2 {
@@ -216,7 +220,7 @@ func TestNewSpoolExporterClampsBatchToProtocolLimit(t *testing.T) {
 	}
 }
 
-func TestDurableEventUnionPreservesAllFourTypedBodies(t *testing.T) {
+func TestDurableEventUsesBodiesOnlyForSearchableMetadata(t *testing.T) {
 	records := []spool.Record{
 		testRecord("full.mkv"),
 		{
@@ -229,32 +233,40 @@ func TestDurableEventUnionPreservesAllFourTypedBodies(t *testing.T) {
 			},
 		},
 		{
-			InfoHash: "223344556677889900aabbccddeeff0011223344",
-			Encoding: spool.EncodingHashOnly,
-			HashOnly: &spool.HashOnlyMetadata{Reason: "invalid_normalized_metadata"},
+			InfoHash:     "223344556677889900aabbccddeeff0011223344",
+			Encoding:     spool.EncodingHashOnly,
+			DecisionCode: spool.DecisionInvalidMetadata,
 		},
 		{
-			InfoHash: "3344556677889900aabbccddeeff001122334455",
-			Encoding: spool.EncodingReject,
-			Reject:   &spool.RejectMetadata{Reason: "reject_file_cap"},
+			InfoHash:     "3344556677889900aabbccddeeff001122334455",
+			Encoding:     spool.EncodingReject,
+			DecisionCode: spool.DecisionRejectFileCap,
 		},
 	}
 
 	for index, record := range records {
 		event := durableEventFromRecord(record)
 		bodies := 0
-		for _, present := range []bool{
-			event.Normalized != nil,
-			event.Summary != nil,
-			event.HashOnly != nil,
-			event.Reject != nil,
-		} {
+		for _, present := range []bool{event.Normalized != nil, event.Summary != nil} {
 			if present {
 				bodies++
 			}
 		}
-		if event.Encoding != record.Encoding || bodies != 1 {
-			t.Fatalf("event %d encoding=%q bodies=%d", index, event.Encoding, bodies)
+		wantBodies := 0
+		if record.Encoding == spool.EncodingNormalized || record.Encoding == spool.EncodingSummary {
+			wantBodies = 1
+		}
+		if event.Encoding != record.Encoding || event.DecisionCode != record.DecisionCode || bodies != wantBodies {
+			t.Fatalf("event %d encoding=%q code=%d bodies=%d", index, event.Encoding, event.DecisionCode, bodies)
+		}
+		encoded, err := json.Marshal(event)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, forbidden := range []string{"policy_id", "region", "piece_length", "reason", `"hash_only":`, `"reject":`} {
+			if strings.Contains(string(encoded), forbidden) {
+				t.Fatalf("event %d contains deleted field %q: %s", index, forbidden, encoded)
+			}
 		}
 	}
 }

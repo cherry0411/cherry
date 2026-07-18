@@ -24,14 +24,23 @@ const (
 	EncodingReject     Encoding = "reject"
 )
 
+// DecisionCode is the compact, closed authority shared with durable ingest.
+// Zero is reserved for searchable normalized/summary records.
+type DecisionCode uint8
+
 const (
-	recordSchemaVersion = 1
+	DecisionHashOnly        DecisionCode = 1
+	DecisionReject          DecisionCode = 2
+	DecisionHashOnlyFileCap DecisionCode = 3
+	DecisionRejectFileCap   DecisionCode = 4
+	DecisionInvalidMetadata DecisionCode = 5
+)
+
+const (
+	recordSchemaVersion = 2
 	maxCrawlerIDBytes   = 256
-	maxPolicyIDBytes    = 256
-	maxRegionBytes      = 64
 	maxNameBytes        = 16 << 10
 	maxPathBytes        = 16 << 10
-	maxReasonBytes      = 1024
 	maxExtensionBytes   = 32
 	maxNormalizedFiles  = 10_000
 	maxSummaryFiles     = 64
@@ -43,6 +52,9 @@ var (
 	errBadEncoding    = errors.New("spool: record has invalid encoding/body combination")
 	errBadInfoHash    = errors.New("spool: record has invalid infohash")
 	errInvalidRecord  = errors.New("spool: invalid typed record")
+	// ErrIncompatibleSchema requires an explicit operator archive/reset. The
+	// spool never drops or rewrites an unacknowledged record during Open.
+	ErrIncompatibleSchema = errors.New("spool: incompatible record schema")
 )
 
 // File is the lossless normalized file representation. Path is normalized
@@ -63,7 +75,6 @@ type ExtensionSummary struct {
 type NormalizedMetadata struct {
 	Name        string `json:"name"`
 	TotalLength uint64 `json:"total_length"`
-	PieceLength uint32 `json:"piece_length,omitempty"`
 	Files       []File `json:"files"`
 }
 
@@ -78,40 +89,26 @@ type SummaryMetadata struct {
 	Extensions          []ExtensionSummary `json:"extensions,omitempty"`
 }
 
-// HashOnlyMetadata preserves exact identity and a bounded policy reason. It is
-// intentionally not searchable metadata.
-type HashOnlyMetadata struct {
-	Reason string `json:"reason"`
-}
-
-// RejectMetadata records an explicit policy rejection. Keeping reject distinct
-// from hash_only lets central ingest mark exact processed state without
-// pretending the record is eligible for refetch or search.
-type RejectMetadata struct {
-	Reason string `json:"reason"`
-}
-
-// Record is a tagged union. Exactly one body matching Encoding must be set.
-// Delivery identity is assigned by Spool.Append and persisted inline.
+// Record is a tagged union. Searchable encodings carry exactly one matching
+// body. Hash-only/reject encodings are bodyless and carry one closed decision
+// code. Delivery identity is assigned by Spool.Append and persisted inline.
 type Record struct {
-	Schema     int                 `json:"v"`
-	CrawlerID  string              `json:"cid"`
-	Epoch      uint64              `json:"ep"`
-	Sequence   uint64              `json:"seq"`
-	InfoHash   string              `json:"info_hash"`
-	Encoding   Encoding            `json:"enc"`
-	PolicyID   string              `json:"policy_id,omitempty"`
-	FirstSeen  time.Time           `json:"first_seen,omitempty"`
-	Region     string              `json:"region,omitempty"`
-	Normalized *NormalizedMetadata `json:"normalized,omitempty"`
-	Summary    *SummaryMetadata    `json:"summary,omitempty"`
-	HashOnly   *HashOnlyMetadata   `json:"hash_only,omitempty"`
-	Reject     *RejectMetadata     `json:"reject,omitempty"`
+	Schema       int                 `json:"v"`
+	CrawlerID    string              `json:"cid"`
+	Epoch        uint64              `json:"ep"`
+	Sequence     uint64              `json:"seq"`
+	InfoHash     string              `json:"info_hash"`
+	Encoding     Encoding            `json:"enc"`
+	DecisionCode DecisionCode        `json:"decision_code,omitempty"`
+	FirstSeen    time.Time           `json:"first_seen,omitempty"`
+	Normalized   *NormalizedMetadata `json:"normalized,omitempty"`
+	Summary      *SummaryMetadata    `json:"summary,omitempty"`
 }
 
 func (r *Record) validate() error {
 	if r.Schema != recordSchemaVersion {
-		return fmt.Errorf("%w: schema version %d", errInvalidRecord, r.Schema)
+		return fmt.Errorf("%w: found record v%d, require v%d; archive the old spool directory and start with a new empty directory",
+			ErrIncompatibleSchema, r.Schema, recordSchemaVersion)
 	}
 	if !validBoundedText(r.CrawlerID, maxCrawlerIDBytes, false) {
 		return errEmptyCrawlerID
@@ -121,10 +118,6 @@ func (r *Record) validate() error {
 	}
 	if !validInfoHash(r.InfoHash) {
 		return errBadInfoHash
-	}
-	if !validBoundedText(r.PolicyID, maxPolicyIDBytes, true) ||
-		!validBoundedText(r.Region, maxRegionBytes, true) {
-		return fmt.Errorf("%w: oversized or invalid envelope text", errInvalidRecord)
 	}
 	if !r.FirstSeen.IsZero() && r.FirstSeen.Location() != time.UTC {
 		return fmt.Errorf("%w: first_seen must be UTC", errInvalidRecord)
@@ -137,40 +130,38 @@ func (r *Record) validate() error {
 	if r.Summary != nil {
 		bodies++
 	}
-	if r.HashOnly != nil {
-		bodies++
-	}
-	if r.Reject != nil {
-		bodies++
-	}
-	if bodies != 1 {
-		return errBadEncoding
-	}
-
 	switch r.Encoding {
 	case EncodingNormalized:
-		if r.Normalized == nil {
+		if r.Normalized == nil || bodies != 1 || r.DecisionCode != 0 {
 			return errBadEncoding
 		}
 		return validateNormalized(r.Normalized)
 	case EncodingSummary:
-		if r.Summary == nil {
+		if r.Summary == nil || bodies != 1 || r.DecisionCode != 0 {
 			return errBadEncoding
 		}
 		return validateSummary(r.Summary)
 	case EncodingHashOnly:
-		if r.HashOnly == nil {
+		if bodies != 0 || !isHashOnlyDecision(r.DecisionCode) {
 			return errBadEncoding
 		}
-		return validateReason(r.HashOnly.Reason, "hash-only")
+		return nil
 	case EncodingReject:
-		if r.Reject == nil {
+		if bodies != 0 || !isRejectDecision(r.DecisionCode) {
 			return errBadEncoding
 		}
-		return validateReason(r.Reject.Reason, "reject")
+		return nil
 	default:
 		return errBadEncoding
 	}
+}
+
+func isHashOnlyDecision(code DecisionCode) bool {
+	return code == DecisionHashOnly || code == DecisionHashOnlyFileCap || code == DecisionInvalidMetadata
+}
+
+func isRejectDecision(code DecisionCode) bool {
+	return code == DecisionReject || code == DecisionRejectFileCap
 }
 
 func validateNormalized(m *NormalizedMetadata) error {
@@ -237,13 +228,6 @@ func validateSummary(m *SummaryMetadata) error {
 	return nil
 }
 
-func validateReason(reason, kind string) error {
-	if !validBoundedText(reason, maxReasonBytes, false) {
-		return fmt.Errorf("%w: invalid %s reason", errInvalidRecord, kind)
-	}
-	return nil
-}
-
 func validInfoHash(s string) bool {
 	if len(s) != 40 || strings.ToLower(s) != s {
 		return false
@@ -281,7 +265,7 @@ func (r *Record) encode() ([]byte, error) {
 // an enormous temporary json.Marshal allocation merely to discover that the
 // 4 MiB frame limit is exceeded.
 func (r *Record) minimumTextBytes() int {
-	total := len(r.CrawlerID) + len(r.InfoHash) + len(r.PolicyID) + len(r.Region)
+	total := len(r.CrawlerID) + len(r.InfoHash)
 	add := func(s string) {
 		if total <= maxRecordLength {
 			total += len(s)
@@ -301,15 +285,21 @@ func (r *Record) minimumTextBytes() int {
 		for i := range r.Summary.Extensions {
 			add(r.Summary.Extensions[i].Extension)
 		}
-	case EncodingHashOnly:
-		add(r.HashOnly.Reason)
-	case EncodingReject:
-		add(r.Reject.Reason)
 	}
 	return total
 }
 
 func decodeRecord(b []byte) (Record, error) {
+	var version struct {
+		Schema int `json:"v"`
+	}
+	if err := json.Unmarshal(b, &version); err != nil {
+		return Record{}, fmt.Errorf("spool: decode record: %w", err)
+	}
+	if version.Schema != recordSchemaVersion {
+		return Record{}, fmt.Errorf("%w: found record v%d, require v%d; archive the old spool directory and start with a new empty directory",
+			ErrIncompatibleSchema, version.Schema, recordSchemaVersion)
+	}
 	var r Record
 	dec := json.NewDecoder(bytes.NewReader(b))
 	dec.DisallowUnknownFields()

@@ -15,12 +15,12 @@ const validHash = "aabbccddeeff00112233445566778899aabbccdd"
 
 func TestDefaultPolicyFileThreshold(t *testing.T) {
 	policy := MustDefault()
-	full := policy.Decide(validHash, time.Time{}, "jp", metadataWithFiles(2000), "")
-	if full.Action != ActionFull || full.Record.Encoding != spool.EncodingNormalized || full.NeedsRefetch {
+	full := policy.Decide(validHash, time.Time{}, metadataWithFiles(2000), "")
+	if full.Action != ActionFull || full.Record.Encoding != spool.EncodingNormalized {
 		t.Fatalf("at threshold: %+v", full)
 	}
-	summary := policy.Decide(validHash, time.Time{}, "jp", metadataWithFiles(2001), "")
-	if summary.Action != ActionSummary || summary.Record.Encoding != spool.EncodingSummary || summary.NeedsRefetch {
+	summary := policy.Decide(validHash, time.Time{}, metadataWithFiles(2001), "")
+	if summary.Action != ActionSummary || summary.Record.Encoding != spool.EncodingSummary {
 		t.Fatalf("above threshold: %+v", summary)
 	}
 	if summary.Record.Summary.FileCount != 2001 || len(summary.Record.Summary.RepresentativeFiles) > 32 || len(summary.Record.Summary.Extensions) > 32 {
@@ -33,7 +33,7 @@ func TestDefaultPolicyPathBudget(t *testing.T) {
 	for i := range metadata.Files {
 		metadata.Files[i].PathText = strings.Repeat("x", 3000) + fmt.Sprint(i)
 	}
-	decision := MustDefault().Decide(validHash, time.Time{}, "sg", metadata, "")
+	decision := MustDefault().Decide(validHash, time.Time{}, metadata, "")
 	if decision.Action != ActionSummary || decision.Reason != ReasonPathBytes {
 		t.Fatalf("decision=%+v", decision)
 	}
@@ -47,7 +47,7 @@ func TestDefaultPolicyPathBudget(t *testing.T) {
 }
 
 func TestLegacyFilterOnlyDowngradesToSummary(t *testing.T) {
-	decision := MustDefault().Decide(validHash, time.Now(), "jp", metadataWithFiles(2), "numeric_file_names")
+	decision := MustDefault().Decide(validHash, time.Now(), metadataWithFiles(2), "numeric_file_names")
 	if decision.Action != ActionSummary || !strings.Contains(decision.Reason, "numeric_file_names") {
 		t.Fatalf("decision=%+v", decision)
 	}
@@ -61,14 +61,34 @@ func TestOptionalHashOnlyAndRejectCaps(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	hashOnly := policy.Decide(validHash, time.Time{}, "", metadataWithFiles(3001), "")
-	if hashOnly.Action != ActionHashOnly || hashOnly.NeedsRefetch {
+	hashOnly := policy.Decide(validHash, time.Time{}, metadataWithFiles(3001), "")
+	if hashOnly.Action != ActionHashOnly || hashOnly.Record.DecisionCode != spool.DecisionHashOnlyFileCap {
 		t.Fatalf("hash-only=%+v", hashOnly)
 	}
-	reject := policy.Decide(validHash, time.Time{}, "", metadataWithFiles(4001), "")
+	reject := policy.Decide(validHash, time.Time{}, metadataWithFiles(4001), "")
 	if reject.Action != ActionReject || reject.Record.Encoding != spool.EncodingReject ||
-		reject.Record.Reject == nil || reject.Record.HashOnly != nil || reject.NeedsRefetch {
+		reject.Record.DecisionCode != spool.DecisionRejectFileCap ||
+		reject.Record.Normalized != nil || reject.Record.Summary != nil {
 		t.Fatalf("reject=%+v", reject)
+	}
+}
+
+func TestCompactDecisionCodeClosedMapping(t *testing.T) {
+	tests := []struct {
+		action Action
+		reason string
+		want   spool.DecisionCode
+	}{
+		{ActionHashOnly, "other", spool.DecisionHashOnly},
+		{ActionReject, "other", spool.DecisionReject},
+		{ActionHashOnly, ReasonHashOnlyCap, spool.DecisionHashOnlyFileCap},
+		{ActionReject, ReasonRejectCap, spool.DecisionRejectFileCap},
+		{ActionHashOnly, ReasonInvalid, spool.DecisionInvalidMetadata},
+	}
+	for _, test := range tests {
+		if got := compactDecisionCode(test.action, test.reason); got != test.want {
+			t.Errorf("action=%s reason=%s code=%d want=%d", test.action, test.reason, got, test.want)
+		}
 	}
 }
 
@@ -92,31 +112,39 @@ func TestPolicyRejectsBudgetsOutsideClosedWireSchema(t *testing.T) {
 func TestInvalidMetadataBecomesExactHashOnly(t *testing.T) {
 	metadata := metadataWithFiles(1)
 	metadata.Files[0].Length = -1
-	decision := MustDefault().Decide(validHash, time.Time{}, "", metadata, "")
-	if decision.Action != ActionHashOnly || decision.Record.InfoHash != validHash || decision.Reason != ReasonInvalid {
+	decision := MustDefault().Decide(validHash, time.Time{}, metadata, "")
+	if decision.Action != ActionHashOnly || decision.Record.InfoHash != validHash ||
+		decision.Reason != ReasonInvalid || decision.Record.DecisionCode != spool.DecisionInvalidMetadata {
 		t.Fatalf("decision=%+v", decision)
 	}
 }
 
-func TestPolicyIDIsDeterministicAndConfigBound(t *testing.T) {
-	a := MustDefault()
-	b := MustDefault()
-	if a.ID() != b.ID() || len(a.ID()) != 64 {
-		t.Fatalf("non-deterministic policy IDs %q %q", a.ID(), b.ID())
+func TestRuntimePolicyConfigChangesDecisionWithoutPersistedIdentity(t *testing.T) {
+	metadata := metadataWithFiles(DefaultConfig().SummaryAboveFiles)
+	if got := MustDefault().Decide(validHash, time.Time{}, metadata, ""); got.Action != ActionFull {
+		t.Fatalf("default decision=%+v", got)
 	}
 	config := DefaultConfig()
-	config.SummaryAboveFiles++
-	c, err := New(config)
+	config.SummaryAboveFiles--
+	policy, err := New(config)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.ID() == a.ID() {
-		t.Fatal("policy ID did not change with canonical config")
+	decision := policy.Decide(validHash, time.Time{}, metadata, "")
+	if decision.Action != ActionSummary {
+		t.Fatalf("configured decision=%+v", decision)
+	}
+	encoded, err := json.Marshal(decision.Record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(encoded), "policy_id") {
+		t.Fatalf("policy identity leaked into record: %s", encoded)
 	}
 }
 
 func TestDecisionJSONHasNoRawOrPiecesFields(t *testing.T) {
-	decision := MustDefault().Decide(validHash, time.Now(), "jp", metadataWithFiles(3), "")
+	decision := MustDefault().Decide(validHash, time.Now(), metadataWithFiles(3), "")
 	encoded, err := json.Marshal(decision.Record)
 	if err != nil {
 		t.Fatal(err)
@@ -127,7 +155,8 @@ func TestDecisionJSONHasNoRawOrPiecesFields(t *testing.T) {
 		case map[string]any:
 			for key, child := range typed {
 				switch strings.ToLower(key) {
-				case "raw", "raw_bytes", "bencode", "pieces", "piece_hashes":
+				case "raw", "raw_bytes", "bencode", "pieces", "piece_hashes", "piece_length",
+					"policy_id", "region", "source", "reason", "hash_only", "reject":
 					t.Fatalf("forbidden key %q in %s", key, encoded)
 				}
 				walk(child)
@@ -151,7 +180,7 @@ func TestDecisionCanEnterTypedSpool(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer sp.Close()
-	decision := MustDefault().Decide(validHash, time.Now(), "jp", metadataWithFiles(2001), "")
+	decision := MustDefault().Decide(validHash, time.Now(), metadataWithFiles(2001), "")
 	if _, err := sp.AppendBatchDurable([]spool.Record{decision.Record}); err != nil {
 		t.Fatalf("append policy record: %v", err)
 	}
@@ -173,7 +202,7 @@ func BenchmarkDecide(b *testing.B) {
 		b.Run(fmt.Sprintf("files_%d", fileCount), func(b *testing.B) {
 			b.ReportAllocs()
 			for i := 0; i < b.N; i++ {
-				_ = policy.Decide(validHash, time.Time{}, "jp", metadata, "")
+				_ = policy.Decide(validHash, time.Time{}, metadata, "")
 			}
 		})
 	}
@@ -184,7 +213,7 @@ func BenchmarkDecide(b *testing.B) {
 	b.Run("files_10000_unique_extensions", func(b *testing.B) {
 		b.ReportAllocs()
 		for i := 0; i < b.N; i++ {
-			_ = policy.Decide(validHash, time.Time{}, "jp", metadata, "")
+			_ = policy.Decide(validHash, time.Time{}, metadata, "")
 		}
 	})
 }

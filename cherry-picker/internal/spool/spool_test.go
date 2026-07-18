@@ -316,29 +316,114 @@ func TestTypedZeroRawSchema(t *testing.T) {
 	if err := json.Unmarshal(encoded, &object); err != nil {
 		t.Fatal(err)
 	}
+	for _, field := range []string{"policy_id", "region", "source", "hash_only", "reject", "reason"} {
+		mutated := make(map[string]any, len(object)+1)
+		for key, value := range object {
+			mutated[key] = value
+		}
+		mutated[field] = "forbidden"
+		withDeletedField, _ := json.Marshal(mutated)
+		if _, err := decodeRecord(withDeletedField); err == nil {
+			t.Fatalf("deleted top-level field %q was accepted", field)
+		}
+	}
 	normalized := object["normalized"].(map[string]any)
 	normalized["raw"] = "forbidden"
 	withNestedRaw, _ := json.Marshal(object)
 	if _, err := decodeRecord(withNestedRaw); err == nil {
 		t.Fatal("nested raw field was accepted")
 	}
+	delete(normalized, "raw")
+	normalized["piece_length"] = 16 << 10
+	withPieceLength, _ := json.Marshal(object)
+	if _, err := decodeRecord(withPieceLength); err == nil {
+		t.Fatal("deleted piece_length field was accepted")
+	}
 
 	reject := Record{
-		Schema:    recordSchemaVersion,
-		CrawlerID: "c",
-		Epoch:     1,
-		Sequence:  1,
-		InfoHash:  fmt.Sprintf("%040x", 99),
-		Encoding:  EncodingReject,
-		Reject:    &RejectMetadata{Reason: "policy-noise"},
+		Schema:       recordSchemaVersion,
+		CrawlerID:    "c",
+		Epoch:        1,
+		Sequence:     1,
+		InfoHash:     fmt.Sprintf("%040x", 99),
+		Encoding:     EncodingReject,
+		DecisionCode: DecisionReject,
 	}
 	rejectJSON, err := reject.encode()
 	if err != nil {
 		t.Fatal(err)
 	}
 	decodedReject, err := decodeRecord(rejectJSON)
-	if err != nil || decodedReject.Encoding != EncodingReject || decodedReject.Reject == nil {
+	if err != nil || decodedReject.Encoding != EncodingReject || decodedReject.DecisionCode != DecisionReject ||
+		decodedReject.Normalized != nil || decodedReject.Summary != nil {
 		t.Fatalf("reject action lost: record=%+v err=%v", decodedReject, err)
+	}
+}
+
+func TestClosedDecisionCodesMatchEncoding(t *testing.T) {
+	tests := []struct {
+		encoding Encoding
+		code     DecisionCode
+		valid    bool
+	}{
+		{EncodingHashOnly, DecisionHashOnly, true},
+		{EncodingHashOnly, DecisionHashOnlyFileCap, true},
+		{EncodingHashOnly, DecisionInvalidMetadata, true},
+		{EncodingReject, DecisionReject, true},
+		{EncodingReject, DecisionRejectFileCap, true},
+		{EncodingHashOnly, DecisionReject, false},
+		{EncodingReject, DecisionHashOnly, false},
+		{EncodingHashOnly, 0, false},
+		{EncodingReject, 6, false},
+	}
+	for _, test := range tests {
+		record := Record{
+			InfoHash: fmt.Sprintf("%040x", int(test.code)+1), Encoding: test.encoding,
+			DecisionCode: test.code,
+		}
+		record.CrawlerID, record.Epoch, record.Sequence, record.Schema = "c", 1, 1, recordSchemaVersion
+		_, err := record.encode()
+		if (err == nil) != test.valid {
+			t.Errorf("encoding=%s code=%d err=%v valid=%v", test.encoding, test.code, err, test.valid)
+		}
+	}
+}
+
+func TestOpenFailsFastWithoutMutatingLegacyUnackedRecord(t *testing.T) {
+	dir := t.TempDir()
+	s := openTest(t, dir, nil)
+	appendDurable(t, s, testRecord(0))
+	segment := s.activePath
+	closeOK(t, s)
+
+	data, err := os.ReadFile(segment)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := string(data[headerSize:])
+	legacy := strings.Replace(payload, `"v":2`, `"v":1`, 1)
+	if legacy == payload {
+		t.Fatalf("record did not contain schema v2: %s", payload)
+	}
+	legacyFrame := encodeFrame([]byte(legacy))
+	if err := os.WriteFile(segment, legacyFrame, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	before := string(legacyFrame)
+
+	opened, err := Open(Options{Dir: dir, CrawlerID: "crawler-A"})
+	if opened != nil {
+		_ = opened.Close()
+	}
+	if !errors.Is(err, ErrIncompatibleSchema) || !errors.Is(err, ErrCorruption) {
+		t.Fatalf("legacy Open error=%v", err)
+	}
+	after, readErr := os.ReadFile(segment)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if string(after) != before {
+		t.Fatal("legacy spool was modified during fail-fast Open")
 	}
 }
 

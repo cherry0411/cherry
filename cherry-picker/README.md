@@ -69,7 +69,6 @@ Durations use Go duration strings such as `2s`, `30s`, or `10m`.
 - `CHERRY_PICKER_EXPORTER_HTTP_RETRIES`: HTTP batch retry count.
 - `CHERRY_PICKER_EXPORTER_RETRY_BACKOFF`: per-attempt retry backoff base duration.
 - `CHERRY_PICKER_CRAWLER_ID`: stable durable receipt identity; required with a spool and preserved across process restarts.
-- `CHERRY_PICKER_REGION`: low-cardinality source region such as `sg` or `jp`.
 - `CHERRY_PICKER_SPOOL_DIR`: enables the typed pre-send durable spool for the HTTP exporter.
 - `CHERRY_PICKER_SPOOL_MAX_BYTES`: local spool disk bound; defaults to 4 GiB when durable mode is enabled.
 - `CHERRY_API_KEY`: required by the durable HTTP exporter and sent as `X-API-Key`.
@@ -109,18 +108,32 @@ Adjust those paths if your deployment layout differs.
 
 ## Durable zero-raw delivery
 
-For production HTTP delivery, set a stable crawler ID, region, spool directory,
-API key and the normal batch endpoint. When the configured endpoint ends in
+For production HTTP delivery, set a stable crawler ID, spool directory, API key
+and the normal batch endpoint. When the configured endpoint ends in
 `/api/v1/torrents/batch`, durable mode upgrades it to
 `/api/v1/torrents/batch/durable`; an explicitly supplied durable/custom endpoint
 is left unchanged.
 
 Only the versioned `normalized`, `summary`, `hash_only`, or `reject` record is
-written to the spool. Raw bencode, `pieces`, and piece hashes are never written
-to the spool or HTTP body. A metadata hash becomes locally known only after its
-record has crossed the group-fsync boundary. The sender keeps one stable batch
-in flight and advances the local cursor only after an identity-, checksum-,
-range-, count-, and commit-matching ACK.
+written to the spool. Record schema v2 and durable envelope schema v2 omit
+region, policy identity, piece length, and free-text decision reasons.
+`normalized`/`summary` retain only bounded zero-raw details; `hash_only` and
+`reject` are bodyless and use the closed numeric `decision_code` set shared
+with the backend (1 through 5). Raw bencode, `pieces`, and piece hashes are
+never written to the spool or HTTP body. A metadata hash becomes locally known
+only after its record has crossed the group-fsync boundary. The sender keeps
+one stable batch in flight and advances the local cursor only after an
+identity-, checksum-, range-, count-, and commit-matching ACK.
+
+Record v1 is intentionally not auto-migrated: durable production had not been
+deployed when v2 was introduced, and rewriting an unacknowledged log in place
+would make its receipt/checksum history ambiguous. Opening a directory that
+still contains v1 frames fails with `spool: incompatible record schema` and
+does not modify or delete the directory. Stop the crawler, archive the complete
+old spool directory for audit, then point `CHERRY_PICKER_SPOOL_DIR` at a new
+empty directory. Do not edit the cursor or segment files by hand. There is no
+lossless v1-to-v2 exporter because deleted free-text policy fields have no
+durable meaning in v2.
 
 ## 2-core / 4-GB profiles
 

@@ -18,11 +18,8 @@ public sealed class SearchOutboxItemConfiguration : IEntityTypeConfiguration<Sea
                 "(lease_owner IS NOT NULL AND lease_until IS NOT NULL)");
         });
 
-        builder.HasKey(item => item.InfoHash);
-        builder.Property(item => item.InfoHash)
-            .HasColumnName("info_hash")
-            .HasMaxLength(40)
-            .IsRequired();
+        builder.HasKey(item => item.TorrentId);
+        builder.Property(item => item.TorrentId).HasColumnName("torrent_id");
         builder.Property(item => item.Generation).HasColumnName("generation");
         builder.Property(item => item.EnqueuedAt)
             .HasColumnName("enqueued_at")
@@ -46,7 +43,7 @@ public sealed class SearchOutboxItemConfiguration : IEntityTypeConfiguration<Sea
             .HasDatabaseName("idx_search_outbox_due");
         builder.HasOne<Torrent>()
             .WithMany()
-            .HasForeignKey(item => item.InfoHash)
+            .HasForeignKey(item => item.TorrentId)
             .OnDelete(DeleteBehavior.Cascade);
     }
 }

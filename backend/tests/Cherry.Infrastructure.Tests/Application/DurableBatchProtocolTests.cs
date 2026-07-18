@@ -10,11 +10,35 @@ namespace Cherry.Infrastructure.Tests.Application;
 
 public sealed class DurableBatchProtocolTests
 {
+    [Theory]
+    [InlineData(0)]
+    [InlineData(1)]
+    [InlineData(3)]
+    public void ValidateAndMap_RejectsMissingOrUnsupportedSchemaVersion(int schemaVersion)
+    {
+        var request = ValidRequest();
+        var incompatible = new DurableBatchRequest
+        {
+            SchemaVersion = schemaVersion,
+            CrawlerId = request.CrawlerId,
+            Epoch = request.Epoch,
+            StartSequence = request.StartSequence,
+            EndSequence = request.EndSequence,
+            PayloadSha256 = request.PayloadSha256,
+            Events = request.Events
+        };
+
+        var exception = Assert.Throws<DurableBatchValidationException>(() =>
+            DurableBatchValidator.ValidateAndMap(incompatible));
+        Assert.Contains("schema_version", exception.Message);
+    }
+
     [Fact]
     public void Parse_HashesTheExactRawEventsArrayBytes()
     {
-        const string rawEvents = "[\n  { \"info_hash\" : \"0000000000000000000000000000000000000001\", \"encoding\":\"hash_only\", \"hash_only\":{} }\n]";
+        const string rawEvents = "[\n  { \"info_hash\" : \"0000000000000000000000000000000000000001\", \"encoding\":\"hash_only\", \"decision_code\":1 }\n]";
         var json = "{" +
+                   "\"schema_version\":2," +
                    "\"crawler_id\":\"crawler-a\"," +
                    "\"epoch\":1," +
                    "\"start_sequence\":1," +
@@ -35,6 +59,7 @@ public sealed class DurableBatchProtocolTests
     public void Parse_RejectsDuplicateTopLevelEvents()
     {
         var json = "{" +
+                   "\"schema_version\":2," +
                    "\"crawler_id\":\"crawler-a\"," +
                    "\"epoch\":1," +
                    "\"start_sequence\":1," +
@@ -54,6 +79,7 @@ public sealed class DurableBatchProtocolTests
     public void Parse_RejectsUnknownLegacyRawFields()
     {
         var json = "{" +
+                   "\"schema_version\":2," +
                    "\"crawler_id\":\"crawler-a\"," +
                    "\"epoch\":1," +
                    "\"start_sequence\":1," +
@@ -81,14 +107,13 @@ public sealed class DurableBatchProtocolTests
                          "\"summary\":{\"name\":\"summary\",\"total_length\":100,\"file_count\":10," +
                          "\"representative_files\":[{\"path\":\"sample.bin\",\"length\":1}]," +
                          "\"extensions\":[{\"extension\":\".bin\",\"files\":10,\"bytes\":100}]}}," +
-                         "{\"info_hash\":\"" + HashFor(13) + "\",\"encoding\":\"hash_only\"," +
-                         "\"hash_only\":{\"reason\":\"capacity\"}}," +
-                         "{\"info_hash\":\"" + HashFor(14) + "\",\"encoding\":\"reject\"," +
-                         "\"reject\":{\"reason\":\"policy\"}}" +
+                         "{\"info_hash\":\"" + HashFor(13) + "\",\"encoding\":\"hash_only\",\"decision_code\":3}," +
+                         "{\"info_hash\":\"" + HashFor(14) + "\",\"encoding\":\"reject\",\"decision_code\":4}" +
                          "]";
         var checksum = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(eventsJson)))
             .ToLowerInvariant();
         var json = "{" +
+                   "\"schema_version\":2," +
                    "\"crawler_id\":\"crawler-a\",\"epoch\":1," +
                    "\"start_sequence\":1,\"end_sequence\":4," +
                    "\"payload_sha256\":\"" + checksum + "\"," +
@@ -101,16 +126,10 @@ public sealed class DurableBatchProtocolTests
         Assert.Equal(4, validated.EventCount);
         Assert.Equal(2, validated.Torrents.Count);
         Assert.Equal(2, validated.Decisions.Count);
-        Assert.Contains(validated.Torrents, torrent =>
-            torrent.RetainedLevel == MetadataRetentionLevel.Normalized);
-        Assert.Contains(validated.Torrents, torrent =>
-            torrent.RetainedLevel == MetadataRetentionLevel.Summary);
         Assert.Contains(validated.Decisions, decision =>
-            decision.Action == MetadataDecisionAction.HashOnly);
+            decision.DecisionCode == MetadataDecisionCode.HashOnlyFileCap);
         Assert.Contains(validated.Decisions, decision =>
-            decision.Action == MetadataDecisionAction.Reject);
-        Assert.All(validated.Torrents, torrent => Assert.False(torrent.NeedsRefetch));
-        Assert.All(validated.Decisions, decision => Assert.False(decision.NeedsRefetch));
+            decision.DecisionCode == MetadataDecisionCode.RejectFileCap);
     }
 
     [Fact]
@@ -125,8 +144,6 @@ public sealed class DurableBatchProtocolTests
         Assert.Equal(request.Events![0].InfoHash, torrent.InfoHash);
         Assert.Equal("example", torrent.Name);
         Assert.Equal(123, torrent.TotalLength);
-        Assert.Equal(16_384, torrent.PieceLength);
-        Assert.Equal("crawler-a", torrent.Source);
         Assert.Equal(123, Assert.Single(torrent.Files).Length);
     }
 
@@ -137,8 +154,6 @@ public sealed class DurableBatchProtocolTests
         {
             InfoHash = HashFor(2),
             Encoding = "summary",
-            PolicyId = "policy-a",
-            Region = "jp",
             Summary = new DurableSummaryMetadata
             {
                 Name = "large",
@@ -156,43 +171,30 @@ public sealed class DurableBatchProtocolTests
         var validated = DurableBatchValidator.ValidateAndMap(request);
 
         var torrent = Assert.Single(validated.Torrents);
-        Assert.Equal(MetadataRetentionLevel.Summary, torrent.RetainedLevel);
-        Assert.False(torrent.NeedsRefetch);
         Assert.Equal(100, torrent.FileCount);
         Assert.Single(torrent.Files);
         Assert.Single(torrent.ExtensionSummaries);
     }
 
     [Theory]
-    [InlineData("hash_only", MetadataDecisionAction.HashOnly)]
-    [InlineData("reject", MetadataDecisionAction.Reject)]
+    [InlineData("hash_only", MetadataDecisionCode.HashOnlyFileCap)]
+    [InlineData("reject", MetadataDecisionCode.RejectFileCap)]
     public void ValidateAndMap_PreservesTypedDecisions(
         string encoding,
-        MetadataDecisionAction expectedAction)
+        MetadataDecisionCode expectedCode)
     {
         var item = new DurableBatchEvent
         {
             InfoHash = HashFor(3),
             Encoding = encoding,
-            PolicyId = "policy-a",
-            Region = "jp",
-            HashOnly = encoding == "hash_only"
-                ? new DurableHashOnlyMetadata { Reason = "capacity" }
-                : null,
-            Reject = encoding == "reject"
-                ? new DurableRejectMetadata { Reason = "policy" }
-                : null
+            DecisionCode = (short)expectedCode
         };
 
         var validated = DurableBatchValidator.ValidateAndMap(ValidRequest(events: [item]));
 
         Assert.Empty(validated.Torrents);
         var decision = Assert.Single(validated.Decisions);
-        Assert.Equal(expectedAction, decision.Action);
-        Assert.Equal(MetadataRetentionLevel.HashOnly, decision.RetainedLevel);
-        Assert.False(decision.NeedsRefetch);
-        Assert.Equal("policy-a", decision.PolicyId);
-        Assert.Equal("jp", decision.Region);
+        Assert.Equal(expectedCode, decision.DecisionCode);
     }
 
     [Fact]
@@ -211,6 +213,7 @@ public sealed class DurableBatchProtocolTests
         List<DurableBatchEvent>? events = null) =>
         new()
         {
+            SchemaVersion = 2,
             CrawlerId = "crawler-a",
             Epoch = 1,
             StartSequence = 1,
@@ -227,7 +230,6 @@ public sealed class DurableBatchProtocolTests
                     {
                         Name = "example",
                         TotalLength = 123,
-                        PieceLength = 16_384,
                         Files = [new DurableBatchFile { Path = "example.bin", Length = 123 }]
                     }
                 }

@@ -116,8 +116,6 @@ type ExporterConfig struct {
 	// CrawlerID 是 durable spool/receipt 协议的稳定身份。它必须跨进程重启
 	// 保持不变，不能复用默认带 PID 的 InstanceID。
 	CrawlerID string
-	// Region 是低基数部署区域标签（如 sg/jp），用于跨区覆盖与热度分析。
-	Region string
 
 	// SpoolDir 启用崩溃安全的 pre-send durable spool（推荐用于 http 导出）。
 	// 非空时，metadata 事件先落 spool 再经 durable 批次协议投递，替代
@@ -211,7 +209,6 @@ func Load() (Config, error) {
 			APIKey:         getenvDefault("CHERRY_API_KEY", ""),
 			OracleAPIKey:   strings.TrimSpace(os.Getenv("CHERRY_PICKER_ORACLE_API_KEY")),
 			CrawlerID:      strings.TrimSpace(os.Getenv("CHERRY_PICKER_CRAWLER_ID")),
-			Region:         strings.TrimSpace(os.Getenv("CHERRY_PICKER_REGION")),
 			SpoolDir:       getenvDefault("CHERRY_PICKER_SPOOL_DIR", ""),
 			SpoolMaxBytes:  int64(getenvInt("CHERRY_PICKER_SPOOL_MAX_BYTES", 0)),
 		},
@@ -310,7 +307,6 @@ func loadFromFile(path string) (Config, error) {
 			APIKey:         strings.TrimSpace(raw.Exporter.APIKey),
 			OracleAPIKey:   strings.TrimSpace(raw.Exporter.OracleAPIKey),
 			CrawlerID:      strings.TrimSpace(raw.Exporter.CrawlerID),
-			Region:         strings.TrimSpace(raw.Exporter.Region),
 			SpoolDir:       strings.TrimSpace(raw.Exporter.SpoolDir),
 			SpoolMaxBytes:  raw.Exporter.SpoolMaxBytes,
 		},
@@ -514,7 +510,6 @@ type fileExporterConfig struct {
 	APIKey         string `json:"api_key"`
 	OracleAPIKey   string `json:"oracle_api_key"`
 	CrawlerID      string `json:"crawler_id"`
-	Region         string `json:"region"`
 	SpoolDir       string `json:"spool_dir"`
 	SpoolMaxBytes  int64  `json:"spool_max_bytes"`
 }

@@ -19,9 +19,9 @@ public class MeiliSearchClient
         var settings = JsonSerializer.Serialize(new
         {
             searchableAttributes = new[] { "name" },
-            sortableAttributes = new[] { "createdAt", "fileCount", "peerCount", "totalLength" },
-            filterableAttributes = new[] { "fileCount", "totalLength", "isPrivate", "peerCount" },
-            rankingRules = new[] { "sort", "createdAt:desc", "words", "exactness" },
+            sortableAttributes = new[] { "firstSeen" },
+            filterableAttributes = Array.Empty<string>(),
+            rankingRules = new[] { "words", "typo", "proximity", "attribute", "sort", "exactness" },
             typoTolerance = new
             {
                 minWordSizeForTypos = new { oneTypo = 5, twoTypos = 8 },
@@ -30,7 +30,7 @@ public class MeiliSearchClient
             }
         });
         var content = new StringContent(settings, Encoding.UTF8, "application/json");
-        var body = JsonSerializer.Serialize(new { uid = "torrents", primaryKey = "infoHash" });
+        var body = JsonSerializer.Serialize(new { uid = "torrents", primaryKey = "id" });
         await _http.PostAsync("/indexes", new StringContent(body, Encoding.UTF8, "application/json"), ct);
         await _http.PatchAsync("/indexes/torrents/settings", content, ct);
     }
@@ -41,13 +41,9 @@ public class MeiliSearchClient
     {
         var docs = torrents.Select(t => new
         {
-            infoHash = t.InfoHash,
+            id = t.Id,
             name = t.Name,
-            totalLength = t.TotalLength,
-            fileCount = t.FileCount,
-            isPrivate = t.IsPrivate,
-            peerCount = t.PeerCount,
-            createdAt = new DateTimeOffset(t.CreatedAt, TimeSpan.Zero).ToUnixTimeMilliseconds()
+            firstSeen = new DateTimeOffset(t.CreatedAt, TimeSpan.Zero).ToUnixTimeMilliseconds()
         }).ToList();
 
         var body = JsonSerializer.Serialize(docs);
@@ -108,8 +104,8 @@ public class MeiliSearchClient
             q = query,
             offset = (page - 1) * pageSize,
             limit = pageSize,
-            sort = new[] { "peerCount:desc" },
-            attributesToRetrieve = new[] { "infoHash" },
+            sort = new[] { "firstSeen:desc" },
+            attributesToRetrieve = new[] { "id" },
             matchingStrategy = SearchHelper.IsCjkQuery(query) ? "all" : "last"
         });
 
@@ -137,8 +133,8 @@ public class MeiliSearchResult
 
 public class MeiliHit
 {
-    [JsonPropertyName("infoHash")]
-    public string InfoHash { get; set; } = string.Empty;
+    [JsonPropertyName("id")]
+    public long Id { get; set; }
 }
 
 public static class SearchHelper

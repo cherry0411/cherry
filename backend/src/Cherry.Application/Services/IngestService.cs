@@ -216,16 +216,10 @@ public sealed class IngestService : IHostedService
                 new BatchIngestResponse(accepted, duplicates, workItem.Errors));
         }
 
-        var sources = prepared
-            .Select(item => item.Torrent.Source)
-            .Where(source => source is not null)
-            .Distinct()
-            .OrderBy(source => source);
         _logger.LogInformation(
-            "Exact batch committed: {Total} events -> {Inserted} new from [{Sources}]",
+            "Exact batch committed: {Total} events -> {Inserted} new",
             prepared.Count,
-            inserted.Count,
-            string.Join(", ", sources));
+            inserted.Count);
     }
 
     private static bool TryPrepare(CrawlerEvent? crawlerEvent, out PreparedEvent preparedEvent)
@@ -250,13 +244,8 @@ public sealed class IngestService : IHostedService
         {
             InfoHash = infoHash,
             Name = metadata.Name,
-            PieceLength = metadata.PieceLength,
             TotalLength = metadata.Length,
             FileCount = metadata.FileCount,
-            IsPrivate = metadata.Private,
-            Source = (crawlerEvent.InstanceId ?? string.Empty) is { Length: > 32 } source
-                ? source[..32]
-                : crawlerEvent.InstanceId ?? string.Empty,
             Files = metadata.Files.Select(file => new TorrentFile
             {
                 PathText = file.PathText,

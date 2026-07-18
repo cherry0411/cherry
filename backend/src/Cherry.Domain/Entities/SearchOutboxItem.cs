@@ -7,7 +7,7 @@ namespace Cherry.Domain.Entities;
 /// </summary>
 public sealed class SearchOutboxItem
 {
-    public string InfoHash { get; set; } = string.Empty;
+    public long TorrentId { get; set; }
     public long Generation { get; set; } = 1;
     public DateTime EnqueuedAt { get; set; } = DateTime.UtcNow;
     public DateTime AvailableAt { get; set; } = DateTime.UtcNow;

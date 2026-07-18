@@ -171,7 +171,6 @@ public sealed class IngestServiceTests
         {
             Name = "test",
             Length = 123,
-            PieceLength = 16_384,
             FileCount = 1,
             Files = [new CrawlerFile { PathText = "test.bin", Length = 123 }]
         }

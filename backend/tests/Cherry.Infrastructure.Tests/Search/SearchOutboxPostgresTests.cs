@@ -24,6 +24,7 @@ public sealed class SearchOutboxPostgresTests
         await using var provider = fixture.Provider;
         var hash = HashFor(Guid.NewGuid());
         await InsertLegacyAsync(provider, hash);
+        var torrentId = await TorrentIdAsync(provider, hash);
 
         var responses = new Queue<Func<HttpRequestMessage, HttpResponseMessage>>([
             request => Json(HttpStatusCode.Accepted, "{\"taskUid\":41}"),
@@ -42,7 +43,7 @@ public sealed class SearchOutboxPostgresTests
         await using (var scope = provider.CreateAsyncScope())
         {
             var item = await scope.ServiceProvider.GetRequiredService<AppDbContext>()
-                .SearchOutbox.SingleAsync(row => row.InfoHash == hash);
+                .SearchOutbox.SingleAsync(row => row.TorrentId == torrentId);
             Assert.Equal(1, item.AttemptCount);
             Assert.Contains("bad document", item.LastError);
         }
@@ -52,7 +53,7 @@ public sealed class SearchOutboxPostgresTests
         await using (var scope = provider.CreateAsyncScope())
         {
             var item = await scope.ServiceProvider.GetRequiredService<AppDbContext>()
-                .SearchOutbox.SingleAsync(row => row.InfoHash == hash);
+                .SearchOutbox.SingleAsync(row => row.TorrentId == torrentId);
             Assert.Equal(2, item.AttemptCount);
             Assert.Contains("canceled", item.LastError, StringComparison.OrdinalIgnoreCase);
         }
@@ -62,7 +63,7 @@ public sealed class SearchOutboxPostgresTests
         await using (var scope = provider.CreateAsyncScope())
         {
             var item = await scope.ServiceProvider.GetRequiredService<AppDbContext>()
-                .SearchOutbox.SingleAsync(row => row.InfoHash == hash);
+                .SearchOutbox.SingleAsync(row => row.TorrentId == torrentId);
             Assert.Equal(3, item.AttemptCount);
             Assert.Contains("unavailable", item.LastError, StringComparison.OrdinalIgnoreCase);
         }
@@ -72,7 +73,7 @@ public sealed class SearchOutboxPostgresTests
         await using (var scope = provider.CreateAsyncScope())
         {
             Assert.False(await scope.ServiceProvider.GetRequiredService<AppDbContext>()
-                .SearchOutbox.AnyAsync(row => row.InfoHash == hash));
+                .SearchOutbox.AnyAsync(row => row.TorrentId == torrentId));
         }
 
         var metrics = provider.GetRequiredService<SearchOutboxMetrics>().Snapshot();
@@ -90,6 +91,7 @@ public sealed class SearchOutboxPostgresTests
         await using var provider = fixture.Provider;
         var hash = HashFor(Guid.NewGuid());
         await InsertLegacyAsync(provider, hash);
+        var torrentId = await TorrentIdAsync(provider, hash);
 
         // Simulate a worker that submitted an idempotent document upsert and
         // observed success, then died before its generation-fenced DELETE.
@@ -114,9 +116,9 @@ public sealed class SearchOutboxPostgresTests
         await using (var scope = provider.CreateAsyncScope())
         {
             var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
-            Assert.True(await db.SearchOutbox.AnyAsync(row => row.InfoHash == hash));
+            Assert.True(await db.SearchOutbox.AnyAsync(row => row.TorrentId == torrentId));
             await db.SearchOutbox
-                .Where(row => row.InfoHash == hash)
+                .Where(row => row.TorrentId == torrentId)
                 .ExecuteUpdateAsync(setters => setters
                     .SetProperty(row => row.LeaseUntil, DateTime.UtcNow.AddSeconds(-1)));
         }
@@ -134,7 +136,7 @@ public sealed class SearchOutboxPostgresTests
 
         await using var finalScope = provider.CreateAsyncScope();
         Assert.False(await finalScope.ServiceProvider.GetRequiredService<AppDbContext>()
-            .SearchOutbox.AnyAsync(row => row.InfoHash == hash));
+            .SearchOutbox.AnyAsync(row => row.TorrentId == torrentId));
     }
 
     [Fact]
@@ -146,6 +148,7 @@ public sealed class SearchOutboxPostgresTests
         await using var provider = fixture.Provider;
         var hash = HashFor(Guid.NewGuid());
         await InsertLegacyAsync(provider, hash);
+        var torrentId = await TorrentIdAsync(provider, hash);
 
         var upgraded = false;
         var handler = new DelegateHandler(async request =>
@@ -161,7 +164,7 @@ public sealed class SearchOutboxPostgresTests
                 var connection = (NpgsqlConnection)db.Database.GetDbConnection();
                 await connection.OpenAsync();
                 await using var transaction = await connection.BeginTransactionAsync();
-                await SearchOutboxWriter.EnqueueAsync([hash], connection, transaction, CancellationToken.None);
+                await SearchOutboxWriter.EnqueueAsync([torrentId], connection, transaction, CancellationToken.None);
                 await transaction.CommitAsync();
             }
             return Json(HttpStatusCode.OK, "{\"status\":\"succeeded\"}");
@@ -173,7 +176,7 @@ public sealed class SearchOutboxPostgresTests
         await using (var scope = provider.CreateAsyncScope())
         {
             var item = await scope.ServiceProvider.GetRequiredService<AppDbContext>()
-                .SearchOutbox.SingleAsync(row => row.InfoHash == hash);
+                .SearchOutbox.SingleAsync(row => row.TorrentId == torrentId);
             Assert.Equal(2, item.Generation);
             Assert.Null(item.LeaseOwner);
         }
@@ -181,11 +184,11 @@ public sealed class SearchOutboxPostgresTests
         await using (var scope = provider.CreateAsyncScope())
         {
             var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
-            await db.SearchOutbox.Where(row => row.InfoHash == hash).ExecuteDeleteAsync();
+            await db.SearchOutbox.Where(row => row.TorrentId == torrentId).ExecuteDeleteAsync();
             var rebuilt = await scope.ServiceProvider.GetRequiredService<SearchOutboxStore>()
                 .RebuildAsync();
             Assert.True(rebuilt >= 1);
-            Assert.True(await db.SearchOutbox.AnyAsync(row => row.InfoHash == hash));
+            Assert.True(await db.SearchOutbox.AnyAsync(row => row.TorrentId == torrentId));
         }
     }
 
@@ -198,6 +201,7 @@ public sealed class SearchOutboxPostgresTests
         await using var provider = fixture.Provider;
         var hash = HashFor(Guid.NewGuid());
         await InsertLegacyAsync(provider, hash);
+        var torrentId = await TorrentIdAsync(provider, hash);
 
         await using var firstScope = provider.CreateAsyncScope();
         var firstStore = firstScope.ServiceProvider.GetRequiredService<SearchOutboxStore>();
@@ -208,7 +212,7 @@ public sealed class SearchOutboxPostgresTests
         {
             var db = expireScope.ServiceProvider.GetRequiredService<AppDbContext>();
             await db.SearchOutbox
-                .Where(row => row.InfoHash == hash)
+                .Where(row => row.TorrentId == torrentId)
                 .ExecuteUpdateAsync(setters => setters
                     .SetProperty(row => row.LeaseUntil, DateTime.UtcNow.AddSeconds(-1)));
         }
@@ -252,13 +256,21 @@ public sealed class SearchOutboxPostgresTests
             {
                 InfoHash = hash,
                 Name = "search-outbox-test",
-                PieceLength = 16_384,
                 TotalLength = 100,
                 FileCount = 1,
                 Files = [new TorrentFile { PathText = "test.bin", Length = 100 }]
             }
         ]);
         Assert.Contains(hash, inserted);
+    }
+
+    private static async Task<long> TorrentIdAsync(ServiceProvider provider, string hash)
+    {
+        await using var scope = provider.CreateAsyncScope();
+        return await scope.ServiceProvider.GetRequiredService<AppDbContext>()
+            .Torrents.Where(torrent => torrent.InfoHash == hash)
+            .Select(torrent => torrent.Id)
+            .SingleAsync();
     }
 
     private static async Task<Fixture?> CreateFixtureAsync()

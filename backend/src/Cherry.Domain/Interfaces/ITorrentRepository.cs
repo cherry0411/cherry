@@ -15,8 +15,6 @@ public interface ITorrentRepository
     Task<List<string>> CheckExistsAsync(List<string> hashes, CancellationToken ct = default);
     Task<List<string>> CheckProcessedAsync(List<string> hashes, CancellationToken ct = default);
     IAsyncEnumerable<string> StreamProcessedHashesAsync(CancellationToken ct = default);
-    Task BatchUpdatePeerCountsAsync(Dictionary<string, int> counts, CancellationToken ct = default);
-    Task DecayPeerCountsAsync(CancellationToken ct = default);
     Task<long> GetTotalCountAsync(CancellationToken ct = default);
     Task<long> GetTodayCountAsync(CancellationToken ct = default);
     Task MarkRequestsDoneAsync(IEnumerable<string> infoHashes, CancellationToken ct = default);

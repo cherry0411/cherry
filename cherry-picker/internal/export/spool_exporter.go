@@ -143,6 +143,7 @@ func (e *SpoolExporter) sendBatch(ctx context.Context, batch spool.Batch) error 
 	// RawMessage guarantees the bytes covered by checksum are the bytes placed
 	// in the request's events value. The backend hashes that raw JSON slice.
 	wire := struct {
+		SchemaVersion int             `json:"schema_version"`
 		CrawlerID     string          `json:"crawler_id"`
 		Epoch         uint64          `json:"epoch"`
 		StartSequence uint64          `json:"start_sequence"`
@@ -150,6 +151,7 @@ func (e *SpoolExporter) sendBatch(ctx context.Context, batch spool.Batch) error 
 		PayloadSHA256 string          `json:"payload_sha256"`
 		Events        json.RawMessage `json:"events"`
 	}{
+		SchemaVersion: durableProtocolSchemaVersion,
 		CrawlerID:     batch.CrawlerID,
 		Epoch:         batch.Epoch,
 		StartSequence: batch.StartSeq,

@@ -9,7 +9,7 @@ namespace Cherry.Infrastructure.Tests.Repositories;
 public sealed class StorageSchemaPostgresTests
 {
     [Fact]
-    public async Task CurrentSchema_KeepsHashLookupButOmitsUnusedTrigramIndexes()
+    public async Task CurrentSchema_UsesCompactCatalogAndOmitsWideLegacyIndexes()
     {
         var connectionString = Environment.GetEnvironmentVariable("CHERRY_TEST_POSTGRES");
         if (string.IsNullOrWhiteSpace(connectionString))
@@ -40,7 +40,10 @@ public sealed class StorageSchemaPostgresTests
             indexes.Add(reader.GetString(0));
 
         Assert.Contains("PK_torrents", indexes);
-        Assert.Contains("idx_torrent_files_info_hash", indexes);
+        Assert.Contains("ux_torrents_info_hash", indexes);
+        Assert.Contains("idx_torrent_files_torrent_id", indexes);
+        Assert.DoesNotContain("idx_torrent_files_info_hash", indexes);
+        Assert.DoesNotContain("idx_torrents_peer_count", indexes);
         Assert.DoesNotContain("idx_torrents_name_trgm", indexes);
         Assert.DoesNotContain("idx_torrent_files_path", indexes);
     }

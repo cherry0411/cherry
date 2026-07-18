@@ -97,8 +97,12 @@ public sealed class DurableIngestPostgresTests
         Assert.Equal(firstResult.Response.Accepted, replay.Response.Accepted);
         Assert.Equal(firstResult.Response.Duplicates, replay.Response.Duplicates);
         Assert.Equal(1, await db.Torrents.CountAsync(t => t.InfoHash == firstHash));
-        Assert.Equal(1, await db.TorrentFiles.CountAsync(f => f.InfoHash == firstHash));
-        Assert.Equal(1, await db.SearchOutbox.CountAsync(item => item.InfoHash == firstHash));
+        var firstTorrentId = await db.Torrents
+            .Where(torrent => torrent.InfoHash == firstHash)
+            .Select(torrent => torrent.Id)
+            .SingleAsync();
+        Assert.Equal(1, await db.TorrentFiles.CountAsync(f => f.TorrentId == firstTorrentId));
+        Assert.Equal(1, await db.SearchOutbox.CountAsync(item => item.TorrentId == firstTorrentId));
 
         var gapHash = HashFor(Guid.NewGuid());
         var gap = await service.IngestAsync(Batch(crawlerId, epoch, 3, gapHash));
@@ -153,26 +157,24 @@ public sealed class DurableIngestPostgresTests
         Assert.Equal(0, receipt.LastDuplicates);
         Assert.Equal(2, await db.Torrents.CountAsync(
             torrent => torrent.InfoHash == firstHash || torrent.InfoHash == summaryHash));
-        Assert.Equal(2, await db.TorrentFiles.CountAsync(
-            file => file.InfoHash == firstHash || file.InfoHash == summaryHash));
-        Assert.Equal(2, await db.SearchOutbox.CountAsync(
-            item => item.InfoHash == firstHash || item.InfoHash == summaryHash));
+        var torrentIds = await db.Torrents
+            .Where(torrent => torrent.InfoHash == firstHash || torrent.InfoHash == summaryHash)
+            .Select(torrent => torrent.Id)
+            .ToListAsync();
+        Assert.Equal(2, await db.TorrentFiles.CountAsync(file => torrentIds.Contains(file.TorrentId)));
+        Assert.Equal(2, await db.SearchOutbox.CountAsync(item => torrentIds.Contains(item.TorrentId)));
 
         var summary = await db.Torrents.SingleAsync(torrent => torrent.InfoHash == summaryHash);
-        Assert.Equal(MetadataRetentionLevel.Summary, summary.RetainedLevel);
-        Assert.False(summary.NeedsRefetch);
         Assert.Equal(100, summary.FileCount);
         Assert.Equal(1, await db.TorrentExtensionSummaries.CountAsync(
-            extension => extension.InfoHash == summaryHash));
+            extension => extension.TorrentId == summary.Id));
 
         var hashOnly = await db.MetadataDecisions.SingleAsync(
             decision => decision.InfoHash == Convert.FromHexString(hashOnlyHash));
-        Assert.Equal(MetadataDecisionAction.HashOnly, hashOnly.Action);
-        Assert.False(hashOnly.NeedsRefetch);
+        Assert.Equal(MetadataDecisionCode.HashOnlyFileCap, hashOnly.DecisionCode);
         var reject = await db.MetadataDecisions.SingleAsync(
             decision => decision.InfoHash == Convert.FromHexString(rejectHash));
-        Assert.Equal(MetadataDecisionAction.Reject, reject.Action);
-        Assert.False(reject.NeedsRefetch);
+        Assert.Equal(MetadataDecisionCode.RejectFileCap, reject.DecisionCode);
 
         var repository = new TorrentRepository(db, processedHashFilter: new RecordingProcessedHashFilter());
         var terminallyProcessed = await repository.CheckProcessedAsync(
@@ -192,13 +194,10 @@ public sealed class DurableIngestPostgresTests
         var eventsJson = "[{" +
                          "\"info_hash\":\"" + infoHash + "\"," +
                          "\"encoding\":\"normalized\"," +
-                         "\"policy_id\":\"integration-test\"," +
                          "\"first_seen\":\"2026-07-18T00:00:00Z\"," +
-                         "\"region\":\"test\"," +
                          "\"normalized\":{" +
                          "\"name\":\"integration-test\"," +
                          "\"total_length\":100," +
-                         "\"piece_length\":16384," +
                          "\"files\":[{\"path\":\"test.bin\",\"length\":100}]" +
                          "}}]";
         return BatchFromEvents(crawlerId, epoch, sequence, eventsJson);
@@ -215,9 +214,7 @@ public sealed class DurableIngestPostgresTests
         var eventsJson = "[" +
                          "{\"info_hash\":\"" + summaryHash + "\"," +
                          "\"encoding\":\"summary\"," +
-                         "\"policy_id\":\"integration-test\"," +
                          "\"first_seen\":\"2026-07-18T00:00:00Z\"," +
-                         "\"region\":\"jp\"," +
                          "\"summary\":{" +
                          "\"name\":\"large-summary\"," +
                          "\"total_length\":1000," +
@@ -227,14 +224,10 @@ public sealed class DurableIngestPostgresTests
                          "}}," +
                          "{\"info_hash\":\"" + hashOnlyHash + "\"," +
                          "\"encoding\":\"hash_only\"," +
-                         "\"policy_id\":\"integration-test\"," +
-                         "\"region\":\"jp\"," +
-                         "\"hash_only\":{\"reason\":\"capacity\"}}," +
+                         "\"decision_code\":3}," +
                          "{\"info_hash\":\"" + rejectHash + "\"," +
                          "\"encoding\":\"reject\"," +
-                         "\"policy_id\":\"integration-test\"," +
-                         "\"region\":\"jp\"," +
-                         "\"reject\":{\"reason\":\"policy\"}}" +
+                         "\"decision_code\":4}" +
                          "]";
         return BatchFromEvents(crawlerId, epoch, startSequence, eventsJson);
     }
@@ -249,9 +242,7 @@ public sealed class DurableIngestPostgresTests
         var eventsJson = "[{" +
                          "\"info_hash\":\"" + infoHash + "\"," +
                          "\"encoding\":\"" + encoding + "\"," +
-                         "\"policy_id\":\"integration-test\"," +
-                         "\"region\":\"test\"," +
-                         "\"" + encoding + "\":{\"reason\":\"test\"}" +
+                         "\"decision_code\":" + (encoding == "reject" ? "2" : "1") +
                          "}]";
         return BatchFromEvents(crawlerId, epoch, sequence, eventsJson);
     }
@@ -269,6 +260,7 @@ public sealed class DurableIngestPostgresTests
         var checksum = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(eventsJson)))
             .ToLowerInvariant();
         var json = "{" +
+                   "\"schema_version\":2," +
                    "\"crawler_id\":\"" + crawlerId + "\"," +
                    "\"epoch\":" + epoch + "," +
                    "\"start_sequence\":" + startSequence + "," +
@@ -284,6 +276,7 @@ public sealed class DurableIngestPostgresTests
         string checksum) =>
         new()
         {
+            SchemaVersion = request.SchemaVersion,
             CrawlerId = request.CrawlerId,
             Epoch = request.Epoch,
             StartSequence = request.StartSequence,

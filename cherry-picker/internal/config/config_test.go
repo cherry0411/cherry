@@ -103,7 +103,6 @@ func TestLoadActiveLookupFromEnvironment(t *testing.T) {
 func TestLoadDurableIdentityAndStoragePolicyFromEnvironment(t *testing.T) {
 	t.Setenv("CHERRY_PICKER_CONFIG", "")
 	t.Setenv("CHERRY_PICKER_CRAWLER_ID", "jp-1")
-	t.Setenv("CHERRY_PICKER_REGION", "jp")
 	t.Setenv("CHERRY_PICKER_ORACLE_URL", " https://oracle.example/ ")
 	t.Setenv("CHERRY_PICKER_ORACLE_API_KEY", " oracle-secret ")
 	t.Setenv("CHERRY_PICKER_POLICY_SUMMARY_FILES", "2500")
@@ -115,7 +114,7 @@ func TestLoadDurableIdentityAndStoragePolicyFromEnvironment(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
-	if cfg.Exporter.CrawlerID != "jp-1" || cfg.Exporter.Region != "jp" {
+	if cfg.Exporter.CrawlerID != "jp-1" {
 		t.Fatalf("durable identity = %+v", cfg.Exporter)
 	}
 	if cfg.Exporter.OracleEndpoint != "https://oracle.example/" ||

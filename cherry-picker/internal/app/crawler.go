@@ -433,9 +433,9 @@ func (a *Application) Run(ctx context.Context) error {
 		// Cheap peer/stats events are deliberately not sent to the durable
 		// metadata endpoint, but must still be drained to avoid filling events.
 		go drainEvents(ctx, events)
-		a.logger.Printf("durable spool enabled: dir=%s crawler_id=%s region=%s epoch=%d policy_id=%s max_bytes=%d",
-			a.cfg.Exporter.SpoolDir, a.cfg.Exporter.CrawlerID, a.cfg.Exporter.Region,
-			sp.Epoch(), a.storagePolicy.ID(), a.cfg.Exporter.SpoolMaxBytes)
+		a.logger.Printf("durable spool enabled: dir=%s crawler_id=%s epoch=%d record_schema=2 max_bytes=%d",
+			a.cfg.Exporter.SpoolDir, a.cfg.Exporter.CrawlerID,
+			sp.Epoch(), a.cfg.Exporter.SpoolMaxBytes)
 	} else {
 		s, err := export.NewSink(a.cfg.Exporter)
 		if err != nil {
@@ -1358,7 +1358,7 @@ func (a *Application) consumeMetadata(
 
 			if durable != nil {
 				decision := a.storagePolicy.Decide(
-					ihHex, event.Timestamp, a.cfg.Exporter.Region, metadata, string(filterReason),
+					ihHex, event.Timestamp, metadata, string(filterReason),
 				)
 				if err := durable.Submit(ctx, decision.Record); err != nil {
 					stats.metadataEventsDropped.Add(1)

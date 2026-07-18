@@ -381,7 +381,7 @@ func (s *Spool) recover(cursorExists bool) error {
 		res, scanErr := scanSegment(path, id, func(_ segmentID, _, _ int64, payload []byte) error {
 			rec, err := decodeRecord(payload)
 			if err != nil {
-				return fmt.Errorf("%w: invalid typed record in %s: %v", ErrCorruption, segmentName(id), err)
+				return fmt.Errorf("%w: invalid typed record in %s: %w", ErrCorruption, segmentName(id), err)
 			}
 			if rec.CrawlerID != s.cursor.CrawlerID || rec.Epoch != s.cursor.Epoch {
 				return fmt.Errorf("%w: record identity mismatch in %s", ErrCorruption, segmentName(id))

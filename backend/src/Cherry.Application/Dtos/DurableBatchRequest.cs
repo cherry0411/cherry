@@ -5,6 +5,9 @@ namespace Cherry.Application.Dtos;
 [JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
 public sealed class DurableBatchRequest
 {
+    [JsonPropertyName("schema_version")]
+    public int SchemaVersion { get; init; }
+
     [JsonPropertyName("crawler_id")]
     public string? CrawlerId { get; init; }
 
@@ -33,14 +36,11 @@ public sealed class DurableBatchEvent
     [JsonPropertyName("encoding")]
     public string? Encoding { get; init; }
 
-    [JsonPropertyName("policy_id")]
-    public string? PolicyId { get; init; }
-
     [JsonPropertyName("first_seen")]
     public DateTimeOffset? FirstSeen { get; init; }
 
-    [JsonPropertyName("region")]
-    public string? Region { get; init; }
+    [JsonPropertyName("decision_code")]
+    public short DecisionCode { get; init; }
 
     [JsonPropertyName("normalized")]
     public DurableNormalizedMetadata? Normalized { get; init; }
@@ -48,11 +48,6 @@ public sealed class DurableBatchEvent
     [JsonPropertyName("summary")]
     public DurableSummaryMetadata? Summary { get; init; }
 
-    [JsonPropertyName("hash_only")]
-    public DurableHashOnlyMetadata? HashOnly { get; init; }
-
-    [JsonPropertyName("reject")]
-    public DurableRejectMetadata? Reject { get; init; }
 }
 
 [JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
@@ -63,9 +58,6 @@ public sealed class DurableNormalizedMetadata
 
     [JsonPropertyName("total_length")]
     public ulong TotalLength { get; init; }
-
-    [JsonPropertyName("piece_length")]
-    public uint PieceLength { get; init; }
 
     [JsonPropertyName("files")]
     public List<DurableBatchFile>? Files { get; init; }
@@ -111,20 +103,6 @@ public sealed class DurableExtensionSummary
 
     [JsonPropertyName("bytes")]
     public ulong Bytes { get; init; }
-}
-
-[JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
-public sealed class DurableHashOnlyMetadata
-{
-    [JsonPropertyName("reason")]
-    public string? Reason { get; init; }
-}
-
-[JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
-public sealed class DurableRejectMetadata
-{
-    [JsonPropertyName("reason")]
-    public string? Reason { get; init; }
 }
 
 [JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
