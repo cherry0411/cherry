@@ -73,6 +73,10 @@ scripts/run-crawler-abab.sh \
   --config-b configs/candidate.json --binary-b bin/crawler-b
 ```
 
+For config-only experiments, both arms may use the same template and binary;
+repeatable `--set-a PATH=JSON_VALUE` and `--set-b PATH=JSON_VALUE` overrides
+define each treatment without creating throwaway config files.
+
 The first adjacent pair is randomized, then `AB` and `BA` pair orders alternate
 to balance time/oracle depletion. `--blocks` counts runs, so 12 blocks produce
 six treatment pairs. Both arms share the same identity cohort and global oracle,

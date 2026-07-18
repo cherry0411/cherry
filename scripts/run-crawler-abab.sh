@@ -16,6 +16,7 @@ warmup=10m
 measure=60m
 cohort=primary
 config_a=""; config_b=""; binary_a=""; binary_b=""
+declare -a overrides_a=() overrides_b=()
 
 while (($#)); do
   case "$1" in
@@ -32,6 +33,8 @@ while (($#)); do
     --config-b) config_b="$2"; shift 2 ;;
     --binary-a) binary_a="$2"; shift 2 ;;
     --binary-b) binary_b="$2"; shift 2 ;;
+    --set-a) overrides_a+=("$2"); shift 2 ;;
+    --set-b) overrides_b+=("$2"); shift 2 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
@@ -68,7 +71,10 @@ ${dry_run} && exit 0
 for ((block=1; block<=blocks; block++)); do
   arm="${plan:block-1:1}"
   if [[ "${arm}" == A ]]; then config="${config_a}"; binary="${binary_a}"; else config="${config_b}"; binary="${binary_b}"; fi
-  "${SCRIPT_DIR}/run-crawler-benchmark.sh" \
+  command=("${SCRIPT_DIR}/run-crawler-benchmark.sh" \
     --label "${label}-block${block}" --experiment "${experiment}" --variant "${arm}" --mode steady --cohort "${cohort}" \
-    --warmup "${warmup}" --measure "${measure}" --config "${config}" --binary "${binary}"
+    --warmup "${warmup}" --measure "${measure}" --config "${config}" --binary "${binary}")
+  if [[ "${arm}" == A ]]; then selected_overrides=("${overrides_a[@]}"); else selected_overrides=("${overrides_b[@]}"); fi
+  for override in "${selected_overrides[@]}"; do command+=(--set "${override}"); done
+  "${command[@]}"
 done
