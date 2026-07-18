@@ -308,12 +308,23 @@ calendar-day 的唯一网络 actor-days：同一资源、同一公网 IPv4（IPv
 天内无论端口、node ID、两区域、crawler 重启和 HTTP 重放只贡献一次；跨日再次出现
 可再次贡献一次，以表达持续活跃。
 
-```text
-heat_actor_day(day, torrent_id, actor_fp64, signals, region_mask)
-torrent_heat_daily(day, torrent_id, activity_actor_days, announce_actor_days)
-torrent_heat(torrent_id, heat_1d, heat_7d, heat_15d, heat_30d,
-             as_of_day, coverage_days)
+热路径不写 PostgreSQL，也不长期保存 actor 行。中心端按 UTC 日维护一个临时 SQLite
+authority：
+
+```sql
+CREATE TABLE hashes(id INTEGER PRIMARY KEY, info_hash BLOB UNIQUE NOT NULL);
+CREATE TABLE seen(
+  hash_id INTEGER NOT NULL,
+  actor BLOB NOT NULL,
+  PRIMARY KEY(hash_id, actor)
+) WITHOUT ROWID;
 ```
+
+grace 结束后，SQLite 按 hash 聚合、批量映射 catalog ID，只把不可变的 64-shard
+daily frame 写入 PostgreSQL。每帧按 `id & 63` 分片，按 `id >> 6` 有序编码
+`delta-id,count` uvarint，并带 codec version、entry count、coverage、checksum 和 sealed
+manifest。PostgreSQL 不建 `heat_actor_day`、`torrent_heat_daily` 或长期
+`torrent_heat` 行表。
 
 - actor 是 crawler 内存中用两区共享 master secret 派生当日 key 后计算的 HMAC64；
   原始 IP、端口和 node ID 不出 crawler、不落 spool/PG/备份。IPv4 用完整地址，IPv6
@@ -323,17 +334,24 @@ torrent_heat(torrent_id, heat_1d, heat_7d, heat_15d, heat_30d,
   lookup 和 crawler 自己的流量全部排除，避免优化参数形成自反馈。
 - `announce_peer` 必须先把当前固定 token 改为 source-IP-bound rolling HMAC token，
   在此之前只能 shadow，不能作为做种/供给热度。
-- 当前日 exact 表只保留今天和尚未 finalize 的昨天；finalize 后产生每活跃 hash/day
-  一条稀疏汇总并 drop 分区。第 31 天 drop 日汇总分区，不做全表 DELETE。
+- 每日 SQLite 只保留今天和尚未 seal 的昨天；`FULL` commit 才 ACK，重复 batch 用
+  `INSERT OR IGNORE` 精确幂等。daily frame 与 manifest 持久且校验成功后才删除 actor
+  identity。未 sealed 或 coverage 不完整的日子不能被静默当成零流量日。
 - 四个窗口是 daily actor-day 的 1/7/15/30 日和，不冒充窗口内唯一用户/peer。严格
   cross-day unique 如确有产品价值，再以 1% exact last-seen oracle 比较 sparse HLL。
-- 两区域各自使用连续 heat receipt；`receipt + actor_day UPSERT` 同事务提交，响应丢失
-  重放不能改变结果。只对已入 catalog 的 searchable torrent 保留状态。
-- 每 5–15 分钟只把 touched heat 通过现有 transactional outbox 批量刷新到 Meili；
-  不为每次 sighting 更新 Meili。
+- 两区域的 CHHT batch 可重放；actor-day 主键使“中心已提交但响应丢失”不会重复计数。
+  尚未入 catalog 的 hash 先保留在临时 SQLite，seal 时仍不可搜索才丢弃。
+- Meili 只投影已 sealed 日历日。若上一成功日为 `D-1`，可能变化的 ID 严格来自
+  `D ∪ D-1 ∪ D-7 ∪ D-15 ∪ D-30`；只为这些 ID 扫描当前 30 帧计算四个绝对值并
+  partial PUT，四元组未变化则跳过。漏投多天必须逐日补齐；首次/新索引重建必须从
+  全部 base docs 和当前 30 日 union 开始。
+- daily frame 的 GC 由 Meili `projected_through` 水位控制，不能在投影故障时机械限制
+  为 31 天。metadata outbox 与 heat 都使用 partial PUT；PG catalog join 证明 ID 存在
+  后允许 heat stub，metadata 后到不得覆盖已有 heat。
 - exact-day 状态投影超过 5GiB、heat WAL 超 metadata WAL 25%、API 增加超过 10 个 CPU
-  百分点或 ACK p99 超 250ms 时，转入 Bloom+durable-log shadow；1% exact oracle 是
-  晋级所必需的误差证据。
+  百分点或 ACK p99 超 250ms 时，先启用已验证的 CRC-framed append-log fallback。
+  Redis 不属于默认依赖；只有产品硬性要求可查询的当日实时热度时，才以受限 Bloom
+  作为可丢弃缓存，最终日值仍以 SQLite 精确收敛为准。
 
 ## 7. 1M corpus 基准矩阵
 

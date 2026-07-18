@@ -84,7 +84,9 @@ a:hover { text-decoration: underline; }
 /* ---- results page ---- */
 .result-header { padding: 16px 0 12px; font-size: .88rem; color: var(--text-dim); }
 .result-count { color: var(--text); font-weight: 500; }
+.heat-meta { margin-top: 4px; color: var(--text-muted); font-size: .76rem; }
 .result-filters { display: flex; gap: 6px; margin-top: 8px; flex-wrap: wrap; }
+.heat-windows { margin-top: 10px; }
 .filter-chip { padding: 4px 14px; border-radius: 0; font-size: .78rem; border: 1px solid var(--border); background: #fff; color: var(--text-dim); cursor: pointer; }
 .filter-chip:hover { background: var(--bg-hover); }
 .filter-chip.active { background: var(--accent); border-color: var(--accent); color: #fff; }
