@@ -1,0 +1,44 @@
+{
+  "schema_version": 3,
+  "name": "eligible-two-arm-block",
+  "network": {
+    "node_ids": 96,
+    "udp_port_start": 21000,
+    "udp_port_end": 21095,
+    "sink_tcp_port": 5080
+  },
+  "design": {
+    "plan": "AB",
+    "warmup_runtime_rows": 20,
+    "measurement_runtime_rows": 10
+  },
+  "runtime_line": "runtime 30s: dht_recv=100 handled=100 dropped=0 refresh_q=10 lookup_sent=20 paused=false wire_q_drop=0 ann_q=10000",
+  "sampler_lifecycle": [
+    {"kind": "sampler_start"},
+    {"kind": "owned_process", "executable_sha256": "arm-bound"},
+    {"kind": "baseline", "socket_count": 96},
+    {"kind": "owned_process_end", "clean": true, "runtime_windows": 30},
+    {"kind": "sampler_end", "success": true, "runtime_windows": 30}
+  ],
+  "result": {
+    "runtime_windows": 10,
+    "health": {
+      "monitor_samples": 10,
+      "oracle_samples_valid": 10,
+      "oracle_sample_coverage": 1.0,
+      "oracle_samples_rejected": 0,
+      "runtime_window_coverage": 1.0
+    },
+    "primary": {"global_unique_per_second": 40.0},
+    "peer_source_funnel": {"announce_queued": 100000},
+    "local_funnel": {"wire_queue_dropped": 0, "wire_download_ok": 900},
+    "discovery": {"active_lookup_sent": 10000, "refresh_queries": 2000},
+    "resources": {
+      "udp_rcvbuf_errors": 0,
+      "udp_sndbuf_errors": 0,
+      "tx_qdisc_drops": 0,
+      "rss_mb_max": 1000,
+      "cpu_pct_mean": 120
+    }
+  }
+}

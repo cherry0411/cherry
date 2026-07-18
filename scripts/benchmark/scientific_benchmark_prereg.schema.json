@@ -1,0 +1,211 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cherry.invalid/schema/scientific-benchmark-prereg-v3.json",
+  "title": "Cherry crawler scientific benchmark preregistration v3",
+  "type": "object",
+  "required": [
+    "schema_version", "status", "identity", "schedule", "paths", "artifacts",
+    "run", "network", "design", "arms", "node_content_set_sha256",
+    "firewall", "preflight", "validity"
+  ],
+  "properties": {
+    "schema_version": {"const": 3},
+    "status": {"const": "pre_registered"},
+    "identity": {
+      "type": "object",
+      "required": ["experiment", "label", "region", "host"],
+      "properties": {
+        "experiment": {"type": "string", "minLength": 1},
+        "label": {"type": "string", "pattern": "^[A-Za-z0-9._-]+$"},
+        "region": {"type": "string", "minLength": 1},
+        "host": {"type": "string", "minLength": 1},
+        "purpose": {"type": "string"},
+        "prior_run_policy": {"type": "string"}
+      },
+      "additionalProperties": false
+    },
+    "schedule": {
+      "type": "object",
+      "required": ["start_epoch", "start_utc", "minimum_submission_lead_seconds"],
+      "properties": {
+        "start_epoch": {"type": "integer", "minimum": 1},
+        "start_utc": {"type": "string"},
+        "minimum_submission_lead_seconds": {"type": "integer", "minimum": 1}
+      },
+      "additionalProperties": false
+    },
+    "paths": {
+      "type": "object",
+      "required": [
+        "runtime_root", "oracle_experiment_dir", "diagnostic_dir", "launch_receipt",
+        "node_dir", "crawler_pid_file"
+      ],
+      "properties": {
+        "runtime_root": {"$ref": "#/$defs/absolutePath"},
+        "oracle_experiment_dir": {"$ref": "#/$defs/absolutePath"},
+        "diagnostic_dir": {"$ref": "#/$defs/absolutePath"},
+        "launch_receipt": {"$ref": "#/$defs/absolutePath"},
+        "node_dir": {"$ref": "#/$defs/absolutePath"},
+        "crawler_pid_file": {"$ref": "#/$defs/absolutePath"}
+      },
+      "additionalProperties": false
+    },
+    "artifacts": {
+      "type": "object",
+      "required": [
+        "framework", "start", "launcher", "sampler", "supervisor", "runner",
+        "binary_a", "binary_b", "sink_binary", "config_a", "config_b", "oracle_source"
+      ],
+      "additionalProperties": {"$ref": "#/$defs/artifact"}
+    },
+    "run": {
+      "type": "object",
+      "required": ["cohort", "sink_url"],
+      "properties": {
+        "cohort": {"type": "string", "minLength": 1},
+        "sink_url": {"type": "string", "pattern": "^http://127\\.0\\.0\\.1:[0-9]+/"},
+        "environment": {
+          "type": "object",
+          "additionalProperties": {"type": ["string", "number", "boolean"]}
+        }
+      },
+      "additionalProperties": false
+    },
+    "network": {
+      "type": "object",
+      "required": ["udp_port_start", "udp_port_end", "sink_tcp_port", "node_ids"],
+      "properties": {
+        "udp_port_start": {"$ref": "#/$defs/port"},
+        "udp_port_end": {"$ref": "#/$defs/port"},
+        "sink_tcp_port": {"$ref": "#/$defs/port"},
+        "node_ids": {"type": "integer", "minimum": 1}
+      },
+      "additionalProperties": false
+    },
+    "design": {
+      "type": "object",
+      "required": [
+        "seed", "plan", "blocks", "pairing", "warmup_seconds_per_block",
+        "measure_seconds_per_block"
+      ],
+      "properties": {
+        "seed": {"type": "integer", "minimum": 0},
+        "plan": {"type": "string", "pattern": "^[AB]+$"},
+        "blocks": {"type": "integer", "minimum": 2, "multipleOf": 2},
+        "pairing": {
+          "type": "array",
+          "items": {
+            "type": "array", "minItems": 2, "maxItems": 2,
+            "items": {"type": "integer", "minimum": 1}
+          }
+        },
+        "warmup_seconds_per_block": {"type": "integer", "minimum": 30, "multipleOf": 30},
+        "measure_seconds_per_block": {"type": "integer", "minimum": 30, "multipleOf": 30}
+      },
+      "additionalProperties": false
+    },
+    "arms": {
+      "type": "object",
+      "required": ["A", "B"],
+      "properties": {
+        "A": {"$ref": "#/$defs/arm"},
+        "B": {"$ref": "#/$defs/arm"}
+      },
+      "additionalProperties": false
+    },
+    "node_content_set_sha256": {"$ref": "#/$defs/sha256"},
+    "firewall": {
+      "type": "object",
+      "required": ["ufw", "raw"],
+      "properties": {
+        "ufw": {"$ref": "#/$defs/commandDigest"},
+        "raw": {"$ref": "#/$defs/commandDigest"}
+      },
+      "additionalProperties": false
+    },
+    "preflight": {
+      "type": "object",
+      "required": ["exclusive_process_names"],
+      "properties": {
+        "exclusive_process_names": {
+          "type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}
+        }
+      },
+      "additionalProperties": false
+    },
+    "validity": {
+      "type": "object",
+      "required": [
+        "sampler_tail_seconds", "owner_grace_seconds", "controller_done_grace_seconds",
+        "owned_socket_count", "rss_max_mb", "cpu_max_percent", "cpu_consecutive_samples",
+        "internal_drop_ratio_max", "internal_drop_consecutive_windows",
+        "kernel_immediate_ratio", "kernel_min_loss", "kernel_conditioned_ratio",
+        "kernel_two_window_loss", "qdisc_drops_per_active_minute", "announce_queued_min",
+        "announce_first_second_ratio", "exposure_checks"
+      ],
+      "properties": {
+        "sample_interval_seconds": {"type": "integer", "minimum": 1},
+        "sampler_tail_seconds": {"type": "integer", "minimum": 1},
+        "owner_grace_seconds": {"type": "integer", "minimum": 1},
+        "controller_done_grace_seconds": {"type": "integer", "minimum": 1},
+        "owned_socket_count": {"type": "integer", "minimum": 1},
+        "rss_max_mb": {"type": "number", "exclusiveMinimum": 0},
+        "cpu_max_percent": {"type": "number", "exclusiveMinimum": 0},
+        "cpu_consecutive_samples": {"type": "integer", "minimum": 1},
+        "internal_drop_ratio_max": {"type": "number", "minimum": 0, "maximum": 1},
+        "internal_drop_consecutive_windows": {"type": "integer", "minimum": 1},
+        "kernel_immediate_ratio": {"type": "number", "minimum": 0, "maximum": 1},
+        "kernel_min_loss": {"type": "integer", "minimum": 1},
+        "kernel_conditioned_ratio": {"type": "number", "minimum": 0, "maximum": 1},
+        "kernel_two_window_loss": {"type": "integer", "minimum": 1},
+        "qdisc_drops_per_active_minute": {"type": "integer", "minimum": 0},
+        "announce_queued_min": {"type": "integer", "minimum": 0},
+        "announce_first_second_ratio": {"$ref": "#/$defs/range"},
+        "exposure_checks": {
+          "type": "array", "minItems": 1,
+          "items": {
+            "type": "object", "required": ["name", "result_path", "b_a_range"],
+            "properties": {
+              "name": {"type": "string", "minLength": 1},
+              "result_path": {"type": "string", "minLength": 1},
+              "b_a_range": {"$ref": "#/$defs/range"}
+            },
+            "additionalProperties": false
+          }
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "$defs": {
+    "absolutePath": {"type": "string", "pattern": "^/"},
+    "port": {"type": "integer", "minimum": 1, "maximum": 65535},
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "artifact": {
+      "type": "object", "required": ["path", "sha256"],
+      "properties": {
+        "path": {"$ref": "#/$defs/absolutePath"},
+        "sha256": {"$ref": "#/$defs/sha256"}
+      },
+      "additionalProperties": false
+    },
+    "arm": {
+      "type": "object", "required": ["overrides"],
+      "properties": {"overrides": {"type": "array", "items": {"type": "string"}}},
+      "additionalProperties": false
+    },
+    "commandDigest": {
+      "type": "object", "required": ["command", "sha256"],
+      "properties": {
+        "command": {"type": "array", "minItems": 1, "items": {"type": "string"}},
+        "sha256": {"$ref": "#/$defs/sha256"}
+      },
+      "additionalProperties": false
+    },
+    "range": {
+      "type": "array", "minItems": 2, "maxItems": 2,
+      "items": {"type": "number"}
+    }
+  },
+  "additionalProperties": true
+}
