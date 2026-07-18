@@ -13,6 +13,27 @@ func TestHourBloomShadowDisabledAllocatesNothing(t *testing.T) {
 	}
 }
 
+func TestShadowBloomHardDropDecisionFailsOpen(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		enabled bool
+		result  shadowBloomResult
+		want    bool
+	}{
+		{name: "disabled", result: shadowBloomResult{probableDuplicate: true}},
+		{name: "new", enabled: true, result: shadowBloomResult{new: true}},
+		{name: "exceptional zero result", enabled: true, result: shadowBloomResult{}},
+		{name: "capacity or stale-hour bypass", enabled: true, result: shadowBloomResult{probableDuplicate: true, bypassed: true}},
+		{name: "probable duplicate", enabled: true, result: shadowBloomResult{probableDuplicate: true}, want: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := shouldDropShadowBloomResult(test.enabled, test.result); got != test.want {
+				t.Fatalf("shouldDropShadowBloomResult()=%t want=%t", got, test.want)
+			}
+		})
+	}
+}
+
 func TestHourBloomShadowEnabledUsesBoundedDefaults(t *testing.T) {
 	shadow, err := newHourBloomShadow(shadowBloomOptions{Enabled: true})
 	if err != nil {
@@ -91,6 +112,32 @@ func TestHourBloomShadowCapacityFailsOpen(t *testing.T) {
 	}
 	snapshot := shadow.snapshot()
 	if snapshot.New != 2 || snapshot.Bypassed != 1 || snapshot.Capacity != 2 || snapshot.Checks != 3 {
+		t.Fatalf("snapshot=%+v", snapshot)
+	}
+}
+
+func TestHourBloomHardAdmissionFailureDoesNotPoisonRetry(t *testing.T) {
+	shadow := newTestHourBloomShadow(t, 100, 32)
+	obs := testShadowObservation(20_000, 6, 77)
+
+	admitted, first := shadow.observeAndAdmit(obs, func() bool { return false })
+	if admitted || !first.new || first.probableDuplicate || first.bypassed {
+		t.Fatalf("failed admission result=%+v admitted=%t", first, admitted)
+	}
+	admitted, retry := shadow.observeAndAdmit(obs, func() bool { return true })
+	if !admitted || !retry.new || retry.probableDuplicate || retry.bypassed {
+		t.Fatalf("retry result=%+v admitted=%t", retry, admitted)
+	}
+	admitted, duplicate := shadow.observeAndAdmit(obs, func() bool {
+		t.Fatal("probable duplicate unexpectedly reached admission callback")
+		return true
+	})
+	if admitted || !duplicate.probableDuplicate {
+		t.Fatalf("duplicate result=%+v admitted=%t", duplicate, admitted)
+	}
+
+	snapshot := shadow.snapshot()
+	if snapshot.New != 2 || snapshot.ProbableDuplicates != 1 || snapshot.Bypassed != 0 {
 		t.Fatalf("snapshot=%+v", snapshot)
 	}
 }

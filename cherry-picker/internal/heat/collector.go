@@ -35,82 +35,86 @@ const (
 )
 
 type Options struct {
-	Endpoint                  string
-	CrawlerID                 string
-	SpoolDir                  string
-	SpoolMaxBytes             int64
-	KnownCrawlers             string
-	QueueCapacity             int
-	BatchSize                 int
-	FlushDelay                time.Duration
-	RetryBackoff              time.Duration
-	HTTPTimeout               time.Duration
-	MasterSecret              []byte
-	MasterSecretFile          string
-	HMACSecret                []byte
-	HMACSecretFile            string
-	LocalAddresses            []netip.Addr
-	HTTPClient                *http.Client
-	Now                       func() time.Time
-	ShadowBloomEnabled        bool
-	ShadowBloomCapacity       int
-	ShadowBloomFalsePositive  int
-	ShadowBloomSampleCapacity int
+	Endpoint                          string
+	CrawlerID                         string
+	SpoolDir                          string
+	SpoolMaxBytes                     int64
+	KnownCrawlers                     string
+	QueueCapacity                     int
+	BatchSize                         int
+	FlushDelay                        time.Duration
+	RetryBackoff                      time.Duration
+	HTTPTimeout                       time.Duration
+	MasterSecret                      []byte
+	MasterSecretFile                  string
+	HMACSecret                        []byte
+	HMACSecretFile                    string
+	LocalAddresses                    []netip.Addr
+	HTTPClient                        *http.Client
+	Now                               func() time.Time
+	ShadowBloomEnabled                bool
+	ShadowBloomDropProbableDuplicates bool
+	ShadowBloomCapacity               int
+	ShadowBloomFalsePositive          int
+	ShadowBloomSampleCapacity         int
 }
 
 type Snapshot struct {
-	Observed                        uint64
-	Filtered                        uint64
-	Queued                          uint64
-	QueueDropped                    uint64
-	BatchDuplicates                 uint64
-	Durable                         uint64
-	LostBeforeDurable               uint64
-	SpoolRetries                    uint64
-	SpoolFatalErrors                uint64
-	Exported                        uint64
-	ExportBatches                   uint64
-	ExportRetries                   uint64
-	ExportPermanentFailures         uint64
-	ClosedDayRejectedRecords        uint64
-	ClosedDayRejectedBatches        uint64
-	QueueDepth                      int
-	QueueCapacity                   int
-	SpoolBytes                      int64
-	SpoolMaxBytes                   int64
-	SpoolRecords                    uint64
-	ShadowBloomEnabled              bool
-	ShadowBloomChecks               uint64
-	ShadowBloomNew                  uint64
-	ShadowBloomProbableDuplicates   uint64
-	ShadowBloomBypassed             uint64
-	ShadowBloomRotations            uint64
-	ShadowBloomCurrentHour          uint64
-	ShadowBloomCurrentBitsSet       uint64
-	ShadowBloomCurrentBitFillPPM    uint64
-	ShadowBloomCapacity             uint64
-	ShadowBloomBytes                uint64
-	ShadowBloomSampleCapacity       uint64
-	ShadowBloomSampleEntries        uint64
-	ShadowBloomSampledTruePositive  uint64
-	ShadowBloomSampledFalsePositive uint64
-	ShadowBloomSampledBypassed      uint64
+	Observed                          uint64
+	Filtered                          uint64
+	Queued                            uint64
+	QueueDropped                      uint64
+	BatchDuplicates                   uint64
+	Durable                           uint64
+	LostBeforeDurable                 uint64
+	SpoolRetries                      uint64
+	SpoolFatalErrors                  uint64
+	Exported                          uint64
+	ExportBatches                     uint64
+	ExportRetries                     uint64
+	ExportPermanentFailures           uint64
+	ClosedDayRejectedRecords          uint64
+	ClosedDayRejectedBatches          uint64
+	QueueDepth                        int
+	QueueCapacity                     int
+	SpoolBytes                        int64
+	SpoolMaxBytes                     int64
+	SpoolRecords                      uint64
+	ShadowBloomEnabled                bool
+	ShadowBloomDropProbableDuplicates bool
+	ShadowBloomDropped                uint64
+	ShadowBloomChecks                 uint64
+	ShadowBloomNew                    uint64
+	ShadowBloomProbableDuplicates     uint64
+	ShadowBloomBypassed               uint64
+	ShadowBloomRotations              uint64
+	ShadowBloomCurrentHour            uint64
+	ShadowBloomCurrentBitsSet         uint64
+	ShadowBloomCurrentBitFillPPM      uint64
+	ShadowBloomCapacity               uint64
+	ShadowBloomBytes                  uint64
+	ShadowBloomSampleCapacity         uint64
+	ShadowBloomSampleEntries          uint64
+	ShadowBloomSampledTruePositive    uint64
+	ShadowBloomSampledFalsePositive   uint64
+	ShadowBloomSampledBypassed        uint64
 }
 
 type Collector struct {
-	identity           *actorIdentity
-	shadow             *hourBloomShadow
-	spool              *heatSpool
-	completion         *completionTracker
-	endpoint           string
-	completionEndpoint string
-	crawlerID          string
-	hmacSecret         string
-	client             *http.Client
-	batchSize          int
-	flushDelay         time.Duration
-	retryDelay         time.Duration
-	now                func() time.Time
+	identity                     *actorIdentity
+	shadow                       *hourBloomShadow
+	shadowDropProbableDuplicates bool
+	spool                        *heatSpool
+	completion                   *completionTracker
+	endpoint                     string
+	completionEndpoint           string
+	crawlerID                    string
+	hmacSecret                   string
+	client                       *http.Client
+	batchSize                    int
+	flushDelay                   time.Duration
+	retryDelay                   time.Duration
+	now                          func() time.Time
 
 	queue        chan writerItem
 	wake         chan struct{}
@@ -142,6 +146,7 @@ type Collector struct {
 	exportPermanentFailures  atomic.Uint64
 	closedDayRejectedRecords atomic.Uint64
 	closedDayRejectedBatches atomic.Uint64
+	shadowBloomDropped       atomic.Uint64
 }
 
 type writerItem struct {
@@ -203,7 +208,8 @@ func New(opts Options) (*Collector, error) {
 		return nil, err
 	}
 	shadow, err := newHourBloomShadow(shadowBloomOptions{
-		Enabled: opts.ShadowBloomEnabled, Capacity: opts.ShadowBloomCapacity,
+		Enabled:       opts.ShadowBloomEnabled || opts.ShadowBloomDropProbableDuplicates,
+		Capacity:      opts.ShadowBloomCapacity,
 		FalsePositive: opts.ShadowBloomFalsePositive, SampleCapacity: opts.ShadowBloomSampleCapacity,
 	})
 	if err != nil {
@@ -255,7 +261,8 @@ func New(opts Options) (*Collector, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	c := &Collector{
 		identity: identity, shadow: shadow, spool: sp, completion: completion, endpoint: endpoint,
-		completionEndpoint: completionEndpoint, crawlerID: opts.CrawlerID,
+		shadowDropProbableDuplicates: opts.ShadowBloomDropProbableDuplicates,
+		completionEndpoint:           completionEndpoint, crawlerID: opts.CrawlerID,
 		hmacSecret: string(hmacSecret), client: client, batchSize: opts.BatchSize,
 		flushDelay: opts.FlushDelay, retryDelay: opts.RetryBackoff, now: now,
 		queue: make(chan writerItem, opts.QueueCapacity), wake: make(chan struct{}, 1),
@@ -272,7 +279,7 @@ func New(opts Options) (*Collector, error) {
 
 // Observe is the get_peers hot-path boundary. A true result means admission to
 // the bounded in-memory writer queue, not durable acknowledgement. A false
-// result is always reflected by Filtered or QueueDropped.
+// result is always reflected by Filtered, QueueDropped or ShadowBloomDropped.
 func (c *Collector) Observe(rawInfoHash, sourceIP string, now time.Time) bool {
 	c.observed.Add(1)
 	obs, ok := c.identity.observation(rawInfoHash, sourceIP, now)
@@ -280,7 +287,9 @@ func (c *Collector) Observe(rawInfoHash, sourceIP string, now time.Time) bool {
 		c.filtered.Add(1)
 		return false
 	}
-	if c.shadow != nil {
+	if c.shadow != nil && !c.shadowDropProbableDuplicates {
+		// Keep shadow-only measurement semantics unchanged. Hard mode instead
+		// performs a transactional test/admit/commit after the legality gates.
 		c.shadow.observe(obs)
 	}
 	for {
@@ -309,6 +318,32 @@ func (c *Collector) Observe(rawInfoHash, sourceIP string, now time.Time) bool {
 		if c.activeDay.Load() != obs.Day {
 			c.closeMu.RUnlock()
 			continue
+		}
+		if c.shadow != nil && c.shadowDropProbableDuplicates {
+			admitted, result := c.shadow.observeAndAdmit(obs, func() bool {
+				select {
+				case c.queue <- writerItem{observation: obs}:
+					return true
+				default:
+					return false
+				}
+			})
+			if admitted {
+				c.queued.Add(1)
+				c.closeMu.RUnlock()
+				return true
+			}
+			if shouldDropShadowBloomResult(true, result) {
+				c.shadowBloomDropped.Add(1)
+				c.closeMu.RUnlock()
+				return false
+			}
+			// A new-key admission failure did not publish Bloom bits. Capacity and
+			// stale-hour bypasses also remain uncommitted, so all can retry later.
+			c.queueDropped.Add(1)
+			c.completion.markDirty(obs.Day)
+			c.closeMu.RUnlock()
+			return false
 		}
 		select {
 		case c.queue <- writerItem{observation: obs}:
@@ -341,8 +376,11 @@ func (c *Collector) Snapshot() Snapshot {
 		ClosedDayRejectedBatches: c.closedDayRejectedBatches.Load(),
 		QueueDepth:               len(c.queue), QueueCapacity: cap(c.queue), SpoolBytes: spoolBytes,
 		SpoolMaxBytes: spoolMax, SpoolRecords: spoolRecords,
-		ShadowBloomEnabled: shadow.Enabled, ShadowBloomChecks: shadow.Checks,
-		ShadowBloomNew: shadow.New, ShadowBloomProbableDuplicates: shadow.ProbableDuplicates,
+		ShadowBloomEnabled:                shadow.Enabled,
+		ShadowBloomDropProbableDuplicates: c.shadowDropProbableDuplicates,
+		ShadowBloomDropped:                c.shadowBloomDropped.Load(),
+		ShadowBloomChecks:                 shadow.Checks,
+		ShadowBloomNew:                    shadow.New, ShadowBloomProbableDuplicates: shadow.ProbableDuplicates,
 		ShadowBloomBypassed: shadow.Bypassed, ShadowBloomRotations: shadow.Rotations,
 		ShadowBloomCurrentHour: shadow.CurrentHour, ShadowBloomCurrentBitsSet: shadow.CurrentBitsSet,
 		ShadowBloomCurrentBitFillPPM: shadow.CurrentBitFillPPM, ShadowBloomCapacity: shadow.Capacity,

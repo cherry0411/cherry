@@ -149,10 +149,11 @@ type HeatConfig struct {
 	FlushInterval    time.Duration
 	HTTPTimeout      time.Duration
 	RetryBackoff     time.Duration
-	// ShadowBloomEnabled only measures possible current-hour duplicates. It
-	// never changes queue admission or durable record sequencing.
-	ShadowBloomEnabled  bool
-	ShadowBloomCapacity int
+	// ShadowBloomEnabled measures probable current/previous-hour duplicates.
+	// Admission changes only when ShadowBloomDropProbableDuplicates is enabled.
+	ShadowBloomEnabled                bool
+	ShadowBloomDropProbableDuplicates bool
+	ShadowBloomCapacity               int
 	// ShadowBloomFalsePositive is the sizing target in parts per million.
 	ShadowBloomFalsePositive  int
 	ShadowBloomSampleCapacity int
@@ -246,23 +247,24 @@ func Load() (Config, error) {
 			SpoolMaxBytes:  int64(getenvInt("CHERRY_PICKER_SPOOL_MAX_BYTES", 0)),
 		},
 		Heat: HeatConfig{
-			Enabled:                   getenvBool("CHERRY_PICKER_HEAT_ENABLED", false),
-			Endpoint:                  strings.TrimSpace(os.Getenv("CHERRY_PICKER_HEAT_ENDPOINT")),
-			CrawlerID:                 strings.TrimSpace(os.Getenv("CHERRY_PICKER_HEAT_CRAWLER_ID")),
-			MasterSecretFile:          strings.TrimSpace(os.Getenv("CHERRY_PICKER_HEAT_MASTER_SECRET_FILE")),
-			HMACSecretFile:            strings.TrimSpace(os.Getenv("CHERRY_PICKER_HEAT_HMAC_SECRET_FILE")),
-			SpoolDir:                  strings.TrimSpace(os.Getenv("CHERRY_PICKER_HEAT_SPOOL_DIR")),
-			SpoolMaxBytes:             int64(getenvInt("CHERRY_PICKER_HEAT_SPOOL_MAX_BYTES", 0)),
-			KnownCrawlers:             strings.TrimSpace(os.Getenv("CHERRY_PICKER_HEAT_KNOWN_CRAWLERS")),
-			QueueCapacity:             getenvInt("CHERRY_PICKER_HEAT_QUEUE", 0),
-			BatchSize:                 getenvInt("CHERRY_PICKER_HEAT_BATCH", 0),
-			FlushInterval:             getenvDuration("CHERRY_PICKER_HEAT_FLUSH", 0),
-			HTTPTimeout:               getenvDuration("CHERRY_PICKER_HEAT_HTTP_TIMEOUT", 0),
-			RetryBackoff:              getenvDuration("CHERRY_PICKER_HEAT_RETRY_BACKOFF", 0),
-			ShadowBloomEnabled:        getenvBool("CHERRY_PICKER_HEAT_SHADOW_BLOOM_ENABLED", false),
-			ShadowBloomCapacity:       getenvInt("CHERRY_PICKER_HEAT_SHADOW_BLOOM_CAPACITY", 0),
-			ShadowBloomFalsePositive:  getenvInt("CHERRY_PICKER_HEAT_SHADOW_BLOOM_FP_PPM", 0),
-			ShadowBloomSampleCapacity: getenvInt("CHERRY_PICKER_HEAT_SHADOW_SAMPLE_CAPACITY", 0),
+			Enabled:                           getenvBool("CHERRY_PICKER_HEAT_ENABLED", false),
+			Endpoint:                          strings.TrimSpace(os.Getenv("CHERRY_PICKER_HEAT_ENDPOINT")),
+			CrawlerID:                         strings.TrimSpace(os.Getenv("CHERRY_PICKER_HEAT_CRAWLER_ID")),
+			MasterSecretFile:                  strings.TrimSpace(os.Getenv("CHERRY_PICKER_HEAT_MASTER_SECRET_FILE")),
+			HMACSecretFile:                    strings.TrimSpace(os.Getenv("CHERRY_PICKER_HEAT_HMAC_SECRET_FILE")),
+			SpoolDir:                          strings.TrimSpace(os.Getenv("CHERRY_PICKER_HEAT_SPOOL_DIR")),
+			SpoolMaxBytes:                     int64(getenvInt("CHERRY_PICKER_HEAT_SPOOL_MAX_BYTES", 0)),
+			KnownCrawlers:                     strings.TrimSpace(os.Getenv("CHERRY_PICKER_HEAT_KNOWN_CRAWLERS")),
+			QueueCapacity:                     getenvInt("CHERRY_PICKER_HEAT_QUEUE", 0),
+			BatchSize:                         getenvInt("CHERRY_PICKER_HEAT_BATCH", 0),
+			FlushInterval:                     getenvDuration("CHERRY_PICKER_HEAT_FLUSH", 0),
+			HTTPTimeout:                       getenvDuration("CHERRY_PICKER_HEAT_HTTP_TIMEOUT", 0),
+			RetryBackoff:                      getenvDuration("CHERRY_PICKER_HEAT_RETRY_BACKOFF", 0),
+			ShadowBloomEnabled:                getenvBool("CHERRY_PICKER_HEAT_SHADOW_BLOOM_ENABLED", false),
+			ShadowBloomDropProbableDuplicates: getenvBool("CHERRY_PICKER_HEAT_SHADOW_BLOOM_DROP_PROBABLE_DUPLICATES", false),
+			ShadowBloomCapacity:               getenvInt("CHERRY_PICKER_HEAT_SHADOW_BLOOM_CAPACITY", 0),
+			ShadowBloomFalsePositive:          getenvInt("CHERRY_PICKER_HEAT_SHADOW_BLOOM_FP_PPM", 0),
+			ShadowBloomSampleCapacity:         getenvInt("CHERRY_PICKER_HEAT_SHADOW_SAMPLE_CAPACITY", 0),
 		},
 	}
 
@@ -373,23 +375,24 @@ func loadFromFile(path string) (Config, error) {
 			SpoolMaxBytes:  raw.Exporter.SpoolMaxBytes,
 		},
 		Heat: HeatConfig{
-			Enabled:                   raw.Heat.Enabled,
-			Endpoint:                  strings.TrimSpace(raw.Heat.Endpoint),
-			CrawlerID:                 strings.TrimSpace(raw.Heat.CrawlerID),
-			MasterSecretFile:          strings.TrimSpace(raw.Heat.MasterSecretFile),
-			HMACSecretFile:            strings.TrimSpace(raw.Heat.HMACSecretFile),
-			SpoolDir:                  strings.TrimSpace(raw.Heat.SpoolDir),
-			SpoolMaxBytes:             raw.Heat.SpoolMaxBytes,
-			KnownCrawlers:             strings.TrimSpace(raw.Heat.KnownCrawlers),
-			QueueCapacity:             raw.Heat.QueueCapacity,
-			BatchSize:                 raw.Heat.BatchSize,
-			FlushInterval:             parseDuration(raw.Heat.FlushInterval),
-			HTTPTimeout:               parseDuration(raw.Heat.HTTPTimeout),
-			RetryBackoff:              parseDuration(raw.Heat.RetryBackoff),
-			ShadowBloomEnabled:        raw.Heat.ShadowBloomEnabled,
-			ShadowBloomCapacity:       raw.Heat.ShadowBloomCapacity,
-			ShadowBloomFalsePositive:  raw.Heat.ShadowBloomFalsePositive,
-			ShadowBloomSampleCapacity: raw.Heat.ShadowBloomSampleCapacity,
+			Enabled:                           raw.Heat.Enabled,
+			Endpoint:                          strings.TrimSpace(raw.Heat.Endpoint),
+			CrawlerID:                         strings.TrimSpace(raw.Heat.CrawlerID),
+			MasterSecretFile:                  strings.TrimSpace(raw.Heat.MasterSecretFile),
+			HMACSecretFile:                    strings.TrimSpace(raw.Heat.HMACSecretFile),
+			SpoolDir:                          strings.TrimSpace(raw.Heat.SpoolDir),
+			SpoolMaxBytes:                     raw.Heat.SpoolMaxBytes,
+			KnownCrawlers:                     strings.TrimSpace(raw.Heat.KnownCrawlers),
+			QueueCapacity:                     raw.Heat.QueueCapacity,
+			BatchSize:                         raw.Heat.BatchSize,
+			FlushInterval:                     parseDuration(raw.Heat.FlushInterval),
+			HTTPTimeout:                       parseDuration(raw.Heat.HTTPTimeout),
+			RetryBackoff:                      parseDuration(raw.Heat.RetryBackoff),
+			ShadowBloomEnabled:                raw.Heat.ShadowBloomEnabled,
+			ShadowBloomDropProbableDuplicates: raw.Heat.ShadowBloomDropProbableDuplicates,
+			ShadowBloomCapacity:               raw.Heat.ShadowBloomCapacity,
+			ShadowBloomFalsePositive:          raw.Heat.ShadowBloomFalsePositive,
+			ShadowBloomSampleCapacity:         raw.Heat.ShadowBloomSampleCapacity,
 		},
 	}
 
@@ -543,6 +546,11 @@ func normalize(cfg Config) Config {
 	if cfg.Heat.ShadowBloomSampleCapacity <= 0 {
 		cfg.Heat.ShadowBloomSampleCapacity = 4_096
 	}
+	// The hard-filter flag is explicit and sufficient on its own. Enabling the
+	// underlying bounded Bloom avoids a silently ineffective configuration.
+	if cfg.Heat.ShadowBloomDropProbableDuplicates {
+		cfg.Heat.ShadowBloomEnabled = true
+	}
 
 	switch cfg.Role {
 	case "discovery":
@@ -650,23 +658,24 @@ type fileExporterConfig struct {
 }
 
 type fileHeatConfig struct {
-	Enabled                   bool   `json:"enabled"`
-	Endpoint                  string `json:"endpoint"`
-	CrawlerID                 string `json:"crawler_id"`
-	MasterSecretFile          string `json:"master_secret_file"`
-	HMACSecretFile            string `json:"hmac_secret_file"`
-	SpoolDir                  string `json:"spool_dir"`
-	SpoolMaxBytes             int64  `json:"spool_max_bytes"`
-	KnownCrawlers             string `json:"known_crawlers"`
-	QueueCapacity             int    `json:"queue_capacity"`
-	BatchSize                 int    `json:"batch_size"`
-	FlushInterval             string `json:"flush_interval"`
-	HTTPTimeout               string `json:"http_timeout"`
-	RetryBackoff              string `json:"retry_backoff"`
-	ShadowBloomEnabled        bool   `json:"shadow_bloom_enabled"`
-	ShadowBloomCapacity       int    `json:"shadow_bloom_capacity"`
-	ShadowBloomFalsePositive  int    `json:"shadow_bloom_fp_ppm"`
-	ShadowBloomSampleCapacity int    `json:"shadow_bloom_sample_capacity"`
+	Enabled                           bool   `json:"enabled"`
+	Endpoint                          string `json:"endpoint"`
+	CrawlerID                         string `json:"crawler_id"`
+	MasterSecretFile                  string `json:"master_secret_file"`
+	HMACSecretFile                    string `json:"hmac_secret_file"`
+	SpoolDir                          string `json:"spool_dir"`
+	SpoolMaxBytes                     int64  `json:"spool_max_bytes"`
+	KnownCrawlers                     string `json:"known_crawlers"`
+	QueueCapacity                     int    `json:"queue_capacity"`
+	BatchSize                         int    `json:"batch_size"`
+	FlushInterval                     string `json:"flush_interval"`
+	HTTPTimeout                       string `json:"http_timeout"`
+	RetryBackoff                      string `json:"retry_backoff"`
+	ShadowBloomEnabled                bool   `json:"shadow_bloom_enabled"`
+	ShadowBloomDropProbableDuplicates bool   `json:"shadow_bloom_drop_probable_duplicates"`
+	ShadowBloomCapacity               int    `json:"shadow_bloom_capacity"`
+	ShadowBloomFalsePositive          int    `json:"shadow_bloom_fp_ppm"`
+	ShadowBloomSampleCapacity         int    `json:"shadow_bloom_sample_capacity"`
 }
 
 // normalizeFilterConfig applies built-in defaults for any filter threshold that

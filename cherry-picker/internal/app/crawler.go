@@ -260,22 +260,24 @@ type statsSnapshot struct {
 }
 
 type heatShadowStatsSnapshot struct {
-	enabled              bool
-	checks               uint64
-	new                  uint64
-	probableDuplicates   uint64
-	bypassed             uint64
-	rotations            uint64
-	currentHour          uint64
-	currentBitsSet       uint64
-	currentBitFillPPM    uint64
-	capacity             uint64
-	bytes                uint64
-	sampleCapacity       uint64
-	sampleEntries        uint64
-	sampledTruePositive  uint64
-	sampledFalsePositive uint64
-	sampledBypassed      uint64
+	enabled                bool
+	dropProbableDuplicates bool
+	dropped                uint64
+	checks                 uint64
+	new                    uint64
+	probableDuplicates     uint64
+	bypassed               uint64
+	rotations              uint64
+	currentHour            uint64
+	currentBitsSet         uint64
+	currentBitFillPPM      uint64
+	capacity               uint64
+	bytes                  uint64
+	sampleCapacity         uint64
+	sampleEntries          uint64
+	sampledTruePositive    uint64
+	sampledFalsePositive   uint64
+	sampledBypassed        uint64
 }
 
 const (
@@ -429,10 +431,11 @@ func (a *Application) Run(ctx context.Context) error {
 			BatchSize: a.cfg.Heat.BatchSize, FlushDelay: a.cfg.Heat.FlushInterval,
 			HTTPTimeout: a.cfg.Heat.HTTPTimeout, RetryBackoff: a.cfg.Heat.RetryBackoff,
 			MasterSecretFile: a.cfg.Heat.MasterSecretFile, HMACSecretFile: a.cfg.Heat.HMACSecretFile,
-			ShadowBloomEnabled:        a.cfg.Heat.ShadowBloomEnabled,
-			ShadowBloomCapacity:       a.cfg.Heat.ShadowBloomCapacity,
-			ShadowBloomFalsePositive:  a.cfg.Heat.ShadowBloomFalsePositive,
-			ShadowBloomSampleCapacity: a.cfg.Heat.ShadowBloomSampleCapacity,
+			ShadowBloomEnabled:                a.cfg.Heat.ShadowBloomEnabled,
+			ShadowBloomDropProbableDuplicates: a.cfg.Heat.ShadowBloomDropProbableDuplicates,
+			ShadowBloomCapacity:               a.cfg.Heat.ShadowBloomCapacity,
+			ShadowBloomFalsePositive:          a.cfg.Heat.ShadowBloomFalsePositive,
+			ShadowBloomSampleCapacity:         a.cfg.Heat.ShadowBloomSampleCapacity,
 		})
 		if err != nil {
 			return fmt.Errorf("start inbound get_peers heat collector: %w", err)
@@ -448,9 +451,10 @@ func (a *Application) Run(ctx context.Context) error {
 				}
 			}
 		}()
-		a.logger.Printf("inbound get_peers heat enabled: endpoint=%s spool=%s queue=%d batch=%d max_bytes=%d wire=CHHT/2 shadow_bloom=%t shadow_capacity=%d shadow_fp_ppm=%d shadow_sample_capacity=%d",
+		a.logger.Printf("inbound get_peers heat enabled: endpoint=%s spool=%s queue=%d batch=%d max_bytes=%d wire=CHHT/2 shadow_bloom=%t shadow_drop_probable_duplicates=%t shadow_capacity=%d shadow_fp_ppm=%d shadow_sample_capacity=%d",
 			a.cfg.Heat.Endpoint, a.cfg.Heat.SpoolDir, a.cfg.Heat.QueueCapacity,
 			a.cfg.Heat.BatchSize, a.cfg.Heat.SpoolMaxBytes, a.cfg.Heat.ShadowBloomEnabled,
+			a.cfg.Heat.ShadowBloomDropProbableDuplicates,
 			a.cfg.Heat.ShadowBloomCapacity, a.cfg.Heat.ShadowBloomFalsePositive,
 			a.cfg.Heat.ShadowBloomSampleCapacity)
 	}
@@ -1709,22 +1713,24 @@ func (a *Application) emitStats(ctx context.Context, events chan<- pipeline.Even
 				heatSpoolMaxBytes:             heatStats.SpoolMaxBytes,
 				heatSpoolRecords:              heatStats.SpoolRecords,
 				heatShadow: heatShadowStatsSnapshot{
-					enabled:              heatStats.ShadowBloomEnabled,
-					checks:               heatStats.ShadowBloomChecks,
-					new:                  heatStats.ShadowBloomNew,
-					probableDuplicates:   heatStats.ShadowBloomProbableDuplicates,
-					bypassed:             heatStats.ShadowBloomBypassed,
-					rotations:            heatStats.ShadowBloomRotations,
-					currentHour:          heatStats.ShadowBloomCurrentHour,
-					currentBitsSet:       heatStats.ShadowBloomCurrentBitsSet,
-					currentBitFillPPM:    heatStats.ShadowBloomCurrentBitFillPPM,
-					capacity:             heatStats.ShadowBloomCapacity,
-					bytes:                heatStats.ShadowBloomBytes,
-					sampleCapacity:       heatStats.ShadowBloomSampleCapacity,
-					sampleEntries:        heatStats.ShadowBloomSampleEntries,
-					sampledTruePositive:  heatStats.ShadowBloomSampledTruePositive,
-					sampledFalsePositive: heatStats.ShadowBloomSampledFalsePositive,
-					sampledBypassed:      heatStats.ShadowBloomSampledBypassed,
+					enabled:                heatStats.ShadowBloomEnabled,
+					dropProbableDuplicates: heatStats.ShadowBloomDropProbableDuplicates,
+					dropped:                heatStats.ShadowBloomDropped,
+					checks:                 heatStats.ShadowBloomChecks,
+					new:                    heatStats.ShadowBloomNew,
+					probableDuplicates:     heatStats.ShadowBloomProbableDuplicates,
+					bypassed:               heatStats.ShadowBloomBypassed,
+					rotations:              heatStats.ShadowBloomRotations,
+					currentHour:            heatStats.ShadowBloomCurrentHour,
+					currentBitsSet:         heatStats.ShadowBloomCurrentBitsSet,
+					currentBitFillPPM:      heatStats.ShadowBloomCurrentBitFillPPM,
+					capacity:               heatStats.ShadowBloomCapacity,
+					bytes:                  heatStats.ShadowBloomBytes,
+					sampleCapacity:         heatStats.ShadowBloomSampleCapacity,
+					sampleEntries:          heatStats.ShadowBloomSampleEntries,
+					sampledTruePositive:    heatStats.ShadowBloomSampledTruePositive,
+					sampledFalsePositive:   heatStats.ShadowBloomSampledFalsePositive,
+					sampledBypassed:        heatStats.ShadowBloomSampledBypassed,
 				},
 			}
 			funnel := downloader.FunnelBySource()
@@ -1848,6 +1854,8 @@ func (a *Application) emitStats(ctx context.Context, events chan<- pipeline.Even
 				"heat_spool_max_bytes":               uint64(current.heatSpoolMaxBytes),
 				"heat_spool_records":                 current.heatSpoolRecords,
 				"heat_shadow_bloom_enabled":          boolUint64(current.heatShadow.enabled),
+				"heat_shadow_bloom_drop_enabled":     boolUint64(current.heatShadow.dropProbableDuplicates),
+				"heat_shadow_bloom_dropped":          current.heatShadow.dropped,
 				"heat_shadow_bloom_checks":           current.heatShadow.checks,
 				"heat_shadow_bloom_new":              current.heatShadow.new,
 				"heat_shadow_bloom_probable_dup":     current.heatShadow.probableDuplicates,
@@ -1996,8 +2004,10 @@ func formatRuntimeGauges(current, previous statsSnapshot) string {
 		current.heatSpoolRecords,
 	)
 	fmt.Fprintf(&b,
-		" heat_shadow=%t heat_shadow_check=%d heat_shadow_new=%d heat_shadow_prob_dup=%d heat_shadow_bypass=%d heat_shadow_rotate=%d heat_shadow_hour=%d heat_shadow_bits=%d heat_shadow_fill_ppm=%d heat_shadow_cap=%d heat_shadow_bytes=%d heat_shadow_sample_cap=%d heat_shadow_sample_entries=%d heat_shadow_sample_tp=%d heat_shadow_sample_fp=%d heat_shadow_sample_bypass=%d",
+		" heat_shadow=%t heat_shadow_drop_enabled=%t heat_shadow_drop=%d heat_shadow_check=%d heat_shadow_new=%d heat_shadow_prob_dup=%d heat_shadow_bypass=%d heat_shadow_rotate=%d heat_shadow_hour=%d heat_shadow_bits=%d heat_shadow_fill_ppm=%d heat_shadow_cap=%d heat_shadow_bytes=%d heat_shadow_sample_cap=%d heat_shadow_sample_entries=%d heat_shadow_sample_tp=%d heat_shadow_sample_fp=%d heat_shadow_sample_bypass=%d",
 		current.heatShadow.enabled,
+		current.heatShadow.dropProbableDuplicates,
+		current.heatShadow.dropped-previous.heatShadow.dropped,
 		current.heatShadow.checks-previous.heatShadow.checks,
 		current.heatShadow.new-previous.heatShadow.new,
 		current.heatShadow.probableDuplicates-previous.heatShadow.probableDuplicates,

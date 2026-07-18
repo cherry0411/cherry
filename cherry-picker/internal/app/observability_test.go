@@ -11,7 +11,7 @@ func TestFormatRuntimeGaugesUsesGaugesAndCounterDeltas(t *testing.T) {
 	previous := statsSnapshot{
 		dhtBlacklistRejected: 3,
 		heatShadow: heatShadowStatsSnapshot{
-			checks: 100, probableDuplicates: 20, sampledTruePositive: 3,
+			dropped: 5, checks: 100, probableDuplicates: 20, sampledTruePositive: 3,
 		},
 		infohashLRU: cache.LRUStats{
 			Hits: 10, Misses: 20, Inserts: 20, Evicts: 2, DeleteMisses: 1,
@@ -31,7 +31,8 @@ func TestFormatRuntimeGaugesUsesGaugesAndCounterDeltas(t *testing.T) {
 		dhtBlacklistMax:      1000,
 		dhtBlacklistRejected: 7,
 		heatShadow: heatShadowStatsSnapshot{
-			enabled: true, checks: 130, new: 21, probableDuplicates: 29,
+			enabled: true, dropProbableDuplicates: true, dropped: 11,
+			checks: 130, new: 21, probableDuplicates: 29,
 			currentBitFillPPM: 12345, capacity: 1_000_000, bytes: 4_500_000,
 			sampledTruePositive: 7, sampledFalsePositive: 2,
 		},
@@ -48,7 +49,8 @@ func TestFormatRuntimeGaugesUsesGaugesAndCounterDeltas(t *testing.T) {
 		"lru_ih_len=90", "lru_ih_oldest_s=60", "lru_ih_hit=15",
 		"lru_ih_miss=10", "lru_ih_insert=10", "lru_ih_evict=5",
 		"lru_ih_del_miss=2",
-		"heat_shadow=true", "heat_shadow_check=30", "heat_shadow_prob_dup=9",
+		"heat_shadow=true", "heat_shadow_drop_enabled=true", "heat_shadow_drop=6",
+		"heat_shadow_check=30", "heat_shadow_prob_dup=9",
 		"heat_shadow_fill_ppm=12345", "heat_shadow_cap=1000000", "heat_shadow_bytes=4500000",
 		"heat_shadow_sample_tp=4", "heat_shadow_sample_fp=2",
 	} {

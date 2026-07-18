@@ -3,6 +3,7 @@ package heat
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -60,6 +61,252 @@ func TestCollectorShadowBloomNeverChangesAdmission(t *testing.T) {
 	if err := collector.Close(closeCtx); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func TestCollectorDisabledBloomNeverChangesAdmission(t *testing.T) {
+	now := time.Date(2026, 7, 18, 6, 0, 0, 0, time.UTC)
+	collector := newBloomAdmissionCollector(t, now, false, false, 8)
+	hash := string(bytes.Repeat([]byte{0x70}, 20))
+	if !collector.Observe(hash, "8.8.8.8", now) || !collector.Observe(hash, "8.8.8.8", now) {
+		t.Fatal("disabled Bloom changed queue admission")
+	}
+	snapshot := collector.Snapshot()
+	if snapshot.Queued != 2 || snapshot.ShadowBloomEnabled || snapshot.ShadowBloomDropped != 0 {
+		t.Fatalf("snapshot=%+v", snapshot)
+	}
+}
+
+func TestCollectorHardBloomDropsOnlySameHourDuplicates(t *testing.T) {
+	now := time.Date(2026, 7, 18, 6, 0, 0, 0, time.UTC)
+	// DropProbableDuplicates alone deliberately enables the underlying Bloom;
+	// an operator cannot silently select a no-op hard-filter configuration.
+	collector := newBloomAdmissionCollector(t, now, false, true, 16)
+	hash := string(bytes.Repeat([]byte{0x73}, 20))
+	if !collector.Observe(hash, "8.8.8.8", now) {
+		t.Fatal("first current-hour observation was not admitted")
+	}
+	if collector.Observe(hash, "8.8.8.8", now) {
+		t.Fatal("same-hour duplicate was admitted in hard mode")
+	}
+
+	nextHour := now.Add(time.Hour)
+	if !collector.Observe(hash, "8.8.8.8", nextHour) {
+		t.Fatal("first observation in a new hour was not admitted")
+	}
+	if collector.Observe(hash, "8.8.8.8", nextHour) {
+		t.Fatal("new-hour duplicate was admitted in hard mode")
+	}
+	// The retained previous-hour slot remains an eligible hard-filter window.
+	if collector.Observe(hash, "8.8.8.8", now) {
+		t.Fatal("previous-hour duplicate was admitted in hard mode")
+	}
+
+	snapshot := collector.Snapshot()
+	if !snapshot.ShadowBloomEnabled || !snapshot.ShadowBloomDropProbableDuplicates ||
+		snapshot.Queued != 2 || snapshot.ShadowBloomDropped != 3 ||
+		snapshot.Filtered != 0 || snapshot.QueueDropped != 0 {
+		t.Fatalf("snapshot=%+v", snapshot)
+	}
+}
+
+func TestCollectorHardBloomConcurrentDuplicateAdmissionIsSingleWinner(t *testing.T) {
+	now := time.Date(2026, 7, 18, 7, 0, 0, 0, time.UTC)
+	collector := newBloomAdmissionCollector(t, now, true, true, 128)
+	hash := string(bytes.Repeat([]byte{0x76}, 20))
+	const attempts = 64
+	var admitted atomic.Uint64
+	var workers sync.WaitGroup
+	workers.Add(attempts)
+	for range attempts {
+		go func() {
+			defer workers.Done()
+			if collector.Observe(hash, "8.8.8.8", now) {
+				admitted.Add(1)
+			}
+		}()
+	}
+	workers.Wait()
+
+	if got := admitted.Load(); got != 1 {
+		t.Fatalf("admitted=%d want=1", got)
+	}
+	snapshot := collector.Snapshot()
+	if snapshot.Queued != 1 || snapshot.ShadowBloomDropped != attempts-1 ||
+		snapshot.ShadowBloomProbableDuplicates != attempts-1 {
+		t.Fatalf("snapshot=%+v", snapshot)
+	}
+}
+
+func TestCollectorHardBloomCapacityAndOldHourFailOpen(t *testing.T) {
+	now := time.Date(2026, 7, 18, 10, 0, 0, 0, time.UTC)
+	capacityCollector := newBloomAdmissionCollector(t, now, true, true, 1)
+	first := string(bytes.Repeat([]byte{0x74}, 20))
+	second := string(bytes.Repeat([]byte{0x75}, 20))
+	if !capacityCollector.Observe(first, "8.8.8.8", now) ||
+		!capacityCollector.Observe(second, "8.8.4.4", now) {
+		t.Fatal("capacity bypass did not fail open")
+	}
+	capacitySnapshot := capacityCollector.Snapshot()
+	if capacitySnapshot.Queued != 2 || capacitySnapshot.ShadowBloomBypassed != 1 ||
+		capacitySnapshot.ShadowBloomDropped != 0 {
+		t.Fatalf("capacity snapshot=%+v", capacitySnapshot)
+	}
+
+	oldHourCollector := newBloomAdmissionCollector(t, now, true, true, 16)
+	if !oldHourCollector.Observe(first, "8.8.8.8", now) {
+		t.Fatal("current observation was not admitted")
+	}
+	if !oldHourCollector.Observe(second, "8.8.4.4", now.Add(-2*time.Hour)) {
+		t.Fatal("hour older than retained slots did not fail open")
+	}
+	oldSnapshot := oldHourCollector.Snapshot()
+	if oldSnapshot.Queued != 2 || oldSnapshot.ShadowBloomBypassed != 1 ||
+		oldSnapshot.ShadowBloomDropped != 0 {
+		t.Fatalf("old-hour snapshot=%+v", oldSnapshot)
+	}
+}
+
+func TestCollectorHardBloomDoesNotObserveRejectedFutureDay(t *testing.T) {
+	now := time.Date(2026, 7, 18, 10, 0, 0, 0, time.UTC)
+	collector := newBloomAdmissionCollector(t, now, true, true, 16)
+	collector.failed.Store(true)
+	hash := string(bytes.Repeat([]byte{0x77}, 20))
+	if collector.Observe(hash, "8.8.8.8", now.Add(24*time.Hour)) {
+		t.Fatal("failed collector admitted future-day observation")
+	}
+	snapshot := collector.Snapshot()
+	if snapshot.ShadowBloomChecks != 0 || snapshot.ShadowBloomDropped != 0 ||
+		snapshot.QueueDropped != 1 {
+		t.Fatalf("rejected future day polluted hard Bloom: %+v", snapshot)
+	}
+}
+
+func TestCollectorHardBloomQueueFullDoesNotPoisonRetry(t *testing.T) {
+	now := time.Date(2026, 7, 18, 11, 0, 0, 0, time.UTC)
+	collector := newBloomAdmissionCollector(t, now, true, true, 128)
+
+	// Park the writer on a barrier, then deterministically fill its queue.
+	barrier := make(chan bool)
+	collector.queue <- writerItem{barrier: barrier}
+	waitFor(t, time.Second, func() bool { return len(collector.queue) == 0 })
+	filler, ok := collector.identity.observation(string(bytes.Repeat([]byte{0x78}, 20)), "8.8.4.4", now)
+	if !ok {
+		t.Fatal("could not build filler observation")
+	}
+	for range cap(collector.queue) {
+		collector.queue <- writerItem{observation: filler}
+	}
+
+	hash := string(bytes.Repeat([]byte{0x79}, 20))
+	if collector.Observe(hash, "8.8.8.8", now) {
+		t.Fatal("full queue unexpectedly admitted observation")
+	}
+	failed := collector.Snapshot()
+	if failed.QueueDropped != 1 || failed.ShadowBloomChecks != 1 ||
+		failed.ShadowBloomNew != 1 || failed.ShadowBloomDropped != 0 {
+		t.Fatalf("full-queue snapshot=%+v", failed)
+	}
+
+	<-barrier
+	waitFor(t, time.Second, func() bool { return len(collector.queue) == 0 })
+	if !collector.Observe(hash, "8.8.8.8", now) {
+		t.Fatal("queue-full observation did not remain retryable")
+	}
+	if collector.Observe(hash, "8.8.8.8", now) {
+		t.Fatal("duplicate after successful retry was admitted")
+	}
+	retried := collector.Snapshot()
+	if retried.Queued != 1 || retried.QueueDropped != 1 || retried.ShadowBloomNew != 2 ||
+		retried.ShadowBloomDropped != 1 {
+		t.Fatalf("retry snapshot=%+v", retried)
+	}
+}
+
+func TestCollectorHardBloomSampledFalsePositiveIsVisible(t *testing.T) {
+	now := time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)
+	collector := newBloomAdmissionCollector(t, now, true, true, 100)
+	rawHash, observation := findSampledCollectorObservation(t, collector, "8.8.8.8", now)
+	forceShadowBloomPositive(t, collector.shadow, observation)
+
+	if collector.Observe(rawHash, "8.8.8.8", now) {
+		t.Fatal("forced probable false positive was admitted in hard mode")
+	}
+	snapshot := collector.Snapshot()
+	if snapshot.Queued != 0 || snapshot.ShadowBloomDropped != 1 ||
+		snapshot.ShadowBloomSampledFalsePositive != 1 || snapshot.ShadowBloomSampleEntries != 1 {
+		t.Fatalf("sampled false-positive snapshot=%+v", snapshot)
+	}
+}
+
+func newBloomAdmissionCollector(t *testing.T, now time.Time, enabled, drop bool, capacity int) *Collector {
+	t.Helper()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		writeAcceptedACK(t, w, r, body)
+	}))
+	t.Cleanup(server.Close)
+	collector, err := New(Options{
+		Endpoint: server.URL, CrawlerID: "bloom-admission", SpoolDir: t.TempDir(),
+		SpoolMaxBytes: 1 << 20, QueueCapacity: 16, BatchSize: 16,
+		FlushDelay: time.Hour, MasterSecret: testMasterSecret, HMACSecret: testHMACSecret,
+		LocalAddresses: []netip.Addr{}, Now: func() time.Time { return now },
+		ShadowBloomEnabled: enabled, ShadowBloomDropProbableDuplicates: drop,
+		ShadowBloomCapacity: capacity, ShadowBloomFalsePositive: 1_000,
+		ShadowBloomSampleCapacity: 32,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		if err := collector.Close(ctx); err != nil {
+			t.Errorf("close collector: %v", err)
+		}
+	})
+	return collector
+}
+
+func findSampledCollectorObservation(t *testing.T, collector *Collector, ip string, now time.Time) (string, Observation) {
+	t.Helper()
+	var raw [20]byte
+	for candidate := uint64(1); candidate < 10_000_000; candidate++ {
+		binary.BigEndian.PutUint64(raw[:8], candidate)
+		obs, ok := collector.identity.observation(string(raw[:]), ip, now)
+		if !ok {
+			t.Fatal("test observation rejected")
+		}
+		key := makeShadowBloomKey(uint64(obs.Day)*24+uint64(obs.Hour), obs)
+		if deterministicShadowHash(key)&shadowSampleMask == 0 {
+			return string(raw[:]), obs
+		}
+	}
+	t.Fatal("could not find sampled collector observation")
+	return "", Observation{}
+}
+
+func forceShadowBloomPositive(t *testing.T, shadow *hourBloomShadow, obs Observation) {
+	t.Helper()
+	hour := uint64(obs.Day)*24 + uint64(obs.Hour)
+	key := makeShadowBloomKey(hour, obs)
+	shadow.gate.Lock()
+	slot, tooOld := shadow.prepareHourLocked(hour)
+	if tooOld || slot == nil {
+		shadow.gate.Unlock()
+		t.Fatal("could not prepare Bloom slot")
+	}
+	h1 := maphashBytesForTest(shadow, key)
+	h2 := mixShadowHash(h1^deterministicShadowHash(key)) | 1
+	block := (h1 >> 9) % slot.blocks
+	shard := &slot.shards[block%uint64(len(slot.shards))]
+	base := block / uint64(len(slot.shards)) * shadowBloomBlockWords
+	shard.mu.Lock()
+	for i := uint64(0); i < uint64(shadow.k); i++ {
+		bit := (h1 + i*h2) & (shadowBloomBlockBits - 1)
+		shard.words[base+bit/64] |= uint64(1) << (bit & 63)
+	}
+	shard.mu.Unlock()
+	shadow.gate.Unlock()
 }
 
 func TestCollectorResponseLossReplaysIdenticalBodyAndReceipt(t *testing.T) {

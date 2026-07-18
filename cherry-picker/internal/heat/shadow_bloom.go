@@ -58,6 +58,10 @@ type shadowBloomResult struct {
 
 type shadowBloomKey [36]byte
 
+func shouldDropShadowBloomResult(enabled bool, result shadowBloomResult) bool {
+	return enabled && result.probableDuplicate && !result.bypassed
+}
+
 type shadowBloomShard struct {
 	mu    sync.Mutex
 	words []uint64
@@ -210,6 +214,42 @@ func (s *hourBloomShadow) observe(obs Observation) shadowBloomResult {
 	}
 }
 
+// observeAndAdmit is the hard-filter transaction. For a new key, Bloom bits
+// become visible only after admit succeeds; a full downstream queue therefore
+// cannot poison the retained hour and suppress a later retry. Probable
+// duplicates are rejected without calling admit. Bloom capacity and stale-hour
+// bypasses call admit directly and remain fail-open.
+func (s *hourBloomShadow) observeAndAdmit(obs Observation, admit func() bool) (bool, shadowBloomResult) {
+	s.checks.Add(1)
+	hour := uint64(obs.Day)*24 + uint64(obs.Hour)
+	key := makeShadowBloomKey(hour, obs)
+
+	for {
+		s.gate.RLock()
+		slot := s.slotForHourLocked(hour)
+		if slot != nil {
+			result, admitted := s.observeSlotAndAdmit(slot, key, admit)
+			s.gate.RUnlock()
+			s.record(result)
+			return admitted, result
+		}
+		s.gate.RUnlock()
+
+		s.gate.Lock()
+		slot, tooOld := s.prepareHourLocked(hour)
+		if tooOld {
+			s.gate.Unlock()
+			result := shadowBloomResult{bypassed: true}
+			s.record(result)
+			return admit(), result
+		}
+		result, admitted := s.observeSlotAndAdmit(slot, key, admit)
+		s.gate.Unlock()
+		s.record(result)
+		return admitted, result
+	}
+}
+
 func (s *hourBloomShadow) slotForHourLocked(hour uint64) *shadowBloomHourSlot {
 	for _, slot := range s.slots {
 		if slot.valid && slot.hour == hour {
@@ -299,9 +339,52 @@ func (s *hourBloomShadow) observeSlot(slot *shadowBloomHourSlot, key shadowBloom
 	return result
 }
 
+func (s *hourBloomShadow) observeSlotAndAdmit(slot *shadowBloomHourSlot, key shadowBloomKey, admit func() bool) (shadowBloomResult, bool) {
+	sampled := deterministicShadowHash(key)&shadowSampleMask == 0
+	if !sampled {
+		return slot.testAndAdmit(key, s.seed, s.k, admit)
+	}
+
+	slot.sampleMu.Lock()
+	defer slot.sampleMu.Unlock()
+	_, exactDuplicate := slot.sampleKeys[key]
+	result, admitted := slot.testAndAdmit(key, s.seed, s.k, admit)
+	result.sampled = true
+	if result.bypassed {
+		result.sampledBypassed = true
+		return result, admitted
+	}
+	if !exactDuplicate {
+		if len(slot.sampleKeys) >= slot.sampleCap {
+			result.sampledBypassed = true
+			return result, admitted
+		}
+		// The exact oracle is updated before Collector acts on the returned
+		// probable-duplicate decision, including a sampled false positive.
+		slot.sampleKeys[key] = struct{}{}
+	}
+	if result.probableDuplicate {
+		if exactDuplicate {
+			result.sampledTrue = true
+		} else {
+			result.sampledFalse = true
+		}
+	}
+	return result, admitted
+}
+
 func (slot *shadowBloomHourSlot) testAndAdd(key shadowBloomKey, seed maphash.Seed, k uint8) shadowBloomResult {
+	result, _ := slot.testAndAdmit(key, seed, k, nil)
+	return result
+}
+
+func (slot *shadowBloomHourSlot) testAndAdmit(key shadowBloomKey, seed maphash.Seed, k uint8, admit func() bool) (shadowBloomResult, bool) {
 	if slot.newCount.Load() >= slot.capacity {
-		return shadowBloomResult{bypassed: true}
+		result := shadowBloomResult{bypassed: true}
+		if admit != nil {
+			return result, admit()
+		}
+		return result, false
 	}
 	h1 := maphash.Bytes(seed, key[:])
 	h2 := mixShadowHash(h1^deterministicShadowHash(key)) | 1
@@ -323,7 +406,7 @@ func (slot *shadowBloomHourSlot) testAndAdd(key shadowBloomKey, seed maphash.See
 		}
 	}
 	if !missing {
-		return shadowBloomResult{probableDuplicate: true}
+		return shadowBloomResult{probableDuplicate: true}, false
 	}
 
 	// Reserve one of the bounded per-hour "new" admissions before mutating
@@ -331,11 +414,21 @@ func (slot *shadowBloomHourSlot) testAndAdd(key shadowBloomKey, seed maphash.See
 	for {
 		count := slot.newCount.Load()
 		if count >= slot.capacity {
-			return shadowBloomResult{bypassed: true}
+			result := shadowBloomResult{bypassed: true}
+			if admit != nil {
+				return result, admit()
+			}
+			return result, false
 		}
 		if slot.newCount.CompareAndSwap(count, count+1) {
 			break
 		}
+	}
+	if admit != nil && !admit() {
+		// Release the cross-shard capacity reservation without publishing any
+		// bits. The next observation remains eligible to retry admission.
+		slot.newCount.Add(^uint64(0))
+		return shadowBloomResult{new: true}, false
 	}
 	var added uint64
 	for i := uint64(0); i < uint64(k); i++ {
@@ -348,7 +441,7 @@ func (slot *shadowBloomHourSlot) testAndAdd(key shadowBloomKey, seed maphash.See
 		}
 	}
 	slot.bitsSet.Add(added)
-	return shadowBloomResult{new: true}
+	return shadowBloomResult{new: true}, true
 }
 
 func (s *hourBloomShadow) record(result shadowBloomResult) {
