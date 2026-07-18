@@ -142,6 +142,9 @@ func New(opts Options) (*Collector, error) {
 	if len(hmacSecret) < 32 {
 		return nil, errors.New("heat: HMAC secret must contain at least 32 raw bytes")
 	}
+	if bytes.Equal(master, hmacSecret) {
+		return nil, errors.New("heat: actor master secret and HMAC transport secret must be distinct")
+	}
 	endpoint, err := validateEndpoint(opts.Endpoint)
 	if err != nil {
 		return nil, err

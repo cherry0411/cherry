@@ -20,6 +20,8 @@ import (
 	"time"
 )
 
+var testHMACSecret = []byte("abcdef0123456789abcdef0123456789")
+
 type capturedDelivery struct {
 	body   []byte
 	header http.Header
@@ -55,7 +57,7 @@ func TestCollectorResponseLossReplaysIdenticalBodyAndReceipt(t *testing.T) {
 		Endpoint: server.URL, CrawlerID: "jp-crawler-01", SpoolDir: t.TempDir(),
 		SpoolMaxBytes: 1 << 20, QueueCapacity: 32, BatchSize: 8,
 		FlushDelay: 5 * time.Millisecond, RetryBackoff: 5 * time.Millisecond,
-		MasterSecret: testMasterSecret, HMACSecret: testMasterSecret, LocalAddresses: []netip.Addr{},
+		MasterSecret: testMasterSecret, HMACSecret: testHMACSecret, LocalAddresses: []netip.Addr{},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -80,7 +82,8 @@ func TestCollectorResponseLossReplaysIdenticalBodyAndReceipt(t *testing.T) {
 		t.Fatal("response-loss replay changed CHHT body")
 	}
 	for _, delivery := range deliveries {
-		if delivery.header.Get("X-API-Key") != "" || bytes.Contains(delivery.body, testMasterSecret) {
+		if delivery.header.Get("X-API-Key") != "" || bytes.Contains(delivery.body, testMasterSecret) ||
+			bytes.Contains(delivery.body, testHMACSecret) {
 			t.Fatal("raw HMAC secret left the crawler process")
 		}
 	}
@@ -126,7 +129,7 @@ func TestCollectorRejectsArbitrary2xxAndMismatchedHTTP200WithoutDeletingSpool(t 
 	collector, err := New(Options{
 		Endpoint: server.URL, CrawlerID: "crawler", SpoolDir: t.TempDir(), SpoolMaxBytes: 1 << 20,
 		QueueCapacity: 8, BatchSize: 8, FlushDelay: time.Millisecond, RetryBackoff: time.Millisecond,
-		MasterSecret: testMasterSecret, HMACSecret: testMasterSecret, LocalAddresses: []netip.Addr{},
+		MasterSecret: testMasterSecret, HMACSecret: testHMACSecret, LocalAddresses: []netip.Addr{},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -172,7 +175,7 @@ func TestCollectorRejectsMismatchedDayClosedReceiptWithoutAdvancing(t *testing.T
 	collector, err := New(Options{
 		Endpoint: server.URL, CrawlerID: "crawler", SpoolDir: t.TempDir(), SpoolMaxBytes: 1 << 20,
 		QueueCapacity: 8, BatchSize: 8, FlushDelay: time.Millisecond, RetryBackoff: time.Millisecond,
-		MasterSecret: testMasterSecret, HMACSecret: testMasterSecret, LocalAddresses: []netip.Addr{},
+		MasterSecret: testMasterSecret, HMACSecret: testHMACSecret, LocalAddresses: []netip.Addr{},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -206,7 +209,7 @@ func TestCollectorNeverFollowsEndpointRedirects(t *testing.T) {
 	collector, err := New(Options{
 		Endpoint: redirector.URL, CrawlerID: "crawler", SpoolDir: t.TempDir(), SpoolMaxBytes: 1 << 20,
 		QueueCapacity: 8, BatchSize: 8, FlushDelay: time.Millisecond, RetryBackoff: time.Millisecond,
-		MasterSecret: testMasterSecret, HMACSecret: testMasterSecret, LocalAddresses: []netip.Addr{},
+		MasterSecret: testMasterSecret, HMACSecret: testHMACSecret, LocalAddresses: []netip.Addr{},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -249,7 +252,7 @@ func TestCollectorAdvancesOnlyStrictDayClosedNegativeReceipt(t *testing.T) {
 	collector, err := New(Options{
 		Endpoint: server.URL, CrawlerID: "crawler", SpoolDir: t.TempDir(), SpoolMaxBytes: 1 << 20,
 		QueueCapacity: 8, BatchSize: 8, FlushDelay: time.Millisecond, RetryBackoff: time.Millisecond,
-		MasterSecret: testMasterSecret, HMACSecret: testMasterSecret, LocalAddresses: []netip.Addr{},
+		MasterSecret: testMasterSecret, HMACSecret: testHMACSecret, LocalAddresses: []netip.Addr{},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -338,7 +341,7 @@ func TestCollectorNeverPersistsRawIPAndExposesEndpointFailure(t *testing.T) {
 	collector, err := New(Options{
 		Endpoint: server.URL, CrawlerID: "crawler", SpoolDir: dir, SpoolMaxBytes: 1 << 20,
 		QueueCapacity: 32, BatchSize: 8, FlushDelay: time.Millisecond, RetryBackoff: 10 * time.Millisecond,
-		MasterSecret: testMasterSecret, HMACSecret: testMasterSecret, LocalAddresses: []netip.Addr{},
+		MasterSecret: testMasterSecret, HMACSecret: testHMACSecret, LocalAddresses: []netip.Addr{},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -379,7 +382,7 @@ func TestCollectorQueueAndCapacityDropsAreExplicitAndNonBlocking(t *testing.T) {
 	collector, err := New(Options{
 		Endpoint: server.URL, CrawlerID: "crawler", SpoolDir: t.TempDir(), SpoolMaxBytes: 512,
 		QueueCapacity: 4, BatchSize: 4, FlushDelay: time.Millisecond, RetryBackoff: 100 * time.Millisecond,
-		MasterSecret: testMasterSecret, HMACSecret: testMasterSecret, LocalAddresses: []netip.Addr{},
+		MasterSecret: testMasterSecret, HMACSecret: testHMACSecret, LocalAddresses: []netip.Addr{},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -448,7 +451,7 @@ func TestCollectorCompletesOnlyFullLosslessDayAfterCrossDaySpoolDrain(t *testing
 		Endpoint: server.URL + "/api/v1/heat/batches", CrawlerID: "jp-crawler-01",
 		SpoolDir: t.TempDir(), SpoolMaxBytes: 1 << 20, QueueCapacity: 16, BatchSize: 8,
 		FlushDelay: time.Millisecond, RetryBackoff: time.Millisecond, Now: func() time.Time { return now },
-		MasterSecret: testMasterSecret, HMACSecret: testMasterSecret, LocalAddresses: []netip.Addr{},
+		MasterSecret: testMasterSecret, HMACSecret: testHMACSecret, LocalAddresses: []netip.Addr{},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -517,7 +520,7 @@ func TestCompletionResponseLossReplaysIdenticalIdentity(t *testing.T) {
 		Endpoint: server.URL + "/api/v1/heat/batches", CrawlerID: "jp-crawler-01",
 		SpoolDir: t.TempDir(), SpoolMaxBytes: 1 << 20, QueueCapacity: 8, BatchSize: 8,
 		RetryBackoff: time.Millisecond, Now: func() time.Time { return now },
-		MasterSecret: testMasterSecret, HMACSecret: testMasterSecret, LocalAddresses: []netip.Addr{},
+		MasterSecret: testMasterSecret, HMACSecret: testHMACSecret, LocalAddresses: []netip.Addr{},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -568,7 +571,7 @@ func TestTooEarlyBatchNeverAdvancesSpoolUntilAuthenticatedACK(t *testing.T) {
 		Endpoint: server.URL + "/api/v1/heat/batches", CrawlerID: "jp-crawler-01",
 		SpoolDir: t.TempDir(), SpoolMaxBytes: 1 << 20, QueueCapacity: 8, BatchSize: 8,
 		RetryBackoff: 5 * time.Millisecond, Now: func() time.Time { return now },
-		MasterSecret: testMasterSecret, HMACSecret: testMasterSecret, LocalAddresses: []netip.Addr{},
+		MasterSecret: testMasterSecret, HMACSecret: testHMACSecret, LocalAddresses: []netip.Addr{},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -616,7 +619,7 @@ func TestTooEarlyCompletionRemainsPendingUntilStorageDayCloses(t *testing.T) {
 		Endpoint: server.URL + "/api/v1/heat/batches", CrawlerID: "jp-crawler-01",
 		SpoolDir: t.TempDir(), SpoolMaxBytes: 1 << 20, QueueCapacity: 8, BatchSize: 8,
 		RetryBackoff: 5 * time.Millisecond, Now: func() time.Time { return now },
-		MasterSecret: testMasterSecret, HMACSecret: testMasterSecret, LocalAddresses: []netip.Addr{},
+		MasterSecret: testMasterSecret, HMACSecret: testHMACSecret, LocalAddresses: []netip.Addr{},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -704,6 +707,23 @@ func TestCompletionStateCrashAndGracefulRestartBothPoisonActiveDay(t *testing.T)
 	}
 }
 
+func TestNewRejectsActorMasterAsHMACTransportSecret(t *testing.T) {
+	collector, err := New(Options{
+		Endpoint: "http://127.0.0.1/heat", CrawlerID: "crawler", SpoolDir: t.TempDir(),
+		MasterSecret:   testMasterSecret,
+		HMACSecret:     append([]byte(nil), testMasterSecret...),
+		LocalAddresses: []netip.Addr{},
+	})
+	if err == nil {
+		_ = collector.Close(context.Background())
+		t.Fatal("actor master accepted as HMAC transport secret")
+	}
+	const want = "heat: actor master secret and HMAC transport secret must be distinct"
+	if err.Error() != want {
+		t.Fatalf("New() error = %q, want %q", err, want)
+	}
+}
+
 func TestNewRejectsShortSigningSecretAndInsecureRemoteEndpoint(t *testing.T) {
 	base := Options{
 		Endpoint: "http://127.0.0.1/heat", CrawlerID: "crawler", SpoolDir: t.TempDir(),
@@ -713,7 +733,7 @@ func TestNewRejectsShortSigningSecretAndInsecureRemoteEndpoint(t *testing.T) {
 		collector.Close(context.Background())
 		t.Fatal("short HMAC secret accepted")
 	}
-	base.HMACSecret = testMasterSecret
+	base.HMACSecret = testHMACSecret
 	base.Endpoint = "http://storage.example/heat"
 	if collector, err := New(base); err == nil {
 		collector.Close(context.Background())
@@ -875,7 +895,7 @@ func BenchmarkCollectorObserveAdmission(b *testing.B) {
 	collector, err := New(Options{
 		Endpoint: server.URL, CrawlerID: "benchmark", SpoolDir: b.TempDir(), SpoolMaxBytes: 64 << 20,
 		QueueCapacity: 1 << 20, BatchSize: 4096, MasterSecret: testMasterSecret,
-		HMACSecret: testMasterSecret, LocalAddresses: []netip.Addr{},
+		HMACSecret: testHMACSecret, LocalAddresses: []netip.Addr{},
 	})
 	if err != nil {
 		b.Fatal(err)
