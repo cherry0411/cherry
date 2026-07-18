@@ -346,6 +346,11 @@ type routingTable struct {
 	// nodeCount 无锁近似节点计数，供爬虫模式快速路径判断路由表是否已满。
 	// 使用 atomic.Int64 避免获取写锁。
 	nodeCount int64
+	// These counters make crawl-table turnover observable without changing the
+	// admission algorithm. They are critical when diagnosing long-run decay.
+	nodesInserted  atomic.Uint64
+	nodesRemoved   atomic.Uint64
+	refreshQueries atomic.Uint64
 
 	// 爬虫模式预缓存：K 个邻居节点的 compact node info 拼接字符串，每秒刷新一次。
 	// 热路径直接原子读取，替代每请求 O(n×logK) 路由表扫描。
@@ -408,6 +413,7 @@ func (rt *routingTable) Insert(nd *node) bool {
 			rt.cachedKBuckets.Push(bucket.prefix.String(), bucket)
 			if isNew {
 				atomic.AddInt64(&rt.nodeCount, 1)
+				rt.nodesInserted.Add(1)
 			}
 
 			return isNew
@@ -572,6 +578,7 @@ func (rt *routingTable) Remove(id *bitmap) {
 		rt.cachedNodes.Delete(nd.addr.String())
 		rt.cachedKBuckets.Push(bucket.prefix.String(), bucket)
 		atomic.AddInt64(&rt.nodeCount, -1)
+		rt.nodesRemoved.Add(1)
 	}
 }
 
@@ -599,6 +606,7 @@ func (rt *routingTable) Fresh() {
 			if i < rt.dht.RefreshNodeNum {
 				no := e.Value.(*node)
 				rt.dht.transactionManager.findNode(no, bucket.RandomChildID())
+				rt.refreshQueries.Add(1)
 				rt.clearQueue.PushBack(no)
 			}
 			i++

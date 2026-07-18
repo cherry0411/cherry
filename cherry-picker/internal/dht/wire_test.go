@@ -80,3 +80,15 @@ func TestWireBlacklistsHandshakeFailureAcrossInfohashes(t *testing.T) {
 		t.Fatalf("Blacklisted = %d, want 1", got)
 	}
 }
+
+func TestWireCountsPreDialQueueDrop(t *testing.T) {
+	wire := NewWire(64, 1, 1)
+	wire.Request(make([]byte, 20), "127.0.0.1", 1)
+	wire.Request(make([]byte, 20), "127.0.0.1", 2)
+	if got := wire.Stats.QueueDropped.Load(); got != 1 {
+		t.Fatalf("QueueDropped = %d, want 1", got)
+	}
+	if got := wire.RequestDepth(); got != 1 {
+		t.Fatalf("RequestDepth = %d, want 1", got)
+	}
+}

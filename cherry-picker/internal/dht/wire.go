@@ -171,6 +171,7 @@ type Response struct {
 
 // WireStats 提供 wire 层的诊断计数器，所有字段均为原子操作安全。
 type WireStats struct {
+	QueueDropped    atomic.Int64 // request channel 满时、拨号前丢弃
 	DialAttempts    atomic.Int64 // TCP dial 尝试次数
 	DialOK          atomic.Int64 // TCP dial 成功
 	DialFailed      atomic.Int64 // TCP dial 失败
@@ -234,6 +235,7 @@ func (wire *Wire) Request(infoHash []byte, ip string, port int) {
 	select {
 	case wire.requests <- Request{InfoHash: infoHash, IP: ip, Port: port}:
 	default:
+		wire.Stats.QueueDropped.Add(1)
 	}
 }
 

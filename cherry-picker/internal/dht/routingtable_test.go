@@ -2,6 +2,7 @@ package dht
 
 import (
 	"net"
+	"sync/atomic"
 	"testing"
 )
 
@@ -66,6 +67,30 @@ func TestGetTopKNodesReturnsTrueClosestNodes(t *testing.T) {
 		if distance := no.id.data[len(no.id.data)-1]; distance != want[i] {
 			t.Fatalf("result[%d] distance = %d, want %d", i, distance, want[i])
 		}
+	}
+}
+
+func TestRoutingTurnoverCounters(t *testing.T) {
+	cfg := NewCrawlConfig()
+	d := &DHT{Config: cfg, blackList: newBlackList(64)}
+	rt := newRoutingTable(cfg.KBucketSize, d)
+	d.routingTable = rt
+	no, err := newNode(string([]byte("01234567890123456789")), "udp4", "203.0.113.10:6881")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !rt.Insert(no) {
+		t.Fatal("node was not inserted")
+	}
+	if got := rt.nodesInserted.Load(); got != 1 {
+		t.Fatalf("nodesInserted = %d, want 1", got)
+	}
+	rt.Remove(no.id)
+	if got := rt.nodesRemoved.Load(); got != 1 {
+		t.Fatalf("nodesRemoved = %d, want 1", got)
+	}
+	if got := atomic.LoadInt64(&rt.nodeCount); got != 0 {
+		t.Fatalf("nodeCount = %d, want 0", got)
 	}
 }
 

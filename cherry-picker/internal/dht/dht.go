@@ -204,14 +204,18 @@ type packetStats struct {
 }
 
 type PacketStats struct {
-	Received      uint64
-	Enqueued      uint64
-	Dropped       uint64
-	Handled       uint64
-	DecodeErrors  uint64
-	BytesReceived uint64
-	BytesSent     uint64
-	FollowupsSent uint64
+	Received       uint64
+	Enqueued       uint64
+	Dropped        uint64
+	Handled        uint64
+	DecodeErrors   uint64
+	BytesReceived  uint64
+	BytesSent      uint64
+	FollowupsSent  uint64
+	RoutingNodes   uint64
+	NodesInserted  uint64
+	NodesRemoved   uint64
+	RefreshQueries uint64
 }
 
 // New returns a DHT pointer. If config is nil, then config will be set to
@@ -396,7 +400,7 @@ func (dht *DHT) readWorkerCount() int {
 }
 
 func (dht *DHT) PacketStats() PacketStats {
-	return PacketStats{
+	stats := PacketStats{
 		Received:      dht.stats.received.Load(),
 		Enqueued:      dht.stats.enqueued.Load(),
 		Dropped:       dht.stats.dropped.Load(),
@@ -406,6 +410,13 @@ func (dht *DHT) PacketStats() PacketStats {
 		BytesSent:     dht.stats.bytesSent.Load(),
 		FollowupsSent: dht.stats.followupsSent.Load(),
 	}
+	if dht.routingTable != nil {
+		stats.RoutingNodes = uint64(max(0, int(atomic.LoadInt64(&dht.routingTable.nodeCount))))
+		stats.NodesInserted = dht.routingTable.nodesInserted.Load()
+		stats.NodesRemoved = dht.routingTable.nodesRemoved.Load()
+		stats.RefreshQueries = dht.routingTable.refreshQueries.Load()
+	}
+	return stats
 }
 
 // writeToUDP 发送 UDP 报文并累加出站字节计数（带宽可观测性）。

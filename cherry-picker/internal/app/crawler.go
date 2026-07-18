@@ -148,6 +148,11 @@ type statsSnapshot struct {
 	dhtBytesReceived        uint64
 	dhtBytesSent            uint64
 	dhtFollowupsSent        uint64
+	dhtRoutingNodes         uint64
+	dhtNodesInserted        uint64
+	dhtNodesRemoved         uint64
+	dhtRefreshQueries       uint64
+	wireQueueDropped        int64
 	wireDialAttempts        int64
 	wireDialOK              int64
 	wireDialFailed          int64
@@ -1178,6 +1183,11 @@ func (a *Application) emitStats(ctx context.Context, events chan<- pipeline.Even
 				dhtBytesReceived:        packetStats.BytesReceived,
 				dhtBytesSent:            packetStats.BytesSent,
 				dhtFollowupsSent:        packetStats.FollowupsSent,
+				dhtRoutingNodes:         packetStats.RoutingNodes,
+				dhtNodesInserted:        packetStats.NodesInserted,
+				dhtNodesRemoved:         packetStats.NodesRemoved,
+				dhtRefreshQueries:       packetStats.RefreshQueries,
+				wireQueueDropped:        downloader.Stats.QueueDropped.Load(),
 				wireDialAttempts:        downloader.Stats.DialAttempts.Load(),
 				wireDialOK:              downloader.Stats.DialOK.Load(),
 				wireDialFailed:          downloader.Stats.DialFailed.Load(),
@@ -1228,6 +1238,11 @@ func (a *Application) emitStats(ctx context.Context, events chan<- pipeline.Even
 					"dht_bytes_received":        current.dhtBytesReceived,
 					"dht_bytes_sent":            current.dhtBytesSent,
 					"dht_followups_sent":        current.dhtFollowupsSent,
+					"dht_routing_nodes":         current.dhtRoutingNodes,
+					"dht_nodes_inserted":        current.dhtNodesInserted,
+					"dht_nodes_removed":         current.dhtNodesRemoved,
+					"dht_refresh_queries":       current.dhtRefreshQueries,
+					"wire_queue_dropped":        uint64(current.wireQueueDropped),
 					"wire_dial_attempts":        uint64(current.wireDialAttempts),
 					"wire_dial_ok":              uint64(current.wireDialOK),
 					"wire_dial_failed":          uint64(current.wireDialFailed),
@@ -1248,13 +1263,17 @@ func (a *Application) logRuntimeDelta(current, previous statsSnapshot) {
 	netInKBps := (current.dhtBytesReceived - previous.dhtBytesReceived) / 1024 / interval
 	netOutKBps := (current.dhtBytesSent - previous.dhtBytesSent) / 1024 / interval
 	a.logger.Printf(
-		"runtime 30s: dht_recv=%d handled=%d dropped=%d decode_err=%d net_in=%dKB/s net_out=%dKB/s lookup_queue=%d lookup_drop=%d lookup_sent=%d follow_sent=%d sample_q=%d sample_resp=%d sample_hash=%d sample_unique=%d peer_sent=%d peer_drop=%d peer_dedup=%d meta_req=%d meta_req_dedup=%d meta_sent=%d meta_drop=%d meta_dedup=%d meta_filtered=%d check_drop=%d paused=%v wire_dial=%d wire_conn=%d wire_dial_fail=%d wire_hs=%d wire_hs_fail=%d wire_ok=%d wire_dl_fail=%d wire_bl=%d",
+		"runtime 30s: dht_recv=%d handled=%d dropped=%d decode_err=%d net_in=%dKB/s net_out=%dKB/s nodes=%d node_add=%d node_rm=%d refresh_q=%d lookup_queue=%d lookup_drop=%d lookup_sent=%d follow_sent=%d sample_q=%d sample_resp=%d sample_hash=%d sample_unique=%d peer_sent=%d peer_drop=%d peer_dedup=%d meta_req=%d meta_req_dedup=%d meta_sent=%d meta_drop=%d meta_dedup=%d meta_filtered=%d check_drop=%d paused=%v wire_q_drop=%d wire_dial=%d wire_conn=%d wire_dial_fail=%d wire_hs=%d wire_hs_fail=%d wire_ok=%d wire_dl_fail=%d wire_bl=%d",
 		current.dhtPacketsReceived-previous.dhtPacketsReceived,
 		current.dhtPacketsHandled-previous.dhtPacketsHandled,
 		current.dhtPacketsDropped-previous.dhtPacketsDropped,
 		current.dhtPacketDecodeErrors-previous.dhtPacketDecodeErrors,
 		netInKBps,
 		netOutKBps,
+		current.dhtRoutingNodes,
+		current.dhtNodesInserted-previous.dhtNodesInserted,
+		current.dhtNodesRemoved-previous.dhtNodesRemoved,
+		current.dhtRefreshQueries-previous.dhtRefreshQueries,
 		current.activeLookupsQueued-previous.activeLookupsQueued,
 		current.activeLookupsDropped-previous.activeLookupsDropped,
 		current.activeLookupsSent-previous.activeLookupsSent,
@@ -1274,6 +1293,7 @@ func (a *Application) logRuntimeDelta(current, previous statsSnapshot) {
 		current.metadataEventsFiltered-previous.metadataEventsFiltered,
 		current.checkBatchesDropped-previous.checkBatchesDropped,
 		a.metaPaused.Load(),
+		current.wireQueueDropped-previous.wireQueueDropped,
 		current.wireDialAttempts-previous.wireDialAttempts,
 		current.wireDialOK-previous.wireDialOK,
 		current.wireDialFailed-previous.wireDialFailed,
@@ -1477,6 +1497,10 @@ func (a *Application) aggregatePacketStats() dht.PacketStats {
 		agg.BytesReceived += ps.BytesReceived
 		agg.BytesSent += ps.BytesSent
 		agg.FollowupsSent += ps.FollowupsSent
+		agg.RoutingNodes += ps.RoutingNodes
+		agg.NodesInserted += ps.NodesInserted
+		agg.NodesRemoved += ps.NodesRemoved
+		agg.RefreshQueries += ps.RefreshQueries
 	}
 	return agg
 }
