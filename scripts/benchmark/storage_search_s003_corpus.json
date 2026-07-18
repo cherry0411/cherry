@@ -1,0 +1,112 @@
+{
+  "schema_version": 1,
+  "corpus_id": "cherry-search-s003-v1",
+  "total_documents": 10000,
+  "noise_seed": 20260718,
+  "groups": [
+    {
+      "id": "distributed_handbook",
+      "class": "exact_latin",
+      "query": "Distributed Systems Handbook",
+      "matching_strategy": "last",
+      "target_name": "Distributed Systems Handbook",
+      "secondary_name": "Distributed Systems Handbook Second Edition",
+      "aliases": ["distributed-systems-handbook.epub"],
+      "distractor_template": "Distributed Engineering Weekly {n}",
+      "distractor_count": 28
+    },
+    {
+      "id": "observability_pipeline",
+      "class": "partial_latin",
+      "query": "observability pipelines",
+      "matching_strategy": "last",
+      "target_name": "Practical Observability Pipelines for Cloud Systems",
+      "secondary_name": "Observability Pipelines Field Notes",
+      "aliases": ["chapter-07-pipeline-design.pdf"],
+      "distractor_template": "Observability Community Digest {n}",
+      "distractor_count": 28
+    },
+    {
+      "id": "galaxy_expedition",
+      "class": "exact_chinese",
+      "query": "银河远征",
+      "matching_strategy": "all",
+      "target_name": "银河远征",
+      "secondary_name": "银河远征 完整版",
+      "aliases": ["银河远征.2026.2160p.mkv"],
+      "distractor_template": "银河远征 观众讨论 第{n}期",
+      "distractor_count": 28
+    },
+    {
+      "id": "deep_learning",
+      "class": "partial_chinese",
+      "query": "深度 学习 实战",
+      "matching_strategy": "all",
+      "target_name": "深度学习实战",
+      "secondary_name": "深度学习实战 第二版",
+      "aliases": ["第03章-神经网络.mp4"],
+      "distractor_template": "深度学习实战课程点评 第{n}篇",
+      "distractor_count": 28
+    },
+    {
+      "id": "tokyo_drift",
+      "class": "mixed_script",
+      "query": "东京 Drift",
+      "matching_strategy": "all",
+      "target_name": "东京 Drift",
+      "secondary_name": "东京 Drift Original Soundtrack",
+      "aliases": ["Tokyo-Drift-FLAC.cue"],
+      "distractor_template": "东京 Drift 车迷评论 {n}",
+      "distractor_count": 28
+    },
+    {
+      "id": "blue_planet",
+      "class": "exact_title",
+      "query": "Blue Planet Documentary",
+      "matching_strategy": "last",
+      "target_name": "Blue Planet Documentary",
+      "secondary_name": "Blue Planet Documentary 4K Remaster",
+      "aliases": ["episode-01-ocean.mkv"],
+      "distractor_template": "Blue Community Video {n}",
+      "distractor_count": 28
+    },
+    {
+      "id": "ubuntu_iso_alias",
+      "class": "filename_alias_only",
+      "query": "ubuntu-24.04 server",
+      "matching_strategy": "last",
+      "target_name": "Linux 发布镜像归档",
+      "aliases": ["ubuntu-24.04-server-amd64.iso"],
+      "distractor_count": 0
+    },
+    {
+      "id": "wandering_earth_alias",
+      "class": "alias_chinese_only",
+      "query": "流浪地球2 4K",
+      "matching_strategy": "all",
+      "target_name": "科幻影片归档",
+      "aliases": ["流浪地球2.2023.4K.mkv"],
+      "distractor_count": 0
+    },
+    {
+      "id": "concert_alias",
+      "class": "alias_mixed_only",
+      "query": "Taylor Swift 东京",
+      "matching_strategy": "all",
+      "target_name": "音乐现场录像",
+      "aliases": ["Taylor Swift 东京演唱会 2025.mkv"],
+      "distractor_count": 0
+    },
+    {
+      "id": "kubernetes_ops",
+      "class": "partial_mixed",
+      "query": "Kubernetes 运维",
+      "matching_strategy": "all",
+      "target_name": "Kubernetes 中文运维指南",
+      "secondary_name": "Kubernetes 运维故障手册",
+      "aliases": ["chapter-12-集群升级.pdf"],
+      "distractor_template": "Kubernetes 运维社区周报 {n}",
+      "distractor_count": 28
+    }
+  ]
+}
