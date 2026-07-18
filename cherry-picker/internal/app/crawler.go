@@ -105,6 +105,8 @@ type Application struct {
 }
 
 // runtimeStats 运行时统计（原子计数器）。
+// metadataRequestsQueued 保留 meta_req 历史语义（wire 入队尝试），
+// metadataReqAdmitted 单独记录被 wire channel 实际接纳的请求。
 type runtimeStats struct {
 	infohashEventsSent      atomic.Uint64
 	infohashEventsDropped   atomic.Uint64
@@ -117,6 +119,7 @@ type runtimeStats struct {
 	metadataEventsDeduped   atomic.Uint64
 	metadataEventsFiltered  atomic.Uint64
 	metadataRequestsQueued  atomic.Uint64
+	metadataReqAdmitted     atomic.Uint64
 	metadataRequestsDeduped atomic.Uint64
 	checkBatchesQueued      atomic.Uint64
 	checkBatchesDropped     atomic.Uint64
@@ -139,6 +142,7 @@ type statsSnapshot struct {
 	peerEventsDropped       uint64
 	peerEventsDeduped       uint64
 	metadataRequestsQueued  uint64
+	metadataReqAdmitted     uint64
 	metadataRequestsDeduped uint64
 	checkBatchesQueued      uint64
 	checkBatchesDropped     uint64
@@ -1442,11 +1446,22 @@ func (a *Application) queueMetadataRequest(downloader *dht.Wire, ihHex, ip strin
 
 	// 自适应调优：内存压力高时暂停 metadata 入队
 	if a.metaPaused.Load() {
+		// 本次观察并未进入 wire 队列，不能烧掉 admission reservation；
+		// 恢复后同一 peer 必须仍有重试机会。
+		a.metadataRequestSeen.Delete(requestKey)
 		return
 	}
 
+	// Preserve meta_req as the legacy attempt counter. Exact successful
+	// channel admissions are reported separately as meta_admitted.
 	stats.metadataRequestsQueued.Add(1)
-	downloader.RequestFromSource(infoHashBytes, ip, port, source)
+	if !downloader.RequestFromSource(infoHashBytes, ip, port, source) {
+		// Wire channel 满时请求没有被接纳。撤销本 goroutine 刚创建的
+		// reservation，使后续观察能在容量恢复后重试。
+		a.metadataRequestSeen.Delete(requestKey)
+		return
+	}
+	stats.metadataReqAdmitted.Add(1)
 }
 
 func (a *Application) incPeerCount(ihHex string) {
@@ -1611,6 +1626,7 @@ func (a *Application) emitStats(ctx context.Context, events chan<- pipeline.Even
 				peerEventsDropped:             stats.peerEventsDropped.Load(),
 				peerEventsDeduped:             stats.peerEventsDeduped.Load(),
 				metadataRequestsQueued:        stats.metadataRequestsQueued.Load(),
+				metadataReqAdmitted:           stats.metadataReqAdmitted.Load(),
 				metadataRequestsDeduped:       stats.metadataRequestsDeduped.Load(),
 				checkBatchesQueued:            stats.checkBatchesQueued.Load(),
 				checkBatchesDropped:           stats.checkBatchesDropped.Load(),
@@ -1873,7 +1889,7 @@ func (a *Application) logRuntimeDelta(current, previous statsSnapshot) {
 	netOutKBps := (current.dhtBytesSent - previous.dhtBytesSent) / 1024 / interval
 	localeDelta := current.metadataLocale.subtract(previous.metadataLocale)
 	a.logger.Printf(
-		"runtime 30s: dht_recv=%d handled=%d dropped=%d decode_err=%d net_in=%dKB/s net_out=%dKB/s nodes=%d node_add=%d node_rm=%d refresh_q=%d lookup_queue=%d lookup_drop=%d lookup_sent=%d follow_sent=%d sample_q=%d sample_resp=%d sample_hash=%d sample_unique=%d peer_sent=%d peer_drop=%d peer_dedup=%d meta_req=%d meta_req_dedup=%d meta_sent=%d meta_drop=%d meta_dedup=%d meta_filtered=%d meta_locale_n=%d meta_han=%d meta_kana=%d meta_hangul=%d meta_zh_proxy=%d check_drop=%d paused=%v wire_q_drop=%d wire_dial=%d wire_conn=%d wire_dial_fail=%d wire_hs=%d wire_hs_fail=%d wire_ok=%d wire_dl_fail=%d wire_bl=%d ann_q=%d ann_bl=%d ann_inflight=%d ann_dial=%d ann_conn=%d ann_ok=%d gp_q=%d gp_bl=%d gp_inflight=%d gp_dial=%d gp_conn=%d gp_ok=%d bl_size=%d bl_max=%d bl_reject=%d bl_expired=%d%s",
+		"runtime 30s: dht_recv=%d handled=%d dropped=%d decode_err=%d net_in=%dKB/s net_out=%dKB/s nodes=%d node_add=%d node_rm=%d refresh_q=%d lookup_queue=%d lookup_drop=%d lookup_sent=%d follow_sent=%d sample_q=%d sample_resp=%d sample_hash=%d sample_unique=%d peer_sent=%d peer_drop=%d peer_dedup=%d meta_req=%d meta_admitted=%d meta_req_dedup=%d meta_sent=%d meta_drop=%d meta_dedup=%d meta_filtered=%d meta_locale_n=%d meta_han=%d meta_kana=%d meta_hangul=%d meta_zh_proxy=%d check_drop=%d paused=%v wire_q_drop=%d wire_dial=%d wire_conn=%d wire_dial_fail=%d wire_hs=%d wire_hs_fail=%d wire_ok=%d wire_dl_fail=%d wire_bl=%d ann_q=%d ann_bl=%d ann_inflight=%d ann_dial=%d ann_conn=%d ann_ok=%d gp_q=%d gp_bl=%d gp_inflight=%d gp_dial=%d gp_conn=%d gp_ok=%d bl_size=%d bl_max=%d bl_reject=%d bl_expired=%d%s",
 		current.dhtPacketsReceived-previous.dhtPacketsReceived,
 		current.dhtPacketsHandled-previous.dhtPacketsHandled,
 		current.dhtPacketsDropped-previous.dhtPacketsDropped,
@@ -1896,6 +1912,7 @@ func (a *Application) logRuntimeDelta(current, previous statsSnapshot) {
 		current.peerEventsDropped-previous.peerEventsDropped,
 		current.peerEventsDeduped-previous.peerEventsDeduped,
 		current.metadataRequestsQueued-previous.metadataRequestsQueued,
+		current.metadataReqAdmitted-previous.metadataReqAdmitted,
 		current.metadataRequestsDeduped-previous.metadataRequestsDeduped,
 		current.metadataEventsSent-previous.metadataEventsSent,
 		current.metadataEventsDropped-previous.metadataEventsDropped,

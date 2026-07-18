@@ -2,6 +2,8 @@ package dht
 
 import (
 	"net"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -84,13 +86,48 @@ func TestWireBlacklistsHandshakeFailureAcrossInfohashes(t *testing.T) {
 
 func TestWireCountsPreDialQueueDrop(t *testing.T) {
 	wire := NewWire(64, 1, 1)
-	wire.Request(make([]byte, 20), "127.0.0.1", 1)
-	wire.Request(make([]byte, 20), "127.0.0.1", 2)
+	if !wire.RequestFromSource(make([]byte, 20), "127.0.0.1", 1, PeerSourceUnknown) {
+		t.Fatal("first request was not admitted")
+	}
+	if wire.RequestFromSource(make([]byte, 20), "127.0.0.1", 2, PeerSourceUnknown) {
+		t.Fatal("request was admitted into a full queue")
+	}
 	if got := wire.Stats.QueueDropped.Load(); got != 1 {
 		t.Fatalf("QueueDropped = %d, want 1", got)
 	}
 	if got := wire.RequestDepth(); got != 1 {
 		t.Fatalf("RequestDepth = %d, want 1", got)
+	}
+}
+
+func TestWireConcurrentAdmissionResultMatchesQueueState(t *testing.T) {
+	const (
+		capacity = 64
+		attempts = 512
+	)
+	wire := NewWire(64, capacity, 1)
+
+	var admitted atomic.Int64
+	var workers sync.WaitGroup
+	workers.Add(attempts)
+	for i := 0; i < attempts; i++ {
+		go func(port int) {
+			defer workers.Done()
+			if wire.RequestFromSource(make([]byte, 20), "127.0.0.1", port, PeerSourceGetPeers) {
+				admitted.Add(1)
+			}
+		}(i + 1)
+	}
+	workers.Wait()
+
+	if got := admitted.Load(); got != capacity {
+		t.Fatalf("admitted = %d, want %d", got, capacity)
+	}
+	if got := wire.RequestDepth(); got != capacity {
+		t.Fatalf("RequestDepth = %d, want %d", got, capacity)
+	}
+	if got := wire.Stats.QueueDropped.Load(); got != attempts-capacity {
+		t.Fatalf("QueueDropped = %d, want %d", got, attempts-capacity)
 	}
 }
 
@@ -133,7 +170,9 @@ func TestWireFunnelAttributesDialBySource(t *testing.T) {
 // out-of-bounds array write) in the dial accounting.
 func TestWireRequestFromSourceEnqueuesSource(t *testing.T) {
 	wire := NewWire(64, 4, 1)
-	wire.RequestFromSource(make([]byte, 20), "127.0.0.1", 1, PeerSourceGetPeers)
+	if !wire.RequestFromSource(make([]byte, 20), "127.0.0.1", 1, PeerSourceGetPeers) {
+		t.Fatal("request was not admitted")
+	}
 	select {
 	case r := <-wire.requests:
 		if r.Source != PeerSourceGetPeers {

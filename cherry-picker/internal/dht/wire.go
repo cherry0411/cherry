@@ -300,15 +300,20 @@ func NewWire(blackListSize, requestQueueSize, workerQueueSize int) *Wire {
 // Request 将请求放入队列。队列满时直接丢弃（调用方是 UDP 包处理 goroutine，不能阻塞）。
 // 来源标记为 Unknown，保留给不关心来源分解的旧调用方。
 func (wire *Wire) Request(infoHash []byte, ip string, port int) {
-	wire.RequestFromSource(infoHash, ip, port, PeerSourceUnknown)
+	_ = wire.RequestFromSource(infoHash, ip, port, PeerSourceUnknown)
 }
 
-// RequestFromSource 与 Request 相同，但标注 peer 来源用于漏斗分解。
-func (wire *Wire) RequestFromSource(infoHash []byte, ip string, port int, source PeerSource) {
+// RequestFromSource 与 Request 相同，但标注 peer 来源用于漏斗分解。返回 true
+// 表示请求已被 channel 接纳；返回 false 表示 channel 已满且请求已丢弃。
+// 调用方可据此撤销在入队前创建的 reservation，避免一个从未拨号的 peer
+// 长时间占用上层去重缓存。
+func (wire *Wire) RequestFromSource(infoHash []byte, ip string, port int, source PeerSource) bool {
 	select {
 	case wire.requests <- Request{InfoHash: infoHash, IP: ip, Port: port, Source: source}:
+		return true
 	default:
 		wire.Stats.QueueDropped.Add(1)
+		return false
 	}
 }
 

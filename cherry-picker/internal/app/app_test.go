@@ -90,6 +90,82 @@ func TestQueueActiveLookupDropRemainsRetryable(t *testing.T) {
 	}
 }
 
+func TestQueueMetadataRequestFullWireQueueRemainsRetryable(t *testing.T) {
+	cfg := defaultTestConfig()
+	cfg.Metadata.Enabled = true
+	application := New(cfg, testLogger())
+	downloader := dht.NewWire(64, 1, 1)
+	stats := &runtimeStats{}
+	checkQueue := make(chan string, 2)
+	infoHash := "0123456789012345678901234567890123456789"
+	requestKey := buildInfohashPeerKey(infoHash, "127.0.0.1", 6882)
+
+	if !downloader.RequestFromSource(make([]byte, 20), "127.0.0.1", 6881, dht.PeerSourceUnknown) {
+		t.Fatal("failed to fill wire queue")
+	}
+	application.queueMetadataRequest(downloader, infoHash, "127.0.0.1", 6882, dht.PeerSourceGetPeers, stats, checkQueue)
+
+	if application.metadataRequestSeen.Contains(requestKey) {
+		t.Fatal("wire queue drop poisoned metadata request reservation")
+	}
+	if got := stats.metadataRequestsQueued.Load(); got != 1 {
+		t.Fatalf("metadataRequestsQueued = %d, want 1 legacy admission attempt", got)
+	}
+	if got := stats.metadataReqAdmitted.Load(); got != 0 {
+		t.Fatalf("metadataReqAdmitted = %d, want 0 for rejected admission", got)
+	}
+	if got := downloader.Stats.QueueDropped.Load(); got != 1 {
+		t.Fatalf("wire QueueDropped = %d, want 1", got)
+	}
+
+	retryDownloader := dht.NewWire(64, 1, 1)
+	application.queueMetadataRequest(retryDownloader, infoHash, "127.0.0.1", 6882, dht.PeerSourceGetPeers, stats, checkQueue)
+	if !application.metadataRequestSeen.Contains(requestKey) {
+		t.Fatal("request rejected by a full queue was not retryable")
+	}
+	if got := stats.metadataRequestsQueued.Load(); got != 2 {
+		t.Fatalf("metadataRequestsQueued after retry = %d, want 2 legacy attempts", got)
+	}
+	if got := stats.metadataReqAdmitted.Load(); got != 1 {
+		t.Fatalf("metadataReqAdmitted after retry = %d, want 1", got)
+	}
+}
+
+func TestQueueMetadataRequestPauseRemainsRetryable(t *testing.T) {
+	cfg := defaultTestConfig()
+	cfg.Metadata.Enabled = true
+	application := New(cfg, testLogger())
+	downloader := dht.NewWire(64, 1, 1)
+	stats := &runtimeStats{}
+	checkQueue := make(chan string, 2)
+	infoHash := "0123456789012345678901234567890123456789"
+	requestKey := buildInfohashPeerKey(infoHash, "127.0.0.1", 6881)
+
+	application.metaPaused.Store(true)
+	application.queueMetadataRequest(downloader, infoHash, "127.0.0.1", 6881, dht.PeerSourceAnnounce, stats, checkQueue)
+	if application.metadataRequestSeen.Contains(requestKey) {
+		t.Fatal("paused request poisoned metadata request reservation")
+	}
+	if got := stats.metadataRequestsQueued.Load(); got != 0 {
+		t.Fatalf("metadataRequestsQueued while paused = %d, want 0", got)
+	}
+	if got := stats.metadataReqAdmitted.Load(); got != 0 {
+		t.Fatalf("metadataReqAdmitted while paused = %d, want 0", got)
+	}
+
+	application.metaPaused.Store(false)
+	application.queueMetadataRequest(downloader, infoHash, "127.0.0.1", 6881, dht.PeerSourceAnnounce, stats, checkQueue)
+	if !application.metadataRequestSeen.Contains(requestKey) {
+		t.Fatal("retry after pause did not retain an admitted reservation")
+	}
+	if got := stats.metadataRequestsQueued.Load(); got != 1 {
+		t.Fatalf("metadataRequestsQueued after retry = %d, want 1", got)
+	}
+	if got := stats.metadataReqAdmitted.Load(); got != 1 {
+		t.Fatalf("metadataReqAdmitted after retry = %d, want 1", got)
+	}
+}
+
 func TestNormalizeMetadataPrefersUTF8AndAggregatesFiles(t *testing.T) {
 	data := []byte(dht.Encode(map[string]interface{}{
 		"name":         "fallback-name",
