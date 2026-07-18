@@ -101,6 +101,12 @@ a:hover { text-decoration: underline; }
 .filter-chip { padding: 4px 14px; border-radius: 0; font-size: .78rem; border: 1px solid var(--border); background: #fff; color: var(--text-dim); cursor: pointer; }
 .filter-chip:hover { background: var(--bg-hover); }
 .filter-chip.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+.filter-chip.disabled { cursor: not-allowed; opacity: .62; background: #f8f8f8; }
+.filter-chip.disabled:hover { background: #f8f8f8; }
+.filter-chip.active.disabled { background: var(--accent); color: #fff; }
+.filter-chip small { font-size: .68rem; }
+.filter-note { margin-top: 8px; color: var(--text-muted); font-size: .74rem; }
+.heat-accumulating { color: var(--text-dim); }
 
 .result-item {
     display: flex; flex-direction: column; gap: 4px; padding: 12px 0; border-bottom: 1px solid var(--border);

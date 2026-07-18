@@ -19,8 +19,26 @@ function fmtRelative(iso) {
 }
 function fmtNumber(n) { return n == null ? '0' : Number(n).toLocaleString('zh-CN'); }
 function heatValue(item, windowName) {
-    var key = 'heat' + String(windowName || '7d');
+    var key = 'heat' + String(windowName || '24h');
     return Number(item && item[key]) || 0;
+}
+var SEARCH_CACHE_TTL_MS = 15000;
+var SEARCH_CACHE_MAX_ENTRIES = 32;
+var searchCache = new Map();
+var dailyHeatAvailable = window.CHERRY_DAILY_HEAT_AVAILABLE === true;
+function searchCacheKey(query, heatWindow, page, size) { return JSON.stringify([query, heatWindow, page, size]); }
+function getCachedSearch(key, now) {
+    var entry = searchCache.get(key);
+    if (!entry) return null;
+    if (entry.expiresAt <= now) { searchCache.delete(key); return null; }
+    searchCache.delete(key);
+    searchCache.set(key, entry);
+    return entry.value;
+}
+function putCachedSearch(key, value, now) {
+    searchCache.delete(key);
+    searchCache.set(key, { expiresAt: now + SEARCH_CACHE_TTL_MS, value: value });
+    while (searchCache.size > SEARCH_CACHE_MAX_ENTRIES) searchCache.delete(searchCache.keys().next().value);
 }
 function magnetLink(h, n) { return 'magnet:?xt=urn:btih:' + h + '&dn=' + encodeURIComponent(n || ''); }
 function escapeHtml(s) { return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;'); }
@@ -50,8 +68,8 @@ function fileIcon(filename) {
 // ---- i18n ----
 var lang = (function () { try { var v = localStorage.getItem('cherry_lang'); if (v) return v; } catch (e) { } return (navigator.language || '').startsWith('zh') ? 'zh' : 'en'; })();
 var dict = {
-    zh: { site_title: 'Cherry - 种子搜索', search_placeholder: '搜索种子...', search_btn: '搜索', hero_title: 'Cherry 种子搜索', hero_desc: '搜索千万级 DHT 网络种子', hero_placeholder: '电影、剧集、软件、音乐...', stat_total: '总量（估算）', stat_today: '今日入库', recent_searches: '最近搜索', results_for: '结果', found: '条', no_results: '未找到结果', no_results_hint: '试试其他关键词', retry: '重试', prev_page: '上一页', next_page: '下一页', copy_magnet: '复制', back: '返回结果', torrent_not_found: '种子未找到', server_error: '服务器错误', info_hash: 'Info Hash', total_size: '大小', file_count: '文件数', discovered: '发现时间', download_magnet: '磁力链接', copy_link: '复制链接', copied: '已复制', file_list: '文件列表', filter_files: '筛选文件...', hash_copied: '已复制', link_copied: '已复制', private_torrent: '私有种子', just_now: '刚刚', min_ago: '分钟前', h_ago: '小时前', d_ago: '天前', mo_ago: '个月前', sort_name: '文件名', sort_size: '大小', lang_label: 'En', lookup: '查询', hot: '热榜', network_activity: '网络活跃度', heat_as_of: '统计截至', heat_coverage: '覆盖小时', status_crawling: '抓取中', status_online: 'API 在线', status_offline: '离线', metadata_rate: 'Metadata 速率', heat_records: 'Heat 记录', heat_rate: 'Heat 速率', rolling_heat: '24h Heat 容量', last_update: '更新于' },
-    en: { site_title: 'Cherry - DHT Search', search_placeholder: 'Search torrents...', search_btn: 'Search', hero_title: 'Cherry Torrent Search', hero_desc: 'Search millions of torrents from DHT', hero_placeholder: 'Movies, TV, software, music...', stat_total: 'Total (estimate)', stat_today: 'Ingested today', recent_searches: 'Recent', results_for: 'Results for', found: 'found', no_results: 'No results', no_results_hint: 'Try different keywords', retry: 'Retry', prev_page: 'Prev', next_page: 'Next', copy_magnet: 'Copy', back: 'Back to results', torrent_not_found: 'Torrent not found', server_error: 'Server error', info_hash: 'Info Hash', total_size: 'Size', file_count: 'Files', discovered: 'Discovered', download_magnet: 'Magnet', copy_link: 'Copy Link', copied: 'Copied', file_list: 'File List', filter_files: 'Filter files...', hash_copied: 'Copied', link_copied: 'Copied', private_torrent: 'Private', just_now: 'just now', min_ago: 'm ago', h_ago: 'h ago', d_ago: 'd ago', mo_ago: 'mo ago', sort_name: 'Name', sort_size: 'Size', lang_label: '中文', lookup: 'Lookup', hot: 'Hot', network_activity: 'Network activity', heat_as_of: 'As of', heat_coverage: 'coverage hours', status_crawling: 'Crawling', status_online: 'API online', status_offline: 'Offline', metadata_rate: 'Metadata rate', heat_records: 'Heat records', heat_rate: 'Heat rate', rolling_heat: '24h heat capacity', last_update: 'Updated' }
+    zh: { site_title: 'Cherry - 种子搜索', search_placeholder: '搜索种子...', search_btn: '搜索', hero_title: 'Cherry 种子搜索', hero_desc: '搜索千万级 DHT 网络种子', hero_placeholder: '电影、剧集、软件、音乐...', stat_total: '总量（估算）', stat_today: '今日入库', recent_searches: '最近搜索', results_for: '结果', found: '条', no_results: '未找到结果', no_results_hint: '试试其他关键词', retry: '重试', prev_page: '上一页', next_page: '下一页', copy_magnet: '复制', back: '返回结果', torrent_not_found: '种子未找到', server_error: '服务器错误', info_hash: 'Info Hash', total_size: '大小', file_count: '文件数', discovered: '发现时间', download_magnet: '磁力链接', copy_link: '复制链接', copied: '已复制', file_list: '文件列表', filter_files: '筛选文件...', hash_copied: '已复制', link_copied: '已复制', private_torrent: '私有种子', just_now: '刚刚', min_ago: '分钟前', h_ago: '小时前', d_ago: '天前', mo_ago: '个月前', sort_name: '文件名', sort_size: '大小', lang_label: 'En', lookup: '查询', hot: '热榜', network_activity: '网络活跃度', heat_as_of: '统计截至', heat_coverage: '覆盖小时', heat_accumulating: '数据积累中', file_filter_pending: '文件类型筛选暂不可用', status_crawling: '抓取中', status_online: 'API 在线', status_offline: '离线', metadata_rate: 'Metadata 速率', heat_records: 'Heat 记录', heat_rate: 'Heat 速率', rolling_heat: '24h Heat 容量', last_update: '更新于' },
+    en: { site_title: 'Cherry - DHT Search', search_placeholder: 'Search torrents...', search_btn: 'Search', hero_title: 'Cherry Torrent Search', hero_desc: 'Search millions of torrents from DHT', hero_placeholder: 'Movies, TV, software, music...', stat_total: 'Total (estimate)', stat_today: 'Ingested today', recent_searches: 'Recent', results_for: 'Results for', found: 'found', no_results: 'No results', no_results_hint: 'Try different keywords', retry: 'Retry', prev_page: 'Prev', next_page: 'Next', copy_magnet: 'Copy', back: 'Back to results', torrent_not_found: 'Torrent not found', server_error: 'Server error', info_hash: 'Info Hash', total_size: 'Size', file_count: 'Files', discovered: 'Discovered', download_magnet: 'Magnet', copy_link: 'Copy Link', copied: 'Copied', file_list: 'File List', filter_files: 'Filter files...', hash_copied: 'Copied', link_copied: 'Copied', private_torrent: 'Private', just_now: 'just now', min_ago: 'm ago', h_ago: 'h ago', d_ago: 'd ago', mo_ago: 'mo ago', sort_name: 'Name', sort_size: 'Size', lang_label: '中文', lookup: 'Lookup', hot: 'Hot', network_activity: 'Network activity', heat_as_of: 'As of', heat_coverage: 'coverage hours', heat_accumulating: 'Collecting data', file_filter_pending: 'File type filtering is temporarily unavailable', status_crawling: 'Crawling', status_online: 'API online', status_offline: 'Offline', metadata_rate: 'Metadata rate', heat_records: 'Heat records', heat_rate: 'Heat rate', rolling_heat: '24h heat capacity', last_update: 'Updated' }
 };
 function T(k) { return (dict[lang] && dict[lang][k]) || dict.en[k] || k; }
 function switchLang() { lang = lang === 'zh' ? 'en' : 'zh'; try { localStorage.setItem('cherry_lang', lang); } catch (e) { } window.location.reload(); }
@@ -114,26 +132,64 @@ var HomePage = {
 };
 
 var SearchPage = {
-    template: '<div class="result-header"><span class="result-count">{{ fmtNumber(total) }}</span> {{ T("found") }} — <template v-if="q">{{ T("results_for") }} <b>{{ q }}</b></template><b v-else>{{ T("hot") }}</b><div class="heat-meta" v-if="heatAsOfUtc">{{ T("heat_as_of") }} {{ fmtDate(heatAsOfUtc) }}<span v-if="heatCoverageHours!=null"> · {{ T("heat_coverage") }} {{ heatCoverageHours }}/{{ heatWindowHours }}h</span></div><div class="result-filters heat-windows"><span v-for="w in heatWindows" class="filter-chip" :class="{active:heatWindow===w}" @click="setHeat(w)">{{ w }}</span></div><div class="result-filters" v-if="q"><span v-for="f in filters" class="filter-chip" :class="{active:af===f.v}" @click="setF(f.v)">{{ f.l }}</span></div></div><div v-if="loading"><div class="skeleton skel-line long"></div><div class="skeleton skel-line long"></div><div class="skeleton skel-line mid"></div></div><div v-else-if="err" class="error-state">{{ err }} <button class="retry-btn" @click="fetch">{{ T("retry") }}</button></div><div v-else-if="items.length===0" class="empty-state">{{ T("no_results") }}<span v-if="q"> "{{ q }}"</span><br><span style="font-size:.82rem;color:var(--text-muted);">{{ T("no_results_hint") }}</span></div><div v-else><div v-for="item in items" :key="item.infoHash" class="result-item" @click="$router.push(\'/torrent/\'+item.infoHash)"><div class="result-title" v-html="highlightTerm(item.name,q)"></div><div class="result-tags"><span v-if="catInfo(item.name).cat" class="tag tag-cat">{{ catInfo(item.name).cat }}</span><span class="tag tag-size">{{ fmtSize(item.totalLength) }}</span><span v-if="item.fileCount>1" class="tag tag-files">{{ item.fileCount }} files</span><span v-if="heat(item)>0" class="tag tag-health">{{ fmtNumber(heat(item)) }} {{ T("network_activity") }} / {{ heatWindow }}</span></div><div class="result-footer"><span>{{ fmtRelative(item.createdAt) }}</span><span>{{ item.infoHash.slice(0,12) }}...</span><button class="result-copy-btn" @click.stop="cp(item)">🧲 {{ T("copy_magnet") }}</button></div></div></div><div v-if="total>pageSize" class="pagination"><button :disabled="page<=1" @click="goPage(page-1)">{{ T("prev_page") }}</button><span class="page-info">{{ page }} / {{ tp }}</span><button :disabled="page>=tp" @click="goPage(page+1)">{{ T("next_page") }}</button></div></div>',
+    template: '<div class="result-header"><span class="result-count">{{ fmtNumber(total) }}</span> {{ T("found") }} — <template v-if="q">{{ T("results_for") }} <b>{{ q }}</b></template><b v-else>{{ T("hot") }}</b><div class="heat-meta" v-if="heatAsOfUtc">{{ T("heat_as_of") }} {{ fmtDate(heatAsOfUtc) }}<span v-if="heatCoverageHours>0"> · {{ T("heat_coverage") }} {{ heatCoverageHours }}/{{ heatWindowHours }}h</span></div><div class="heat-meta heat-accumulating" v-else-if="heatWindow!==\'24h\'">{{ T("heat_accumulating") }}</div><div class="result-filters heat-windows"><span v-for="w in heatWindows" class="filter-chip" :class="{active:heatWindow===w,disabled:isDailyUnavailable(w)}" :aria-disabled="isDailyUnavailable(w)?\'true\':\'false\'" :title="isDailyUnavailable(w)?T(\'heat_accumulating\'):w" @click="setHeat(w)">{{ w }}<small v-if="isDailyUnavailable(w)"> · {{ T("heat_accumulating") }}</small></span></div><div class="filter-note" v-if="q">{{ T("file_filter_pending") }}</div></div><div v-if="loading"><div class="skeleton skel-line long"></div><div class="skeleton skel-line long"></div><div class="skeleton skel-line mid"></div></div><div v-else-if="err" class="error-state">{{ err }} <button class="retry-btn" @click="fetch">{{ T("retry") }}</button></div><div v-else-if="items.length===0" class="empty-state">{{ T("no_results") }}<span v-if="q"> "{{ q }}"</span><br><span style="font-size:.82rem;color:var(--text-muted);">{{ T("no_results_hint") }}</span></div><div v-else><div v-for="item in items" :key="item.infoHash" class="result-item" @click="$router.push(\'/torrent/\'+item.infoHash)"><div class="result-title" v-html="highlightTerm(item.name,q)"></div><div class="result-tags"><span v-if="catInfo(item.name).cat" class="tag tag-cat">{{ catInfo(item.name).cat }}</span><span class="tag tag-size">{{ fmtSize(item.totalLength) }}</span><span v-if="item.fileCount>1" class="tag tag-files">{{ item.fileCount }} files</span><span v-if="heat(item)>0" class="tag tag-health">{{ fmtNumber(heat(item)) }} {{ T("network_activity") }} / {{ heatWindow }}</span></div><div class="result-footer"><span>{{ fmtRelative(item.createdAt) }}</span><span>{{ item.infoHash.slice(0,12) }}...</span><button class="result-copy-btn" @click.stop="cp(item)">🧲 {{ T("copy_magnet") }}</button></div></div></div><div v-if="total>pageSize" class="pagination"><button :disabled="page<=1" @click="goPage(page-1)">{{ T("prev_page") }}</button><span class="page-info">{{ page }} / {{ tp }}</span><button :disabled="page>=tp" @click="goPage(page+1)">{{ T("next_page") }}</button></div></div>',
     data: function () {
         return {
-            items: [], total: 0, loading: true, err: '', af: '', heatAsOfUtc: '', heatCoverageHours: null,
-            heatWindows: ['24h', '3d', '7d', '15d'],
-            filters: [{ l: 'All', v: '' }, { l: '🎬 Video', v: 'mkv' }, { l: '🎵 Audio', v: 'mp3' }, { l: '📚 Books', v: 'pdf' }, { l: '📦 Archives', v: 'zip' }, { l: '🖼️ Images', v: 'jpg' }]
+            items: [], total: 0, loading: true, err: '', heatAsOfUtc: '', heatCoverageHours: null,
+            heatWindows: ['24h', '3d', '7d', '15d'], dailyAvailable: dailyHeatAvailable,
+            requestController: null, requestGeneration: 0,
+            dailyProbeTimer: null, dailyProbeBusy: false, dailyProbeStopped: false
         };
     },
-    computed: { q: function () { return (this.$route.query.q || '').trim(); }, heatWindow: function () { var w = String(this.$route.query.heatWindow || '7d'); return this.heatWindows.indexOf(w) >= 0 ? w : '7d'; }, heatWindowHours: function () { return this.heatWindow === '24h' ? 24 : parseInt(this.heatWindow, 10) * 24; }, page: function () { return Math.max(1, parseInt(this.$route.query.page) || 1); }, pageSize: function () { return 20; }, tp: function () { return Math.max(1, Math.ceil(this.total / this.pageSize)); } },
+    computed: { q: function () { return (this.$route.query.q || '').trim(); }, heatWindow: function () { var w = String(this.$route.query.heatWindow || '24h'); return this.heatWindows.indexOf(w) >= 0 ? w : '24h'; }, heatWindowHours: function () { return this.heatWindow === '24h' ? 24 : parseInt(this.heatWindow, 10) * 24; }, page: function () { return Math.max(1, parseInt(this.$route.query.page) || 1); }, pageSize: function () { return 20; }, tp: function () { return Math.max(1, Math.ceil(this.total / this.pageSize)); } },
     watch: { '$route.fullPath': { immediate: true, handler: function () { this.fetch(); } } },
+    mounted: function () { this.dailyProbeStopped = false; this.checkDailyAvailability(); },
+    beforeUnmount: function () { this.dailyProbeStopped = true; clearTimeout(this.dailyProbeTimer); this.requestGeneration++; if (this.requestController) this.requestController.abort(); },
     methods: {
         T: T, fmtSize: fmtSize, fmtDate: fmtDate, fmtNumber: fmtNumber, fmtRelative: fmtRelative, catInfo: detectCategory, highlightTerm: highlightTerm,
         heat: function (item) { return heatValue(item, this.heatWindow); },
-        setF: function (f) { this.af = this.af === f ? '' : f; this.fetch(); },
-        setHeat: function (w) { this.$router.push({ path: this.q ? '/search' : '/hot', query: { q: this.q || undefined, heatWindow: w } }); },
+        isDailyUnavailable: function (w) { return w !== '24h' && !this.dailyAvailable; },
+        setHeat: function (w) { if (this.isDailyUnavailable(w)) return; this.$router.push({ path: this.q ? '/search' : '/hot', query: { q: this.q || undefined, heatWindow: w } }); },
+        markDailyAvailable: function () { dailyHeatAvailable = true; this.dailyAvailable = true; clearTimeout(this.dailyProbeTimer); this.dailyProbeTimer = null; },
+        scheduleDailyAvailabilityCheck: function () {
+            var s = this;
+            clearTimeout(s.dailyProbeTimer); s.dailyProbeTimer = null;
+            if (!s.dailyAvailable && !s.dailyProbeStopped) s.dailyProbeTimer = setTimeout(function () { s.checkDailyAvailability(); }, 60000);
+        },
+        checkDailyAvailability: function () {
+            var s = this;
+            if (s.dailyAvailable || s.dailyProbeBusy || s.dailyProbeStopped) return;
+            s.dailyProbeBusy = true;
+            fetch(API + '/health', { cache: 'no-store' }).then(function (r) { if (!r.ok) throw new Error(String(r.status)); return r.json(); }).then(function (d) {
+                if (Number(d && d.heat && d.heat.sealedDays) > 0) s.markDailyAvailable();
+            }).catch(function () { }).finally(function () { s.dailyProbeBusy = false; s.scheduleDailyAvailabilityCheck(); });
+        },
+        applySearchResult: function (d) {
+            this.items = d.items || []; this.total = d.total || 0; this.heatAsOfUtc = d.heatAsOfUtc || '';
+            this.heatCoverageHours = d.heatCoverageHours == null ? null : d.heatCoverageHours;
+            if (this.heatWindow !== '24h' && this.heatAsOfUtc && Number(this.heatCoverageHours) > 0) this.markDailyAvailable();
+        },
         fetch: function () {
-            var s = this; s.loading = true; s.err = '';
+            var s = this, generation = ++s.requestGeneration;
+            if (s.requestController) s.requestController.abort();
+            s.requestController = null; s.loading = true; s.err = '';
             if (s.q) saveHistory(s.q); document.title = (s.q || T('hot')) + ' - Cherry';
-            var p = new URLSearchParams({ q: s.q, page: s.page, size: s.pageSize, heatWindow: s.heatWindow }); if (s.af && s.q) p.set('fileType', s.af);
-            fetch(API + '/api/v1/torrents/search?' + p).then(function (r) { if (!r.ok) throw new Error('Search failed'); return r.json(); }).then(function (d) { s.items = d.items || []; s.total = d.total || 0; s.heatAsOfUtc = d.heatAsOfUtc || ''; s.heatCoverageHours = d.heatCoverageHours == null ? null : d.heatCoverageHours; }).catch(function (e) { s.err = e.message; }).finally(function () { s.loading = false; });
+            var cacheKey = searchCacheKey(s.q, s.heatWindow, s.page, s.pageSize), cached = getCachedSearch(cacheKey, Date.now());
+            if (cached) { s.applySearchResult(cached); s.loading = false; return; }
+            var controller = typeof AbortController === 'function' ? new AbortController() : null;
+            s.requestController = controller;
+            var p = new URLSearchParams({ q: s.q, page: s.page, size: s.pageSize, heatWindow: s.heatWindow });
+            fetch(API + '/api/v1/torrents/search?' + p, controller ? { signal: controller.signal } : undefined).then(function (r) { if (!r.ok) throw new Error('Search failed'); return r.json(); }).then(function (d) {
+                if (generation !== s.requestGeneration) return;
+                putCachedSearch(cacheKey, d, Date.now()); s.applySearchResult(d);
+            }).catch(function (e) {
+                if (generation !== s.requestGeneration || (e && e.name === 'AbortError')) return;
+                s.err = e.message;
+            }).finally(function () {
+                if (generation !== s.requestGeneration) return;
+                if (s.requestController === controller) s.requestController = null;
+                s.loading = false;
+            });
         },
         goPage: function (p) { this.$router.push({ path: this.q ? '/search' : '/hot', query: { q: this.q || undefined, page: p, heatWindow: this.heatWindow } }); },
         cp: function (item) { copyText(magnetLink(item.infoHash, item.name)); }
