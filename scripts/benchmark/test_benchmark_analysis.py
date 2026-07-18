@@ -258,6 +258,67 @@ class AnalyzerTests(unittest.TestCase):
         self.assertIsNone(health["fill_ratio"])
         self.assertEqual(health["insert_rejected"], 0)
 
+    def test_lru_health_sums_counters_and_keeps_last_gauges(self):
+        rows = [
+            {
+                "lru_ih_len": 80, "lru_ih_cap": 100,
+                "lru_ih_oldest_s": 60, "lru_ih_hit": 10,
+                "lru_ih_miss": 30, "lru_ih_insert": 30,
+                "lru_ih_evict": 0, "lru_ih_del_miss": 2,
+            },
+            {
+                "lru_ih_len": 100, "lru_ih_cap": 100,
+                "lru_ih_oldest_s": 90, "lru_ih_hit": 20,
+                "lru_ih_miss": 20, "lru_ih_insert": 20,
+                "lru_ih_evict": 15, "lru_ih_del_miss": 3,
+            },
+        ]
+        health = analyze.lru_health(rows)["ih"]
+        self.assertEqual(health["len"], 100)
+        self.assertAlmostEqual(health["fill_ratio"], 1.0)
+        self.assertEqual(health["oldest_age_seconds"], 90)
+        self.assertEqual(health["hits"], 30)
+        self.assertEqual(health["misses"], 50)
+        self.assertAlmostEqual(health["hit_ratio"], 0.375)
+        self.assertEqual(health["evicts"], 15)
+        self.assertEqual(health["delete_misses"], 5)
+
+    def test_new_observability_is_backward_compatible(self):
+        rows = [{"meta_sent": 3}]
+        self.assertIsNone(analyze.lru_health(rows)["remote"]["len"])
+        self.assertIsNone(analyze.lru_health(rows)["remote"]["hit_ratio"])
+        self.assertIsNone(analyze.wire_pressure(rows)["active_workers_last"])
+        self.assertIsNone(analyze.dht_blacklist_health(rows)["fill_ratio"])
+
+    def test_wire_pressure_and_dht_blacklist_health(self):
+        rows = [
+            {
+                "wire_active": 100, "wire_busy": 80,
+                "wire_req_depth": 10, "wire_req_cap": 1000,
+                "wire_resp_depth": 2, "wire_resp_cap": 100,
+                "wire_q_drop": 3, "wire_dial_fail": 9,
+                "wire_hs_fail": 4, "wire_dl_fail": 1,
+                "dht_bl_size": 800, "dht_bl_max": 1000,
+                "dht_bl_reject": 2, "dht_bl_expired": 7,
+            },
+            {
+                "wire_active": 50, "wire_busy": 50,
+                "wire_req_depth": 20, "wire_req_cap": 1000,
+                "wire_resp_depth": 3, "wire_resp_cap": 100,
+                "wire_q_drop": 1, "wire_dial_fail": 8,
+                "wire_hs_fail": 3, "wire_dl_fail": 2,
+                "dht_bl_size": 1000, "dht_bl_max": 1000,
+                "dht_bl_reject": 5, "dht_bl_expired": 11,
+            },
+        ]
+        pressure = analyze.wire_pressure(rows)
+        self.assertEqual(pressure["request_depth_max"], 20)
+        self.assertAlmostEqual(pressure["busy_to_active_mean"], 0.9)
+        self.assertEqual(pressure["queue_dropped"], 4)
+        dht_health = analyze.dht_blacklist_health(rows)
+        self.assertAlmostEqual(dht_health["fill_ratio"], 1.0)
+        self.assertEqual(dht_health["insert_rejected"], 7)
+
 
 class ComparatorTests(unittest.TestCase):
     def test_ba_order_always_computes_b_minus_a(self):

@@ -419,6 +419,13 @@ func (dht *DHT) PacketStats() PacketStats {
 	return stats
 }
 
+// BlacklistStats returns this DHT identity's UDP blacklist health. A crawler
+// normally runs many identities, so the application aggregates these fixed-
+// cost snapshots every 30 seconds rather than scanning blacklist entries.
+func (dht *DHT) BlacklistStats() BlacklistStats {
+	return dht.blackList.stats()
+}
+
 // writeToUDP 发送 UDP 报文并累加出站字节计数（带宽可观测性）。
 // 所有出站路径（快速路径直接构造 + 标准 Encode 路径）都应经由此方法。
 func (dht *DHT) writeToUDP(buf []byte, addr *net.UDPAddr) (int, error) {

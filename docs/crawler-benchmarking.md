@@ -259,6 +259,53 @@ full time gap, preventing a failed `/stats` request from becoming a fake rate
 spike. Its short-window slope is exposed as `transient_slope`; the old
 `decay_slope` key remains as a compatibility alias.
 
+### P0 decay observability (O1/O2/O3)
+
+The optimization build after `80591c9` adds observation only; it does not
+change cache admission/eviction order, DHT queries, blacklist policy, queue
+capacity, worker targets, or download timeouts. It exists to select the next
+single-variable experiment from evidence rather than another broad parameter
+bundle.
+
+- **O1 — five sharded LRUs.** Every 30 seconds the runtime line reports
+  `lru_{ih,peer,mreq,mres,remote}_{len,cap,oldest_s,hit,miss,insert,evict,del_miss}`.
+  `len`, `cap`, and `oldest_s` are gauges; other values are window deltas.
+  A hit/miss is recorded for `Set`, `Contains`, and `ContainsAndTouch`; `insert`
+  means a previously absent key was admitted, `evict` means capacity removed
+  the shard tail, and `del_miss` means cleanup tried to remove an absent key.
+  `oldest_s` is the maximum coarse last-touch age among the 64 shard tails;
+  because every shard tail is its least recently used entry, it remains useful
+  under steady churn. Clock precision is one 30-second interval. Collection
+  visits only those tails and never scans all entries. A coarse `uint32`
+  timestamp increases the aligned entry object from 16 to 24 bytes: about
+  8 bytes per resident entry (roughly 13 MiB at 1.6 million residents, 4.2% of
+  the existing 192-byte/entry planning estimate). The measured Windows/amd64
+  hot-hit path is 0 allocations and roughly 26–46 ns/op, and a full 64-shard
+  snapshot is 0 allocations and roughly 0.32–0.41 microseconds.
+  `result.json.lru_health` exposes last fill/age gauges plus hit and eviction
+  ratios.
+- **O2 — wire pressure.** `wire_active` is the autotuner admission ceiling,
+  `wire_max` its configured ceiling, and `wire_busy` the instantaneous number
+  executing a request. `wire_req_depth/cap` and `wire_resp_depth/cap` locate
+  request versus consumer backpressure. Existing `wire_q_drop`,
+  `wire_dial_fail`, `wire_hs_fail`, and `wire_dl_fail` remain window counters.
+  `result.json.wire_pressure` combines these without changing older fields.
+- **O3 — DHT UDP blacklists.** `dht_bl_size/max` sums gauges across every DHT
+  identity (96 in the 2C4G profile); `dht_bl_reject/expired` are aggregate
+  window deltas. They are intentionally separate from `bl_*`, which describes
+  the one peer-wire TCP blacklist. Collection locks each map only long enough
+  to read its length and never scans its entries. The analyzer writes the
+  additive `dht_blacklist_health` section.
+
+Old runtime lines remain readable because the parser already accepts arbitrary
+`key=value` tokens and every new reducer treats missing keys as `None`/zero.
+Rollback is a release switch to the preceding immutable binary: no state or
+file-format migration exists. Remove the `lastTouched`/counter fields and the
+appended runtime tokens only if the measured CPU/RSS guardrail regresses; keep
+the parser additions because they are backward compatible and preserve already
+captured runs. After rollback, verify the old binary SHA and confirm that the
+existing `runtime 30s:` rows and `result.json` generation continue normally.
+
 The current first diagnostics are routing-table turnover (`nodes`, `node_add`,
 `node_rm`, `refresh_q`) and pre-dial wire admission loss (`wire_q_drop`). They
 distinguish stale discovery from downstream saturation before either behavior is

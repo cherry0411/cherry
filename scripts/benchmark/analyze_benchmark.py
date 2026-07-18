@@ -333,6 +333,89 @@ def blacklist_health(runtime_rows: list[dict[str, float]]) -> dict[str, float | 
     }
 
 
+def _last(runtime_rows: list[dict[str, float]], key: str) -> float | None:
+    values = [row[key] for row in runtime_rows if key in row]
+    return values[-1] if values else None
+
+
+def wire_pressure(runtime_rows: list[dict[str, float]]) -> dict[str, float | None]:
+    """Expose instantaneous wire saturation alongside per-window failures.
+
+    Missing gauge keys remain None, so logs from releases before O2 continue to
+    reduce normally.
+    """
+    request_depths = [row["wire_req_depth"] for row in runtime_rows if "wire_req_depth" in row]
+    response_depths = [row["wire_resp_depth"] for row in runtime_rows if "wire_resp_depth" in row]
+    busy = [row["wire_busy"] for row in runtime_rows if "wire_busy" in row]
+    utilization = [
+        row["wire_busy"] / row["wire_active"]
+        for row in runtime_rows
+        if row.get("wire_active", 0) and "wire_busy" in row
+    ]
+    return {
+        "active_workers_last": _last(runtime_rows, "wire_active"),
+        "max_workers": _last(runtime_rows, "wire_max"),
+        "busy_workers_mean": mean(busy),
+        "busy_to_active_mean": mean(utilization),
+        "request_depth_last": _last(runtime_rows, "wire_req_depth"),
+        "request_depth_max": maximum(request_depths),
+        "request_capacity": _last(runtime_rows, "wire_req_cap"),
+        "response_depth_last": _last(runtime_rows, "wire_resp_depth"),
+        "response_depth_max": maximum(response_depths),
+        "response_capacity": _last(runtime_rows, "wire_resp_cap"),
+        "queue_dropped": total(runtime_rows, "wire_q_drop"),
+        "dial_failed": total(runtime_rows, "wire_dial_fail"),
+        "handshake_failed": total(runtime_rows, "wire_hs_fail"),
+        "download_failed": total(runtime_rows, "wire_dl_fail"),
+    }
+
+
+def dht_blacklist_health(runtime_rows: list[dict[str, float]]) -> dict[str, float | None]:
+    """Aggregate saturation across all per-port DHT UDP blacklists."""
+    size = _last(runtime_rows, "dht_bl_size")
+    capacity = _last(runtime_rows, "dht_bl_max")
+    return {
+        "size": size,
+        "max": capacity,
+        "fill_ratio": _safe_ratio(size, capacity)
+        if size is not None and capacity else None,
+        "insert_rejected": total(runtime_rows, "dht_bl_reject"),
+        "expired_evicted": total(runtime_rows, "dht_bl_expired"),
+    }
+
+
+def lru_health(runtime_rows: list[dict[str, float]]) -> dict[str, dict[str, float | None]]:
+    """Summarize cache effectiveness without scanning resident entries.
+
+    Runtime hit/miss/insert/evict/delete-miss values are per-window deltas;
+    len/cap/oldest are gauges. Legacy logs produce empty-health values rather
+    than failing analysis.
+    """
+    result: dict[str, dict[str, float | None]] = {}
+    for name in ("ih", "peer", "mreq", "mres", "remote"):
+        length = _last(runtime_rows, f"lru_{name}_len")
+        capacity = _last(runtime_rows, f"lru_{name}_cap")
+        hits = total(runtime_rows, f"lru_{name}_hit")
+        misses = total(runtime_rows, f"lru_{name}_miss")
+        inserts = total(runtime_rows, f"lru_{name}_insert")
+        evicts = total(runtime_rows, f"lru_{name}_evict")
+        result[name] = {
+            "len": length,
+            "capacity": capacity,
+            "fill_ratio": _safe_ratio(length, capacity)
+            if length is not None and capacity else None,
+            "oldest_age_seconds": _last(runtime_rows, f"lru_{name}_oldest_s"),
+            "hits": hits,
+            "misses": misses,
+            "hit_ratio": _safe_ratio(hits, hits + misses),
+            "inserts": inserts,
+            "evicts": evicts,
+            "evict_to_insert_ratio": _safe_ratio(evicts, inserts),
+            "delete_misses": total(runtime_rows, f"lru_{name}_del_miss"),
+        }
+    return result
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--run-id", required=True)
@@ -446,6 +529,9 @@ def main() -> None:
         # fill_ratio near 1 with rising insert_rejected explains a decaying
         # connect rate that is not caused by peer supply.
         "blacklist_health": blacklist_health(runtime_rows),
+        "dht_blacklist_health": dht_blacklist_health(runtime_rows),
+        "wire_pressure": wire_pressure(runtime_rows),
+        "lru_health": lru_health(runtime_rows),
         # Script-level signals are regional comparison proxies, not language
         # detection. In particular, Han-only Japanese/Korean names can satisfy
         # chinese_proxy; Kana and Hangul are reported separately so that bias is

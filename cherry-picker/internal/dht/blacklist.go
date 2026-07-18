@@ -100,7 +100,9 @@ func (bl *blackList) in(ip string, port int) bool {
 		if time.Now().Sub(v.(*blockedItem).createTime) < bl.expiredAfter {
 			return true
 		}
-		bl.list.Delete(key)
+		if bl.list.Delete(key) {
+			bl.expiredEvicted.Add(1)
+		}
 	}
 	return false
 }
@@ -118,9 +120,9 @@ func (bl *blackList) clear() {
 			}
 		}
 
-		bl.list.DeleteMulti(keys)
-		if len(keys) > 0 {
-			bl.expiredEvicted.Add(int64(len(keys)))
+		deleted := bl.list.DeleteMulti(keys)
+		if deleted > 0 {
+			bl.expiredEvicted.Add(int64(deleted))
 		}
 	}
 }

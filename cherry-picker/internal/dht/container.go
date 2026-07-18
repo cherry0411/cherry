@@ -47,22 +47,29 @@ func (smap *syncedMap) Set(key interface{}, val interface{}) {
 	smap.data[key] = val
 }
 
-// Delete deletes the key in the map.
-func (smap *syncedMap) Delete(key interface{}) {
+// Delete deletes the key in the map and reports whether it was present.
+func (smap *syncedMap) Delete(key interface{}) bool {
 	smap.Lock()
 	defer smap.Unlock()
 
+	_, existed := smap.data[key]
 	delete(smap.data, key)
+	return existed
 }
 
-// DeleteMulti deletes keys in batch.
-func (smap *syncedMap) DeleteMulti(keys []interface{}) {
+// DeleteMulti deletes keys in batch and returns the number actually removed.
+func (smap *syncedMap) DeleteMulti(keys []interface{}) int {
 	smap.Lock()
 	defer smap.Unlock()
 
+	deleted := 0
 	for _, key := range keys {
+		if _, existed := smap.data[key]; existed {
+			deleted++
+		}
 		delete(smap.data, key)
 	}
+	return deleted
 }
 
 // Clear resets the data.

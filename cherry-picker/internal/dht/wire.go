@@ -260,6 +260,7 @@ type Wire struct {
 	responses   chan Response
 	workerCount int
 	active      atomic.Int64
+	busy        atomic.Int64
 	peerID      []byte
 	Stats       WireStats
 }
@@ -340,6 +341,21 @@ func (wire *Wire) RequestDepth() int {
 
 func (wire *Wire) ResponseDepth() int {
 	return len(wire.responses)
+}
+
+func (wire *Wire) RequestCapacity() int {
+	return cap(wire.requests)
+}
+
+func (wire *Wire) ResponseCapacity() int {
+	return cap(wire.responses)
+}
+
+// BusyWorkers is the instantaneous number of workers executing a request.
+// ActiveWorkers is the autotuner's admission ceiling; reporting both
+// distinguishes an idle supply-side queue from a saturated worker pool.
+func (wire *Wire) BusyWorkers() int {
+	return int(wire.busy.Load())
 }
 
 // isDone 检查所有分片是否已下载完成。
@@ -612,8 +628,14 @@ func (wire *Wire) runWorker(workerID int) {
 		if !ok {
 			return
 		}
-		wire.handleRequest(r)
+		wire.runRequest(r)
 	}
+}
+
+func (wire *Wire) runRequest(r Request) {
+	wire.busy.Add(1)
+	defer wire.busy.Add(-1)
+	wire.handleRequest(r)
 }
 
 func (wire *Wire) handleRequest(r Request) {

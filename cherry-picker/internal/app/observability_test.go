@@ -1,0 +1,70 @@
+package app
+
+import (
+	"strings"
+	"testing"
+
+	"cherry-picker/internal/cache"
+)
+
+func TestFormatRuntimeGaugesUsesGaugesAndCounterDeltas(t *testing.T) {
+	previous := statsSnapshot{
+		dhtBlacklistRejected: 3,
+		infohashLRU: cache.LRUStats{
+			Hits: 10, Misses: 20, Inserts: 20, Evicts: 2, DeleteMisses: 1,
+		},
+	}
+	current := statsSnapshot{
+		wireActiveWorkers:    96,
+		wireMaxWorkers:       128,
+		wireBusyWorkers:      80,
+		wireRequestDepth:     123,
+		wireRequestCap:       1000,
+		wireResponseDepth:    5,
+		wireResponseCap:      100,
+		dhtBlacklistSize:     900,
+		dhtBlacklistMax:      1000,
+		dhtBlacklistRejected: 7,
+		infohashLRU: cache.LRUStats{
+			Len: 90, Capacity: 100, OldestAgeSeconds: 60,
+			Hits: 25, Misses: 30, Inserts: 30, Evicts: 7, DeleteMisses: 3,
+		},
+	}
+
+	line := formatRuntimeGauges(current, previous)
+	for _, want := range []string{
+		"wire_active=96", "wire_busy=80", "wire_req_depth=123",
+		"dht_bl_size=900", "dht_bl_reject=4",
+		"lru_ih_len=90", "lru_ih_oldest_s=60", "lru_ih_hit=15",
+		"lru_ih_miss=10", "lru_ih_insert=10", "lru_ih_evict=5",
+		"lru_ih_del_miss=2",
+	} {
+		if !strings.Contains(line, want) {
+			t.Errorf("runtime fields missing %q: %s", want, line)
+		}
+	}
+}
+
+func TestAddLRUWorkerStatsKeepsCumulativeCounters(t *testing.T) {
+	out := make(map[string]uint64)
+	addLRUWorkerStats(out, "remote_known", cache.LRUStats{
+		Len: 7, Capacity: 10, OldestAgeSeconds: 45,
+		Hits: 11, Misses: 12, Inserts: 13, Evicts: 14, DeleteMisses: 15,
+	})
+
+	want := map[string]uint64{
+		"lru_remote_known_len":                7,
+		"lru_remote_known_capacity":           10,
+		"lru_remote_known_oldest_age_seconds": 45,
+		"lru_remote_known_hits":               11,
+		"lru_remote_known_misses":             12,
+		"lru_remote_known_inserts":            13,
+		"lru_remote_known_evicts":             14,
+		"lru_remote_known_delete_misses":      15,
+	}
+	for key, value := range want {
+		if out[key] != value {
+			t.Errorf("worker stat %s = %d, want %d", key, out[key], value)
+		}
+	}
+}

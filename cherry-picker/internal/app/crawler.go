@@ -189,6 +189,30 @@ type statsSnapshot struct {
 	wireBlacklistMax      int64
 	wireBlacklistRejected int64
 	wireBlacklistExpired  int64
+
+	// Wire queue/worker gauges. The existing stage counters above are
+	// cumulative; these instantaneous depths explain which stage is applying
+	// backpressure in each 30-second window.
+	wireActiveWorkers int64
+	wireMaxWorkers    int64
+	wireBusyWorkers   int64
+	wireRequestDepth  int64
+	wireRequestCap    int64
+	wireResponseDepth int64
+	wireResponseCap   int64
+
+	// Aggregate of every DHT identity's UDP blacklist (normally 96). This is
+	// separate from the peer-wire TCP blacklist above.
+	dhtBlacklistSize     int64
+	dhtBlacklistMax      int64
+	dhtBlacklistRejected int64
+	dhtBlacklistExpired  int64
+
+	infohashLRU   cache.LRUStats
+	peerLRU       cache.LRUStats
+	metaReqLRU    cache.LRUStats
+	metaResultLRU cache.LRUStats
+	remoteLRU     cache.LRUStats
 }
 
 const (
@@ -1339,6 +1363,7 @@ func (a *Application) emitStats(ctx context.Context, events chan<- pipeline.Even
 			return
 		case <-ticker.C:
 			packetStats := a.aggregatePacketStats()
+			dhtBlacklist := a.aggregateDHTBlacklistStats()
 			current := statsSnapshot{
 				infohashEventsSent:      stats.infohashEventsSent.Load(),
 				infohashEventsDropped:   stats.infohashEventsDropped.Load(),
@@ -1384,6 +1409,22 @@ func (a *Application) emitStats(ctx context.Context, events chan<- pipeline.Even
 				wireDownloadOK:          downloader.Stats.DownloadOK.Load(),
 				wireDownloadFailed:      downloader.Stats.DownloadFailed.Load(),
 				wireBlacklisted:         downloader.Stats.Blacklisted.Load(),
+				wireActiveWorkers:       int64(downloader.ActiveWorkers()),
+				wireMaxWorkers:          int64(downloader.MaxWorkers()),
+				wireBusyWorkers:         int64(downloader.BusyWorkers()),
+				wireRequestDepth:        int64(downloader.RequestDepth()),
+				wireRequestCap:          int64(downloader.RequestCapacity()),
+				wireResponseDepth:       int64(downloader.ResponseDepth()),
+				wireResponseCap:         int64(downloader.ResponseCapacity()),
+				dhtBlacklistSize:        int64(dhtBlacklist.Size),
+				dhtBlacklistMax:         int64(dhtBlacklist.MaxSize),
+				dhtBlacklistRejected:    dhtBlacklist.InsertRejected,
+				dhtBlacklistExpired:     dhtBlacklist.ExpiredEvicted,
+				infohashLRU:             a.infohashSeen.Snapshot(),
+				peerLRU:                 a.peerSeen.Snapshot(),
+				metaReqLRU:              a.metadataRequestSeen.Snapshot(),
+				metaResultLRU:           a.metadataResultSeen.Snapshot(),
+				remoteLRU:               a.remoteKnown.Snapshot(),
 			}
 			funnel := downloader.FunnelBySource()
 			announce := funnel[dht.PeerSourceAnnounce]
@@ -1471,7 +1512,23 @@ func (a *Application) emitStats(ctx context.Context, events chan<- pipeline.Even
 				"wire_blacklist_max":      uint64(current.wireBlacklistMax),
 				"wire_blacklist_rejected": uint64(current.wireBlacklistRejected),
 				"wire_blacklist_expired":  uint64(current.wireBlacklistExpired),
+				"wire_active_workers":     uint64(current.wireActiveWorkers),
+				"wire_max_workers":        uint64(current.wireMaxWorkers),
+				"wire_busy_workers":       uint64(current.wireBusyWorkers),
+				"wire_request_depth":      uint64(current.wireRequestDepth),
+				"wire_request_capacity":   uint64(current.wireRequestCap),
+				"wire_response_depth":     uint64(current.wireResponseDepth),
+				"wire_response_capacity":  uint64(current.wireResponseCap),
+				"dht_blacklist_size":      uint64(current.dhtBlacklistSize),
+				"dht_blacklist_max":       uint64(current.dhtBlacklistMax),
+				"dht_blacklist_rejected":  uint64(current.dhtBlacklistRejected),
+				"dht_blacklist_expired":   uint64(current.dhtBlacklistExpired),
 			}
+			addLRUWorkerStats(workerStats, "infohash", current.infohashLRU)
+			addLRUWorkerStats(workerStats, "peer", current.peerLRU)
+			addLRUWorkerStats(workerStats, "metadata_request", current.metaReqLRU)
+			addLRUWorkerStats(workerStats, "metadata_result", current.metaResultLRU)
+			addLRUWorkerStats(workerStats, "remote_known", current.remoteLRU)
 			current.metadataLocale.addWorkerStats(workerStats)
 			a.submitEvent(events, pipeline.Event{
 				Type:       pipeline.EventWorkerStats,
@@ -1491,7 +1548,7 @@ func (a *Application) logRuntimeDelta(current, previous statsSnapshot) {
 	netOutKBps := (current.dhtBytesSent - previous.dhtBytesSent) / 1024 / interval
 	localeDelta := current.metadataLocale.subtract(previous.metadataLocale)
 	a.logger.Printf(
-		"runtime 30s: dht_recv=%d handled=%d dropped=%d decode_err=%d net_in=%dKB/s net_out=%dKB/s nodes=%d node_add=%d node_rm=%d refresh_q=%d lookup_queue=%d lookup_drop=%d lookup_sent=%d follow_sent=%d sample_q=%d sample_resp=%d sample_hash=%d sample_unique=%d peer_sent=%d peer_drop=%d peer_dedup=%d meta_req=%d meta_req_dedup=%d meta_sent=%d meta_drop=%d meta_dedup=%d meta_filtered=%d meta_locale_n=%d meta_han=%d meta_kana=%d meta_hangul=%d meta_zh_proxy=%d check_drop=%d paused=%v wire_q_drop=%d wire_dial=%d wire_conn=%d wire_dial_fail=%d wire_hs=%d wire_hs_fail=%d wire_ok=%d wire_dl_fail=%d wire_bl=%d ann_q=%d ann_bl=%d ann_inflight=%d ann_dial=%d ann_conn=%d ann_ok=%d gp_q=%d gp_bl=%d gp_inflight=%d gp_dial=%d gp_conn=%d gp_ok=%d bl_size=%d bl_max=%d bl_reject=%d bl_expired=%d",
+		"runtime 30s: dht_recv=%d handled=%d dropped=%d decode_err=%d net_in=%dKB/s net_out=%dKB/s nodes=%d node_add=%d node_rm=%d refresh_q=%d lookup_queue=%d lookup_drop=%d lookup_sent=%d follow_sent=%d sample_q=%d sample_resp=%d sample_hash=%d sample_unique=%d peer_sent=%d peer_drop=%d peer_dedup=%d meta_req=%d meta_req_dedup=%d meta_sent=%d meta_drop=%d meta_dedup=%d meta_filtered=%d meta_locale_n=%d meta_han=%d meta_kana=%d meta_hangul=%d meta_zh_proxy=%d check_drop=%d paused=%v wire_q_drop=%d wire_dial=%d wire_conn=%d wire_dial_fail=%d wire_hs=%d wire_hs_fail=%d wire_ok=%d wire_dl_fail=%d wire_bl=%d ann_q=%d ann_bl=%d ann_inflight=%d ann_dial=%d ann_conn=%d ann_ok=%d gp_q=%d gp_bl=%d gp_inflight=%d gp_dial=%d gp_conn=%d gp_ok=%d bl_size=%d bl_max=%d bl_reject=%d bl_expired=%d%s",
 		current.dhtPacketsReceived-previous.dhtPacketsReceived,
 		current.dhtPacketsHandled-previous.dhtPacketsHandled,
 		current.dhtPacketsDropped-previous.dhtPacketsDropped,
@@ -1552,7 +1609,58 @@ func (a *Application) logRuntimeDelta(current, previous statsSnapshot) {
 		current.wireBlacklistMax,
 		current.wireBlacklistRejected-previous.wireBlacklistRejected,
 		current.wireBlacklistExpired-previous.wireBlacklistExpired,
+		formatRuntimeGauges(current, previous),
 	)
+}
+
+func formatRuntimeGauges(current, previous statsSnapshot) string {
+	var b strings.Builder
+	fmt.Fprintf(&b,
+		" wire_active=%d wire_max=%d wire_busy=%d wire_req_depth=%d wire_req_cap=%d wire_resp_depth=%d wire_resp_cap=%d dht_bl_size=%d dht_bl_max=%d dht_bl_reject=%d dht_bl_expired=%d",
+		current.wireActiveWorkers,
+		current.wireMaxWorkers,
+		current.wireBusyWorkers,
+		current.wireRequestDepth,
+		current.wireRequestCap,
+		current.wireResponseDepth,
+		current.wireResponseCap,
+		current.dhtBlacklistSize,
+		current.dhtBlacklistMax,
+		current.dhtBlacklistRejected-previous.dhtBlacklistRejected,
+		current.dhtBlacklistExpired-previous.dhtBlacklistExpired,
+	)
+	appendLRURuntimeFields(&b, "ih", current.infohashLRU, previous.infohashLRU)
+	appendLRURuntimeFields(&b, "peer", current.peerLRU, previous.peerLRU)
+	appendLRURuntimeFields(&b, "mreq", current.metaReqLRU, previous.metaReqLRU)
+	appendLRURuntimeFields(&b, "mres", current.metaResultLRU, previous.metaResultLRU)
+	appendLRURuntimeFields(&b, "remote", current.remoteLRU, previous.remoteLRU)
+	return b.String()
+}
+
+func appendLRURuntimeFields(b *strings.Builder, name string, current, previous cache.LRUStats) {
+	fmt.Fprintf(b,
+		" lru_%s_len=%d lru_%s_cap=%d lru_%s_oldest_s=%d lru_%s_hit=%d lru_%s_miss=%d lru_%s_insert=%d lru_%s_evict=%d lru_%s_del_miss=%d",
+		name, current.Len,
+		name, current.Capacity,
+		name, current.OldestAgeSeconds,
+		name, current.Hits-previous.Hits,
+		name, current.Misses-previous.Misses,
+		name, current.Inserts-previous.Inserts,
+		name, current.Evicts-previous.Evicts,
+		name, current.DeleteMisses-previous.DeleteMisses,
+	)
+}
+
+func addLRUWorkerStats(out map[string]uint64, name string, stats cache.LRUStats) {
+	prefix := "lru_" + name + "_"
+	out[prefix+"len"] = uint64(stats.Len)
+	out[prefix+"capacity"] = uint64(stats.Capacity)
+	out[prefix+"oldest_age_seconds"] = stats.OldestAgeSeconds
+	out[prefix+"hits"] = stats.Hits
+	out[prefix+"misses"] = stats.Misses
+	out[prefix+"inserts"] = stats.Inserts
+	out[prefix+"evicts"] = stats.Evicts
+	out[prefix+"delete_misses"] = stats.DeleteMisses
 }
 
 func buildInfohashSourceKey(ihHex, source, ip string, port int) string {
@@ -1791,6 +1899,19 @@ func (a *Application) aggregatePacketStats() dht.PacketStats {
 		agg.NodesInserted += ps.NodesInserted
 		agg.NodesRemoved += ps.NodesRemoved
 		agg.RefreshQueries += ps.RefreshQueries
+	}
+	return agg
+}
+
+func (a *Application) aggregateDHTBlacklistStats() dht.BlacklistStats {
+	var agg dht.BlacklistStats
+	for _, instance := range a.dhts {
+		stats := instance.BlacklistStats()
+		agg.Size += stats.Size
+		agg.MaxSize += stats.MaxSize
+		agg.InsertAccepted += stats.InsertAccepted
+		agg.InsertRejected += stats.InsertRejected
+		agg.ExpiredEvicted += stats.ExpiredEvicted
 	}
 	return agg
 }

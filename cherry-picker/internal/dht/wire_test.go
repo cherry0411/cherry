@@ -3,6 +3,7 @@ package dht
 import (
 	"net"
 	"testing"
+	"time"
 )
 
 func TestWireCountsDialFailureAndBlacklistsEndpoint(t *testing.T) {
@@ -234,5 +235,37 @@ func TestBlacklistStatsExposeFullRejectAndSize(t *testing.T) {
 	}
 	if stats.InsertRejected != 1 {
 		t.Fatalf("InsertRejected = %d, want 1 (full-reject must be visible)", stats.InsertRejected)
+	}
+}
+
+func TestDHTBlacklistStatsExposePerIdentityState(t *testing.T) {
+	instance := &DHT{blackList: newBlackList(4)}
+	instance.blackList.insert("1.1.1.1", 1)
+	stats := instance.BlacklistStats()
+	if stats.Size != 1 || stats.MaxSize != 4 || stats.InsertAccepted != 1 {
+		t.Fatalf("unexpected DHT blacklist stats: %+v", stats)
+	}
+}
+
+func TestBlacklistStatsCountLazyExpiryOnce(t *testing.T) {
+	bl := newBlackList(4)
+	bl.list.Set(bl.genKey("1.1.1.1", 1), &blockedItem{
+		ip:         "1.1.1.1",
+		port:       1,
+		createTime: time.Now().Add(-bl.expiredAfter - time.Second),
+	})
+
+	if bl.in("1.1.1.1", 1) {
+		t.Fatal("expired endpoint remained blacklisted")
+	}
+	stats := bl.stats()
+	if stats.Size != 0 || stats.ExpiredEvicted != 1 {
+		t.Fatalf("lazy-expiry stats = %+v, want size=0 expired=1", stats)
+	}
+	if bl.in("1.1.1.1", 1) {
+		t.Fatal("deleted endpoint became blacklisted")
+	}
+	if got := bl.stats().ExpiredEvicted; got != 1 {
+		t.Fatalf("ExpiredEvicted after second miss = %d, want 1", got)
 	}
 }

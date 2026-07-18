@@ -4,6 +4,8 @@ package cache
 import (
 	"container/list"
 	"sync"
+	"sync/atomic"
+	"time"
 )
 
 // LRU 是线程安全的有界 LRU 缓存，使用双向链表 + map 实现 O(1) set/get。
@@ -15,17 +17,44 @@ import (
 //   - Add(key) bool：同 Set，语义一致，供外部调用
 type LRU struct {
 	shards []*lruShard
+
+	// observedUnix is a deliberately coarse clock. Snapshot advances it once
+	// per telemetry interval; hot Set/ContainsAndTouch operations only perform
+	// an atomic load instead of calling time.Now. OldestAgeSeconds is therefore
+	// accurate to one telemetry interval while avoiding time.Now on the request
+	// path.
+	observedUnix atomic.Uint32
 }
 
 type lruShard struct {
-	mu       sync.Mutex
-	capacity int
-	list     *list.List
-	items    map[string]*list.Element
+	mu           sync.Mutex
+	capacity     int
+	list         *list.List
+	items        map[string]*list.Element
+	hits         uint64
+	misses       uint64
+	inserts      uint64
+	evicts       uint64
+	deleteMisses uint64
 }
 
 type entry struct {
-	key string
+	key         string
+	lastTouched uint32
+}
+
+// LRUStats is a cumulative, race-free cache snapshot. Len, Capacity and
+// OldestAgeSeconds are gauges; all other fields are monotonic counters.
+// Snapshot visits only the fixed shard set (at most 64), never every entry.
+type LRUStats struct {
+	Len              int
+	Capacity         int
+	OldestAgeSeconds uint64
+	Hits             uint64
+	Misses           uint64
+	Inserts          uint64
+	Evicts           uint64
+	DeleteMisses     uint64
 }
 
 // NewLRU 创建一个容量为 capacity 的 LRU 缓存。capacity 必须 >= 1。
@@ -67,7 +96,9 @@ func NewLRU(capacity int) *LRU {
 		})
 	}
 
-	return &LRU{shards: shards}
+	c := &LRU{shards: shards}
+	c.observedUnix.Store(uint32(time.Now().Unix()))
+	return c
 }
 
 // Set 插入 key。若 key 不存在，插入并返回 true；若已存在，将其移至头部并返回 false。
@@ -76,14 +107,18 @@ func NewLRU(capacity int) *LRU {
 // "seen" 语义：返回 false 表示已见过，返回 true 表示首次出现。
 func (c *LRU) Set(key string) bool {
 	shard := c.shardFor(key)
+	now := c.observedUnix.Load()
 	shard.mu.Lock()
 	defer shard.mu.Unlock()
 
 	// 已存在：移至头部，返回 false（已见过）
 	if elem, ok := shard.items[key]; ok {
+		shard.hits++
+		elem.Value.(*entry).lastTouched = now
 		shard.list.MoveToFront(elem)
 		return false
 	}
+	shard.misses++
 
 	// 容量已满：淘汰链表尾部（最旧）的条目
 	if shard.list.Len() >= shard.capacity {
@@ -91,8 +126,9 @@ func (c *LRU) Set(key string) bool {
 	}
 
 	// 插入新条目到链表头部
-	elem := shard.list.PushFront(&entry{key: key})
+	elem := shard.list.PushFront(&entry{key: key, lastTouched: now})
 	shard.items[key] = elem
+	shard.inserts++
 	return true
 }
 
@@ -102,6 +138,11 @@ func (c *LRU) Contains(key string) bool {
 	shard.mu.Lock()
 	defer shard.mu.Unlock()
 	_, ok := shard.items[key]
+	if ok {
+		shard.hits++
+	} else {
+		shard.misses++
+	}
 	return ok
 }
 
@@ -110,12 +151,17 @@ func (c *LRU) Contains(key string) bool {
 // 仍被当成冷数据淘汰。
 func (c *LRU) ContainsAndTouch(key string) bool {
 	shard := c.shardFor(key)
+	now := c.observedUnix.Load()
 	shard.mu.Lock()
 	defer shard.mu.Unlock()
 
 	elem, ok := shard.items[key]
 	if ok {
+		shard.hits++
+		elem.Value.(*entry).lastTouched = now
 		shard.list.MoveToFront(elem)
+	} else {
+		shard.misses++
 	}
 	return ok
 }
@@ -133,6 +179,7 @@ func (c *LRU) Delete(key string) bool {
 
 	elem, ok := shard.items[key]
 	if !ok {
+		shard.deleteMisses++
 		return false
 	}
 
@@ -161,6 +208,38 @@ func (c *LRU) Len() int {
 	return total
 }
 
+// Snapshot returns cache health without an O(N) entry scan. Each shard's list
+// tail is its least recently used resident, so reading the coarse last-touch
+// timestamp from at most 64 tails is sufficient. The crawler advances the
+// clock every 30 seconds, bounding age precision without time.Now on hot paths.
+func (c *LRU) Snapshot() LRUStats {
+	now := uint32(time.Now().Unix())
+	c.observedUnix.Store(now)
+
+	var stats LRUStats
+	for _, shard := range c.shards {
+		shard.mu.Lock()
+		stats.Len += shard.list.Len()
+		stats.Capacity += shard.capacity
+		stats.Hits += shard.hits
+		stats.Misses += shard.misses
+		stats.Inserts += shard.inserts
+		stats.Evicts += shard.evicts
+		stats.DeleteMisses += shard.deleteMisses
+		if tail := shard.list.Back(); tail != nil {
+			touched := tail.Value.(*entry).lastTouched
+			if now >= touched {
+				age := uint64(now - touched)
+				if age > stats.OldestAgeSeconds {
+					stats.OldestAgeSeconds = age
+				}
+			}
+		}
+		shard.mu.Unlock()
+	}
+	return stats
+}
+
 // evict 淘汰链表尾部最旧的条目，调用方必须已持有锁。
 func (s *lruShard) evict() {
 	back := s.list.Back()
@@ -169,6 +248,7 @@ func (s *lruShard) evict() {
 	}
 	s.list.Remove(back)
 	delete(s.items, back.Value.(*entry).key)
+	s.evicts++
 }
 
 func (c *LRU) shardFor(key string) *lruShard {
