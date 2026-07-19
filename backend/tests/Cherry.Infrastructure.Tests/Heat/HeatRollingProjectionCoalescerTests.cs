@@ -126,6 +126,33 @@ public sealed class HeatRollingProjectionCoalescerTests
     }
 
     [Fact]
+    public async Task ExpiredPartialCanBeFilledBeforeItsSingleFlush()
+    {
+        var time = new MutableTimeProvider(DateTimeOffset.UtcNow);
+        var coalescer = NewCoalescer(time);
+        coalescer.BeginWindow(123, 0);
+        for (var index = 0; index < 200; index++) coalescer.Upsert(Change(index));
+        time.Advance(TimeSpan.FromSeconds(45));
+        Assert.True(coalescer.IsFlushDue);
+
+        for (var index = 200; index < 500; index++)
+            coalescer.Upsert(Change(index));
+
+        var calls = 0;
+        Assert.Equal(500, await coalescer.FlushAsync(
+            false,
+            (_, changes, _) =>
+            {
+                calls++;
+                Assert.Equal(500, changes.Count);
+                return Task.FromResult(true);
+            },
+            CancellationToken.None));
+        Assert.Equal(1, calls);
+        Assert.Equal(0, coalescer.Count);
+    }
+
+    [Fact]
     public async Task FailedOrRejectedFlushRetainsPendingForReplay()
     {
         var time = new MutableTimeProvider(DateTimeOffset.UtcNow);

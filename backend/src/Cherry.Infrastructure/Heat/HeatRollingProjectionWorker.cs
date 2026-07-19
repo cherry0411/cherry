@@ -180,9 +180,9 @@ public sealed class HeatRollingProjectionWorker : BackgroundService
                 var unstaged = changed
                     .Where(row => !_coalescer.TryUpdateExisting(row))
                     .ToArray();
-                if (_coalescer.IsFlushDue)
+                if (_coalescer.IsAtCapacity)
                 {
-                    await FlushPendingChangesAsync(force: false, cancellationToken);
+                    await FlushPendingChangesAsync(force: true, cancellationToken);
                     if (ClosedTargetHour() != targetHour)
                     {
                         restartAtNewTarget = true;
@@ -202,14 +202,26 @@ public sealed class HeatRollingProjectionWorker : BackgroundService
                         }
                     }
                     _coalescer.Upsert(row);
-                    if (_coalescer.IsFlushDue)
+                    if (_coalescer.IsAtCapacity)
                     {
-                        await FlushPendingChangesAsync(force: false, cancellationToken);
+                        await FlushPendingChangesAsync(force: true, cancellationToken);
                         if (ClosedTargetHour() != targetHour)
                         {
                             restartAtNewTarget = true;
                             break;
                         }
+                    }
+                }
+                // An age-expired partial batch can absorb every unstaged row
+                // from this page first. Filling it before this check reduces
+                // remote tasks without extending the oldest row's deadline.
+                if (!restartAtNewTarget && _coalescer.IsFlushDue)
+                {
+                    await FlushPendingChangesAsync(force: false, cancellationToken);
+                    if (ClosedTargetHour() != targetHour)
+                    {
+                        restartAtNewTarget = true;
+                        break;
                     }
                 }
                 if (restartAtNewTarget) break;
