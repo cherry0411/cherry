@@ -79,6 +79,22 @@ if (!string.IsNullOrWhiteSpace(meiliUrl))
             builder.Configuration.GetValue<int?>("MeiliSearch:OutboxBatchSize") ?? 500,
             1,
             5_000),
+        CoalescingEnabled =
+            builder.Configuration.GetValue<bool?>("MeiliSearch:OutboxCoalescingEnabled") ?? false,
+        CoalescingMinBatchSize = Math.Clamp(
+            builder.Configuration.GetValue<int?>("MeiliSearch:OutboxCoalescingMinBatchSize") ?? 500,
+            1,
+            5_000),
+        CoalescingMaxQueueDelay = TimeSpan.FromMilliseconds(
+            Math.Clamp(
+                builder.Configuration.GetValue<double?>("MeiliSearch:OutboxCoalescingMaxDelayMilliseconds") ?? 30_000,
+                100,
+                300_000)),
+        CoalescingPollInterval = TimeSpan.FromMilliseconds(
+            Math.Clamp(
+                builder.Configuration.GetValue<double?>("MeiliSearch:OutboxCoalescingPollMilliseconds") ?? 500,
+                50,
+                5_000)),
         LeaseDuration = TimeSpan.FromSeconds(
             Math.Clamp(
                 builder.Configuration.GetValue<double?>("MeiliSearch:OutboxLeaseSeconds") ?? 300,

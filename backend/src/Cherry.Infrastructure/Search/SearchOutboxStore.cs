@@ -19,6 +19,10 @@ public sealed record SearchOutboxBacklog(
     long RetryAttempts,
     double OldestAgeSeconds);
 
+public sealed record SearchOutboxReadyWindow(
+    int Count,
+    DateTime? OldestEnqueuedAt);
+
 /// <summary>
 /// Transaction helper shared by all authoritative torrent write paths.
 /// </summary>
@@ -78,6 +82,39 @@ public sealed class SearchOutboxStore
     public SearchOutboxStore(AppDbContext db)
     {
         _db = db;
+    }
+
+    public async Task<SearchOutboxReadyWindow> GetReadyWindowAsync(
+        int limit,
+        CancellationToken cancellationToken = default)
+    {
+        limit = Math.Clamp(limit, 1, 5_000);
+        var connection = (NpgsqlConnection)_db.Database.GetDbConnection();
+        if (connection.State != System.Data.ConnectionState.Open)
+            await connection.OpenAsync(cancellationToken);
+
+        // Ordering is deliberately omitted. At the threshold we only need to
+        // prove that enough work exists; below it the bounded candidate set is
+        // the entire ready tail, so MIN still gives the true freshness anchor.
+        await using var command = new NpgsqlCommand(
+            """
+            WITH candidates AS (
+                SELECT enqueued_at
+                  FROM search_outbox
+                 WHERE available_at <= NOW()
+                   AND (lease_until IS NULL OR lease_until <= NOW())
+                 LIMIT @limit)
+            SELECT COUNT(*)::integer, MIN(enqueued_at)
+              FROM candidates
+            """,
+            connection);
+        command.Parameters.AddWithValue("limit", NpgsqlDbType.Integer, limit);
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        if (!await reader.ReadAsync(cancellationToken))
+            return new SearchOutboxReadyWindow(0, null);
+        return new SearchOutboxReadyWindow(
+            reader.GetInt32(0),
+            reader.IsDBNull(1) ? null : reader.GetDateTime(1));
     }
 
     public async Task<List<SearchOutboxClaim>> ClaimAsync(

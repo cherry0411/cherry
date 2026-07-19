@@ -8,6 +8,10 @@ namespace Cherry.Infrastructure.Search;
 public sealed class SearchOutboxOptions
 {
     public int BatchSize { get; init; } = 500;
+    public bool CoalescingEnabled { get; init; }
+    public int CoalescingMinBatchSize { get; init; } = 500;
+    public TimeSpan CoalescingMaxQueueDelay { get; init; } = TimeSpan.FromSeconds(30);
+    public TimeSpan CoalescingPollInterval { get; init; } = TimeSpan.FromMilliseconds(500);
     public TimeSpan LeaseDuration { get; init; } = TimeSpan.FromMinutes(5);
     public TimeSpan PollInterval { get; init; } = TimeSpan.FromMilliseconds(250);
     public TimeSpan TaskTimeout { get; init; } = TimeSpan.FromMinutes(2);
@@ -41,9 +45,20 @@ public sealed class SearchOutboxOptions
             RetryMaxDelay,
             TimeSpan.FromMinutes(5),
             TimeSpan.FromHours(1));
+        var batchSize = Math.Clamp(BatchSize, 1, 5_000);
         return new SearchOutboxOptions
         {
-            BatchSize = Math.Clamp(BatchSize, 1, 5_000),
+            BatchSize = batchSize,
+            CoalescingEnabled = CoalescingEnabled,
+            CoalescingMinBatchSize = Math.Clamp(CoalescingMinBatchSize, 1, batchSize),
+            CoalescingMaxQueueDelay = ClampPositive(
+                CoalescingMaxQueueDelay,
+                TimeSpan.FromSeconds(30),
+                TimeSpan.FromMinutes(5)),
+            CoalescingPollInterval = ClampPositive(
+                CoalescingPollInterval,
+                TimeSpan.FromMilliseconds(500),
+                TimeSpan.FromSeconds(5)),
             PollInterval = poll,
             TaskTimeout = taskTimeout,
             LeaseDuration = requestedLease < minimumLease ? minimumLease : requestedLease,
@@ -65,6 +80,9 @@ public sealed record SearchOutboxRuntimeMetrics(
     long CompletedTasks,
     long Retries,
     long FailedTasks,
+    long CoalescedDispatches,
+    double CoalescingWaitSeconds,
+    int LastBatchDocuments,
     double LastTaskLatencySeconds,
     string? LastError);
 
@@ -74,6 +92,9 @@ public sealed class SearchOutboxMetrics
     private long _completedTasks;
     private long _retries;
     private long _failedTasks;
+    private long _coalescedDispatches;
+    private long _coalescingWaitTicks;
+    private int _lastBatchDocuments;
     private long _lastTaskLatencyTicks;
     private string? _lastError;
 
@@ -81,8 +102,17 @@ public sealed class SearchOutboxMetrics
     {
         Interlocked.Add(ref _completedDocuments, documents);
         Interlocked.Increment(ref _completedTasks);
+        Interlocked.Exchange(ref _lastBatchDocuments, documents);
         Interlocked.Exchange(ref _lastTaskLatencyTicks, taskLatency.Ticks);
         Volatile.Write(ref _lastError, null);
+    }
+
+    public void RecordCoalescedDispatch(TimeSpan wait)
+    {
+        if (wait <= TimeSpan.Zero)
+            return;
+        Interlocked.Increment(ref _coalescedDispatches);
+        Interlocked.Add(ref _coalescingWaitTicks, wait.Ticks);
     }
 
     public void RecordFailure(string error, bool failedTask)
@@ -98,6 +128,9 @@ public sealed class SearchOutboxMetrics
         Interlocked.Read(ref _completedTasks),
         Interlocked.Read(ref _retries),
         Interlocked.Read(ref _failedTasks),
+        Interlocked.Read(ref _coalescedDispatches),
+        TimeSpan.FromTicks(Interlocked.Read(ref _coalescingWaitTicks)).TotalSeconds,
+        Volatile.Read(ref _lastBatchDocuments),
         TimeSpan.FromTicks(Interlocked.Read(ref _lastTaskLatencyTicks)).TotalSeconds,
         Volatile.Read(ref _lastError));
 }
@@ -133,6 +166,12 @@ public sealed class SearchOutboxWorker : BackgroundService
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
+        _logger.LogInformation(
+            "Search outbox coalescing enabled={Enabled}, min batch={MinBatch}, max queue delay={MaxQueueDelay}, poll={PollInterval}",
+            _options.CoalescingEnabled,
+            _options.CoalescingMinBatchSize,
+            _options.CoalescingMaxQueueDelay,
+            _options.CoalescingPollInterval);
         while (!stoppingToken.IsCancellationRequested)
         {
             try
@@ -155,6 +194,10 @@ public sealed class SearchOutboxWorker : BackgroundService
 
     public async Task<int> ProcessOnceAsync(CancellationToken cancellationToken = default)
     {
+        var coalescing = await AwaitCoalescingWindowAsync(cancellationToken);
+        if (!coalescing.Ready)
+            return 0;
+
         await using var projection =
             await _recoveryCoordinator.EnterProjectionAsync(cancellationToken);
         var owner = Guid.NewGuid();
@@ -170,6 +213,7 @@ public sealed class SearchOutboxWorker : BackgroundService
                 cancellationToken);
             if (claims.Count == 0)
                 return 0;
+            _metrics.RecordCoalescedDispatch(coalescing.Waited);
             documents = await store.LoadDocumentsAsync(claims, cancellationToken);
         }
 
@@ -226,6 +270,36 @@ public sealed class SearchOutboxWorker : BackgroundService
         }
     }
 
+    private async Task<CoalescingOutcome> AwaitCoalescingWindowAsync(
+        CancellationToken cancellationToken)
+    {
+        if (!_options.CoalescingEnabled)
+            return new CoalescingOutcome(true, TimeSpan.Zero);
+
+        var waited = TimeSpan.Zero;
+        while (true)
+        {
+            SearchOutboxReadyWindow window;
+            await using (var scope = _scopeFactory.CreateAsyncScope())
+            {
+                var store = scope.ServiceProvider.GetRequiredService<SearchOutboxStore>();
+                window = await store.GetReadyWindowAsync(
+                    _options.CoalescingMinBatchSize,
+                    cancellationToken);
+            }
+
+            if (window.Count == 0)
+                return new CoalescingOutcome(false, waited);
+
+            var decision = SearchOutboxCoalescer.Decide(_options, window, DateTime.UtcNow);
+            if (decision.Dispatch)
+                return new CoalescingOutcome(true, waited);
+
+            await Task.Delay(decision.Delay, cancellationToken);
+            waited += decision.Delay;
+        }
+    }
+
     private async Task<MeiliTaskState> WaitForCompletionAsync(
         long taskUid,
         CancellationToken cancellationToken)
@@ -265,4 +339,6 @@ public sealed class SearchOutboxWorker : BackgroundService
 
     private sealed class MeiliTaskFailedException(long taskUid, string error)
         : Exception($"Meilisearch task {taskUid} failed: {error}");
+
+    private readonly record struct CoalescingOutcome(bool Ready, TimeSpan Waited);
 }

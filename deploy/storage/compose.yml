@@ -13,7 +13,10 @@ services:
     image: postgres:17.10-alpine@sha256:742f40ea20b9ff2ff31db5458d127452988a2164df9e17441e191f3b72252193
     restart: unless-stopped
     shm_size: 256m
-    mem_limit: 1280m
+    # The API and Meili are page-cache sensitive under the shared heat/search
+    # workload.  PostgreSQL stayed below 480 MiB in the production audit, so
+    # reserve 1.125 GiB here and give the reclaimed headroom to those readers.
+    mem_limit: 1152m
     cpus: "1.25"
     environment:
       POSTGRES_DB: ${POSTGRES_DB:?set POSTGRES_DB}
@@ -67,7 +70,7 @@ services:
   meilisearch:
     image: getmeili/meilisearch:v1.45.1@sha256:ac40212f9e5a7526d8007586e3e46fb0441d29dd36c7b02fa2341d2c9a1f6493
     restart: unless-stopped
-    mem_limit: 1152m
+    mem_limit: 1344m
     cpus: "1.0"
     environment:
       MEILI_ENV: production
@@ -93,7 +96,7 @@ services:
       context: ../../backend
       dockerfile: Dockerfile
     restart: unless-stopped
-    mem_limit: 576m
+    mem_limit: 768m
     cpus: "0.75"
     depends_on:
       postgres:
@@ -109,6 +112,10 @@ services:
       - MeiliSearch__Url=http://meilisearch:7700
       - MeiliSearch__ApiKey=${MEILI_MASTER_KEY:?set MEILI_MASTER_KEY}
       - MeiliSearch__OutboxBatchSize=${MEILI_OUTBOX_BATCH_SIZE:-500}
+      - MeiliSearch__OutboxCoalescingEnabled=${MEILI_OUTBOX_COALESCING_ENABLED:-false}
+      - MeiliSearch__OutboxCoalescingMinBatchSize=${MEILI_OUTBOX_COALESCING_MIN_BATCH_SIZE:-500}
+      - MeiliSearch__OutboxCoalescingMaxDelayMilliseconds=${MEILI_OUTBOX_COALESCING_MAX_DELAY_MS:-30000}
+      - MeiliSearch__OutboxCoalescingPollMilliseconds=${MEILI_OUTBOX_COALESCING_POLL_MS:-500}
       - MeiliSearch__OutboxLeaseSeconds=${MEILI_OUTBOX_LEASE_SECONDS:-300}
       - MeiliSearch__TaskPollMilliseconds=${MEILI_TASK_POLL_MS:-250}
       - MeiliSearch__TaskTimeoutSeconds=${MEILI_TASK_TIMEOUT_SECONDS:-120}
