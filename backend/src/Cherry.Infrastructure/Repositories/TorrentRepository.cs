@@ -426,6 +426,45 @@ public class TorrentRepository : ITorrentRepository
         return await _db.Torrents.LongCountAsync(t => t.CreatedAt >= today, ct);
     }
 
+    public async Task<DurableIngestStatistics> GetDurableIngestStatisticsAsync(
+        CancellationToken ct = default)
+    {
+        // The receipt table has one narrow row per crawler process epoch. Its
+        // counters are updated atomically with metadata, so this is an exact,
+        // restart-safe read without scanning the torrent catalog.
+        var crawlerEpochs = await _db.DurableBatchReceipts
+            .AsNoTracking()
+            .OrderBy(item => item.CrawlerId)
+            .ThenByDescending(item => item.Epoch)
+            .Select(item => new DurableCrawlerEpochStatistics(
+                item.CrawlerId,
+                item.Epoch,
+                item.TotalDelivered,
+                item.TotalAccepted,
+                item.TotalDuplicates,
+                item.TotalMetadataCommitted,
+                item.TotalPolicyCommitted,
+                item.TotalCommittedBatches,
+                item.CountersStartedAt,
+                item.UpdatedAt,
+                item.TotalCommittedBatches > 0 ? item.UpdatedAt : null))
+            .ToListAsync(ct);
+
+        if (crawlerEpochs.Count == 0)
+            return DurableIngestStatistics.Empty;
+
+        return new DurableIngestStatistics(
+            crawlerEpochs.Sum(item => item.DeliveredRecords),
+            crawlerEpochs.Sum(item => item.AcceptedRecords),
+            crawlerEpochs.Sum(item => item.DuplicateRecords),
+            crawlerEpochs.Sum(item => item.MetadataCommitted),
+            crawlerEpochs.Sum(item => item.PolicyCommitted),
+            crawlerEpochs.Sum(item => item.CommittedBatches),
+            crawlerEpochs.Min(item => item.CountersStartedAt),
+            crawlerEpochs.Max(item => item.LastCountedCommitAt),
+            crawlerEpochs);
+    }
+
     public async Task MarkRequestsDoneAsync(IEnumerable<string> infoHashes, CancellationToken ct = default)
     {
         var arr = infoHashes.ToArray();

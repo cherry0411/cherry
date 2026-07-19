@@ -13,7 +13,11 @@ public static class StatsEndpoints
         group.MapGet("/stats", GetStatsAsync)
             .WithName("GetStats")
             .WithSummary("获取系统统计信息")
-            .WithDescription("Get system statistics: total torrents, today's new count, dedup filter size, server time.")
+            .WithDescription(
+                "Get the PostgreSQL catalog estimate, exact durable-ingest counters " +
+                "per crawler epoch, today's indexed catalog count, dedup filter size, and server time. " +
+                "Delivered means records in committed wire batches; accepted means a first-written " +
+                "torrent or policy decision; metadataCommitted counts only new torrent rows.")
             .Produces<StatsResponse>(200)
             .CacheOutput(p => p.Expire(TimeSpan.FromSeconds(10)));
     }

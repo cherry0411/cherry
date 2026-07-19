@@ -17,6 +17,13 @@ public sealed class DurableBatchReceiptConfiguration : IEntityTypeConfiguration<
                 "AND last_accepted = 0 AND last_duplicates = 0) OR " +
                 "(last_start_sequence > 0 AND last_end_sequence >= last_start_sequence " +
                 "AND char_length(last_payload_sha256) = 64 AND last_accepted >= 0 AND last_duplicates >= 0)");
+            table.HasCheckConstraint(
+                "CK_durable_batch_receipts_counters",
+                "total_delivered >= 0 AND total_accepted >= 0 AND total_duplicates >= 0 " +
+                "AND total_metadata_committed >= 0 AND total_policy_committed >= 0 " +
+                "AND total_committed_batches >= 0 " +
+                "AND total_delivered = total_accepted + total_duplicates " +
+                "AND total_accepted = total_metadata_committed + total_policy_committed");
         });
 
         builder.HasKey(x => new { x.CrawlerId, x.Epoch });
@@ -33,6 +40,15 @@ public sealed class DurableBatchReceiptConfiguration : IEntityTypeConfiguration<
             .IsRequired();
         builder.Property(x => x.LastAccepted).HasColumnName("last_accepted");
         builder.Property(x => x.LastDuplicates).HasColumnName("last_duplicates");
+        builder.Property(x => x.TotalDelivered).HasColumnName("total_delivered");
+        builder.Property(x => x.TotalAccepted).HasColumnName("total_accepted");
+        builder.Property(x => x.TotalDuplicates).HasColumnName("total_duplicates");
+        builder.Property(x => x.TotalMetadataCommitted).HasColumnName("total_metadata_committed");
+        builder.Property(x => x.TotalPolicyCommitted).HasColumnName("total_policy_committed");
+        builder.Property(x => x.TotalCommittedBatches).HasColumnName("total_committed_batches");
+        builder.Property(x => x.CountersStartedAt)
+            .HasColumnName("counters_started_at")
+            .HasDefaultValueSql("NOW()");
         builder.Property(x => x.UpdatedAt)
             .HasColumnName("updated_at")
             .HasDefaultValueSql("NOW()");

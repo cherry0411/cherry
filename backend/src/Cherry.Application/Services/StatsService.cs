@@ -18,11 +18,14 @@ public class StatsService
     {
         var total = await _repo.GetTotalCountAsync(ct);
         var today = await _repo.GetTodayCountAsync(ct);
+        var durableIngest = await _repo.GetDurableIngestStatisticsAsync(ct);
 
         return new StatsResponse(
             TotalTorrents: total,
+            PgCatalogEstimate: total,
             TodayNew: today,
             DedupFilterSize: _dedup.Count,
+            DurableIngest: durableIngest,
             ServerTime: DateTime.UtcNow
         );
     }

@@ -160,6 +160,15 @@ public sealed class DurableIngestPostgresTests
         Assert.Equal(second.Request.PayloadSha256, receipt.LastPayloadSha256);
         Assert.Equal(3, receipt.LastAccepted);
         Assert.Equal(0, receipt.LastDuplicates);
+        // Only the two original commits advance the counters. Exact replays,
+        // gaps, checksum conflicts, and overlaps above must remain write-free.
+        Assert.Equal(4, receipt.TotalDelivered);
+        Assert.Equal(4, receipt.TotalAccepted);
+        Assert.Equal(0, receipt.TotalDuplicates);
+        Assert.Equal(2, receipt.TotalMetadataCommitted);
+        Assert.Equal(2, receipt.TotalPolicyCommitted);
+        Assert.Equal(2, receipt.TotalCommittedBatches);
+        Assert.True(receipt.CountersStartedAt <= receipt.UpdatedAt);
         Assert.Equal(2, await db.Torrents.CountAsync(
             torrent => torrent.InfoHash == firstHash || torrent.InfoHash == summaryHash));
         var torrentIds = await db.Torrents
@@ -194,6 +203,30 @@ public sealed class DurableIngestPostgresTests
         Assert.Contains(summaryHash, terminallyProcessed);
         Assert.Contains(hashOnlyHash, terminallyProcessed);
         Assert.Contains(rejectHash, terminallyProcessed);
+
+        var duplicate = await service.IngestAsync(Batch(crawlerId, epoch, 5, firstHash));
+        Assert.True(duplicate.Response.Committed);
+        Assert.Equal(0, duplicate.Response.Accepted);
+        Assert.Equal(1, duplicate.Response.Duplicates);
+        await db.Entry(receipt).ReloadAsync();
+        Assert.Equal(5, receipt.TotalDelivered);
+        Assert.Equal(4, receipt.TotalAccepted);
+        Assert.Equal(1, receipt.TotalDuplicates);
+        Assert.Equal(2, receipt.TotalMetadataCommitted);
+        Assert.Equal(2, receipt.TotalPolicyCommitted);
+        Assert.Equal(3, receipt.TotalCommittedBatches);
+
+        var durableStats = await repository.GetDurableIngestStatisticsAsync();
+        var crawlerEpoch = Assert.Single(durableStats.CrawlerEpochs.Where(item =>
+            item.CrawlerId == crawlerId && item.Epoch == (long)epoch));
+        Assert.Equal(5, crawlerEpoch.DeliveredRecords);
+        Assert.Equal(4, crawlerEpoch.AcceptedRecords);
+        Assert.Equal(1, crawlerEpoch.DuplicateRecords);
+        Assert.Equal(2, crawlerEpoch.MetadataCommitted);
+        Assert.Equal(2, crawlerEpoch.PolicyCommitted);
+        Assert.Equal(3, crawlerEpoch.CommittedBatches);
+        Assert.Equal(receipt.UpdatedAt, crawlerEpoch.ReceiptUpdatedAt);
+        Assert.Equal(receipt.UpdatedAt, crawlerEpoch.LastCountedCommitAt);
     }
 
     private static ParsedDurableBatch Batch(

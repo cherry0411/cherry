@@ -17,5 +17,6 @@ public interface ITorrentRepository
     IAsyncEnumerable<string> StreamProcessedHashesAsync(CancellationToken ct = default);
     Task<long> GetTotalCountAsync(CancellationToken ct = default);
     Task<long> GetTodayCountAsync(CancellationToken ct = default);
+    Task<DurableIngestStatistics> GetDurableIngestStatisticsAsync(CancellationToken ct = default);
     Task MarkRequestsDoneAsync(IEnumerable<string> infoHashes, CancellationToken ct = default);
 }

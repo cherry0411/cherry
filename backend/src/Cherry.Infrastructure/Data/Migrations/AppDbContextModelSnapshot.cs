@@ -41,6 +41,12 @@ namespace Cherry.Infrastructure.Data.Migrations
                         .HasColumnType("integer")
                         .HasColumnName("last_duplicates");
 
+                    b.Property<DateTime>("CountersStartedAt")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("timestamp with time zone")
+                        .HasColumnName("counters_started_at")
+                        .HasDefaultValueSql("NOW()");
+
                     b.Property<long>("LastEndSequence")
                         .HasColumnType("bigint")
                         .HasColumnName("last_end_sequence");
@@ -55,6 +61,30 @@ namespace Cherry.Infrastructure.Data.Migrations
                         .HasColumnType("bigint")
                         .HasColumnName("last_start_sequence");
 
+                    b.Property<long>("TotalAccepted")
+                        .HasColumnType("bigint")
+                        .HasColumnName("total_accepted");
+
+                    b.Property<long>("TotalCommittedBatches")
+                        .HasColumnType("bigint")
+                        .HasColumnName("total_committed_batches");
+
+                    b.Property<long>("TotalDelivered")
+                        .HasColumnType("bigint")
+                        .HasColumnName("total_delivered");
+
+                    b.Property<long>("TotalDuplicates")
+                        .HasColumnType("bigint")
+                        .HasColumnName("total_duplicates");
+
+                    b.Property<long>("TotalMetadataCommitted")
+                        .HasColumnType("bigint")
+                        .HasColumnName("total_metadata_committed");
+
+                    b.Property<long>("TotalPolicyCommitted")
+                        .HasColumnType("bigint")
+                        .HasColumnName("total_policy_committed");
+
                     b.Property<DateTime>("UpdatedAt")
                         .ValueGeneratedOnAdd()
                         .HasColumnType("timestamp with time zone")
@@ -66,6 +96,8 @@ namespace Cherry.Infrastructure.Data.Migrations
                     b.ToTable("durable_batch_receipts", null, t =>
                         {
                             t.HasCheckConstraint("CK_durable_batch_receipts_epoch", "epoch > 0");
+
+                            t.HasCheckConstraint("CK_durable_batch_receipts_counters", "total_delivered >= 0 AND total_accepted >= 0 AND total_duplicates >= 0 AND total_metadata_committed >= 0 AND total_policy_committed >= 0 AND total_committed_batches >= 0 AND total_delivered = total_accepted + total_duplicates AND total_accepted = total_metadata_committed + total_policy_committed");
 
                             t.HasCheckConstraint("CK_durable_batch_receipts_state", "(last_start_sequence = 0 AND last_end_sequence = 0 AND last_payload_sha256 = '' AND last_accepted = 0 AND last_duplicates = 0) OR (last_start_sequence > 0 AND last_end_sequence >= last_start_sequence AND char_length(last_payload_sha256) = 64 AND last_accepted >= 0 AND last_duplicates >= 0)");
                         });

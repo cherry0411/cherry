@@ -173,8 +173,11 @@ public sealed class DurableIngestService
                 start,
                 end,
                 request.PayloadSha256!,
+                validated.EventCount,
                 accepted,
                 duplicates,
+                insertedTorrents.Count,
+                changedDecisionHashes.Count,
                 cancellationToken);
 
             await transaction.CommitAsync(cancellationToken);
@@ -367,8 +370,11 @@ public sealed class DurableIngestService
         long start,
         long end,
         string checksum,
+        int delivered,
         int accepted,
         int duplicates,
+        int metadataCommitted,
+        int policyCommitted,
         CancellationToken cancellationToken)
     {
         await using var command = new NpgsqlCommand(
@@ -379,6 +385,12 @@ public sealed class DurableIngestService
                    last_payload_sha256 = @checksum,
                    last_accepted = @accepted,
                    last_duplicates = @duplicates,
+                   total_delivered = total_delivered + @delivered,
+                   total_accepted = total_accepted + @accepted,
+                   total_duplicates = total_duplicates + @duplicates,
+                   total_metadata_committed = total_metadata_committed + @metadata_committed,
+                   total_policy_committed = total_policy_committed + @policy_committed,
+                   total_committed_batches = total_committed_batches + 1,
                    updated_at = NOW()
              WHERE crawler_id = @crawler_id AND epoch = @epoch
             """,
@@ -387,8 +399,11 @@ public sealed class DurableIngestService
         command.Parameters.AddWithValue("start", NpgsqlDbType.Bigint, start);
         command.Parameters.AddWithValue("end", NpgsqlDbType.Bigint, end);
         command.Parameters.AddWithValue("checksum", NpgsqlDbType.Varchar, checksum);
+        command.Parameters.AddWithValue("delivered", NpgsqlDbType.Bigint, (long)delivered);
         command.Parameters.AddWithValue("accepted", NpgsqlDbType.Integer, accepted);
         command.Parameters.AddWithValue("duplicates", NpgsqlDbType.Integer, duplicates);
+        command.Parameters.AddWithValue("metadata_committed", NpgsqlDbType.Bigint, (long)metadataCommitted);
+        command.Parameters.AddWithValue("policy_committed", NpgsqlDbType.Bigint, (long)policyCommitted);
         command.Parameters.AddWithValue("crawler_id", NpgsqlDbType.Varchar, crawlerId);
         command.Parameters.AddWithValue("epoch", NpgsqlDbType.Bigint, epoch);
         if (await command.ExecuteNonQueryAsync(cancellationToken) != 1)

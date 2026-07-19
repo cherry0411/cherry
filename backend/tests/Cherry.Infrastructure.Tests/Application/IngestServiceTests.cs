@@ -256,6 +256,10 @@ public sealed class IngestServiceTests
         public Task<long> GetTodayCountAsync(CancellationToken ct = default) =>
             throw new NotSupportedException();
 
+        public Task<DurableIngestStatistics> GetDurableIngestStatisticsAsync(
+            CancellationToken ct = default) =>
+            Task.FromResult(DurableIngestStatistics.Empty);
+
         public Task MarkRequestsDoneAsync(
             IEnumerable<string> infoHashes,
             CancellationToken ct = default) => Task.CompletedTask;
