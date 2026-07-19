@@ -117,6 +117,40 @@ func TestLoadFixedMetadataWorkersFromJSON(t *testing.T) {
 	}
 }
 
+func TestLoadRetryObserverDefaultsDisabledAndParsesJSON(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "crawler.json")
+	if err := os.WriteFile(path, []byte(`{
+  "metadata": {
+    "retry_observer_enabled": true,
+    "retry_observer_sample_denominator": 32,
+    "retry_observer_window": "31m",
+    "retry_observer_capacity": 65536
+  }
+}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CHERRY_PICKER_CONFIG", path)
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Metadata.RetryObserverEnabled || cfg.Metadata.RetryObserverSampleDenominator != 32 ||
+		cfg.Metadata.RetryObserverWindow != 31*time.Minute || cfg.Metadata.RetryObserverCapacity != 65_536 {
+		t.Fatalf("unexpected retry observer config: %+v", cfg.Metadata)
+	}
+
+	t.Setenv("CHERRY_PICKER_CONFIG", "")
+	t.Setenv("CHERRY_PICKER_RETRY_OBSERVER_ENABLED", "false")
+	cfg, err = Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Metadata.RetryObserverEnabled || cfg.Metadata.RetryObserverSampleDenominator != 64 ||
+		cfg.Metadata.RetryObserverWindow != 31*time.Minute || cfg.Metadata.RetryObserverCapacity != 131_072 {
+		t.Fatalf("unexpected retry observer defaults: %+v", cfg.Metadata)
+	}
+}
+
 func TestLoadFixedMetadataWorkersFromEnvironment(t *testing.T) {
 	t.Setenv("CHERRY_PICKER_CONFIG", "")
 	t.Setenv("CHERRY_PICKER_AUTO_TUNE", "false")

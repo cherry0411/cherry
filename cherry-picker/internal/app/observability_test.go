@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"cherry-picker/internal/cache"
+	"cherry-picker/internal/dht"
 )
 
 func TestFormatRuntimeGaugesUsesGaugesAndCounterDeltas(t *testing.T) {
@@ -57,6 +58,74 @@ func TestFormatRuntimeGaugesUsesGaugesAndCounterDeltas(t *testing.T) {
 		if !strings.Contains(line, want) {
 			t.Errorf("runtime fields missing %q: %s", want, line)
 		}
+	}
+}
+
+func TestRetryCohortRuntimeAndWorkerMetricsUseWindowDeltas(t *testing.T) {
+	previous := dht.RetryCohortSnapshot{Enabled: true, Candidates: 100, PairSampledAttempts: 10}
+	previous.Classes[0].Attempts = 5
+	previous.Classes[0].Successes = 4
+	previous.Classes[0].Outcomes[0] = 4
+	previous.Classes[0].LatencyMicros = 4000
+	previous.Classes[0].LatencyBuckets[0] = 4
+	current := previous
+	current.PairSampleDenominator = 64
+	current.EndpointSampleDenominator = 64
+	current.InfoHashSampleDenominator = 64
+	current.WindowSeconds = 1860
+	current.PairCapacity = 1024
+	current.IdentityCapacity = 512
+	current.EstimatedBytes = 50_000
+	current.Candidates = 164
+	current.PairSampledAttempts = 11
+	current.EndpointSampledAttempts = 2
+	current.EndpointOtherActiveEvents = 1
+	current.InfoHashSampledAttempts = 3
+	current.InfoHashOtherActiveEvents = 1
+	current.PairSlotsUsed = 7
+	current.EndpointSlotsUsed = 6
+	current.InfoHashSlotsUsed = 5
+	current.Classes[0].Attempts = 6
+	current.Classes[0].Successes = 5
+	current.Classes[0].Outcomes[0] = 5
+	current.Classes[0].LatencyMicros = 14_000
+	current.Classes[0].LatencyBuckets[1] = 1
+	current.Classes[0].EchoHashMismatches = 1
+	current.Classes[1].Attempts = 1
+	current.Classes[1].Outcomes[4] = 1 // dial_timeout
+	current.Classes[1].LatencyMicros = 500_000
+	current.Classes[1].LatencyBuckets[3] = 1
+
+	var builder strings.Builder
+	appendRetryCohortRuntimeFields(&builder, &current, &previous)
+	line := builder.String()
+	for _, want := range []string{
+		"retry_obs_pair_den=64", "retry_obs_endpoint_den=64", "retry_obs_hash_den=64",
+		"retry_obs_candidate=64", "retry_obs_pair_sample=1", "retry_obs_pair_slots=7/1024",
+		"retry_obs_endpoint_sample=2", "retry_obs_endpoint_other_active=1",
+		"retry_obs_hash_sample=3", "retry_obs_hash_other_active=1",
+		"retry_obs_first_attempt=1", "retry_obs_first_ok=1", "retry_obs_first_avg_us=10000",
+		"retry_obs_first_ok_ppm=1000000", "retry_obs_first_p95_le_ms=10", "retry_obs_first_echo_bad=1",
+		"retry_obs_retry_lt2m_dial_timeout=1",
+	} {
+		if !strings.Contains(line, want) {
+			t.Errorf("runtime fields missing %q: %s", want, line)
+		}
+	}
+
+	out := make(map[string]uint64)
+	addRetryCohortWorkerStats(out, &current)
+	if out["retry_observer_enabled"] != 1 || out["retry_observer_first_attempts"] != 6 ||
+		out["retry_observer_pair_sample_denominator"] != 64 ||
+		out["retry_observer_endpoint_sample_denominator"] != 64 ||
+		out["retry_observer_infohash_sample_denominator"] != 64 ||
+		out["retry_observer_retry_lt2m_outcome_dial_timeout"] != 1 ||
+		out["retry_observer_endpoint_sampled_attempts"] != 2 ||
+		out["retry_observer_endpoint_other_active_events"] != 1 ||
+		out["retry_observer_infohash_sampled_attempts"] != 3 ||
+		out["retry_observer_infohash_other_active_events"] != 1 ||
+		out["retry_observer_first_echo_hash_mismatch"] != 1 {
+		t.Fatalf("unexpected worker stats: %+v", out)
 	}
 }
 

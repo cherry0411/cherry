@@ -55,8 +55,11 @@ func read(conn *net.TCPConn, size int, data *bytes.Buffer) error {
 	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
 
 	n, err := io.CopyN(data, conn, int64(size))
-	if err != nil || n != int64(size) {
-		return errors.New("read error")
+	if err != nil {
+		return err
+	}
+	if n != int64(size) {
+		return io.ErrUnexpectedEOF
 	}
 	return nil
 }
@@ -182,6 +185,13 @@ type Request struct {
 	Source   PeerSource
 }
 
+// observedRequest keeps the diagnostic token internal. Response embeds only
+// the public Request, avoiding a live token copy and wider response slots.
+type observedRequest struct {
+	Request
+	retryObservation retryObservation
+}
+
 // Response 包含请求上下文和下载到的 metadata 内容。
 type Response struct {
 	Request
@@ -248,21 +258,55 @@ func (wire *Wire) BlacklistStats() BlacklistStats {
 	return wire.blackList.stats()
 }
 
+// SetRetryCohortObserver installs the optional diagnostic observer. It must be
+// called before Run; the crawler does this during single-threaded startup.
+func (wire *Wire) SetRetryCohortObserver(observer *RetryCohortObserver) {
+	if observer == nil {
+		return
+	}
+	if wire.retryObserver != nil {
+		panic("retry cohort observer already installed")
+	}
+	if len(wire.requests) != 0 {
+		panic("retry cohort observer must be installed before request admission")
+	}
+	if uint64(cap(wire.requests)) != observer.requestQueueCapacity {
+		panic("retry cohort observer request queue capacity does not match wire")
+	}
+	wire.observedRequests = make(chan observedRequest, cap(wire.requests))
+	// Release the baseline channel. Disabled deployments retain chan Request
+	// with no 8-byte token; enabled deployments pay only the observed slot delta.
+	wire.requests = nil
+	wire.retryObserver = observer
+}
+
+// RetryCohortSnapshot returns nil when disabled, so the large diagnostic
+// snapshot does not become resident in the default-off runtime stats state.
+func (wire *Wire) RetryCohortSnapshot() *RetryCohortSnapshot {
+	if wire.retryObserver == nil {
+		return nil
+	}
+	snapshot := wire.retryObserver.Snapshot()
+	return &snapshot
+}
+
 // Wire 表示 peer wire 协议下载器。
 //
 // 改动：
 //   - queue 改为有界 LRU（防止无限增长）
 //   - Run() 使用固定 worker 池，降低高负载调度开销
 type Wire struct {
-	blackList   *blackList
-	queue       *cache.LRU // 有界 LRU，替代原来的 syncedMap
-	requests    chan Request
-	responses   chan Response
-	workerCount int
-	active      atomic.Int64
-	busy        atomic.Int64
-	peerID      []byte
-	Stats       WireStats
+	blackList        *blackList
+	queue            *cache.LRU // 有界 LRU，替代原来的 syncedMap
+	requests         chan Request
+	observedRequests chan observedRequest
+	responses        chan Response
+	workerCount      int
+	active           atomic.Int64
+	busy             atomic.Int64
+	peerID           []byte
+	retryObserver    *RetryCohortObserver
+	Stats            WireStats
 }
 
 // NewWire 创建一个 Wire 实例。
@@ -308,11 +352,26 @@ func (wire *Wire) Request(infoHash []byte, ip string, port int) {
 // 调用方可据此撤销在入队前创建的 reservation，避免一个从未拨号的 peer
 // 长时间占用上层去重缓存。
 func (wire *Wire) RequestFromSource(infoHash []byte, ip string, port int, source PeerSource) bool {
+	request := Request{InfoHash: infoHash, IP: ip, Port: port, Source: source}
+	if wire.retryObserver == nil {
+		select {
+		case wire.requests <- request:
+			return true
+		default:
+			wire.Stats.QueueDropped.Add(1)
+			return false
+		}
+	}
+	observed := observedRequest{Request: request}
+	if len(infoHash) == 20 {
+		observed.retryObservation = wire.retryObserver.begin(request)
+	}
 	select {
-	case wire.requests <- Request{InfoHash: infoHash, IP: ip, Port: port, Source: source}:
+	case wire.observedRequests <- observed:
 		return true
 	default:
 		wire.Stats.QueueDropped.Add(1)
+		wire.retryObserver.finish(&observed.retryObservation, retryOutcomeQueueFull)
 		return false
 	}
 }
@@ -341,6 +400,9 @@ func (wire *Wire) MaxWorkers() int {
 }
 
 func (wire *Wire) RequestDepth() int {
+	if wire.retryObserver != nil {
+		return len(wire.observedRequests)
+	}
 	return len(wire.requests)
 }
 
@@ -349,6 +411,9 @@ func (wire *Wire) ResponseDepth() int {
 }
 
 func (wire *Wire) RequestCapacity() int {
+	if wire.retryObserver != nil {
+		return cap(wire.observedRequests)
+	}
 	return cap(wire.requests)
 }
 
@@ -418,7 +483,7 @@ func extractInfoBytes(torrentData []byte) ([]byte, error) {
 
 // fetchMetadata 连接 peer，通过 extension protocol 下载 info dict。
 // 完成后（成功或失败）都会从 queue 中删除 key，避免泄漏。
-func (wire *Wire) fetchMetadata(r Request, key string) {
+func (wire *Wire) fetchMetadata(r Request, key string, observation retryObservation) {
 	var (
 		length       int
 		msgType      byte
@@ -427,6 +492,7 @@ func (wire *Wire) fetchMetadata(r Request, key string) {
 		utMetadata   int
 		metadataSize int
 	)
+	outcome := retryOutcomeDialError
 
 	const (
 		wireStageDial = iota
@@ -440,7 +506,9 @@ func (wire *Wire) fetchMetadata(r Request, key string) {
 		// 请求完成后释放 inflight 去重键，允许同一 peer 在后续重新尝试。
 		wire.queue.Delete(key)
 		pieces = nil
-		_ = recover()
+		if recover() != nil {
+			outcome = retryOutcomePanic
+		}
 
 		switch stage {
 		case wireStageDial:
@@ -454,6 +522,7 @@ func (wire *Wire) fetchMetadata(r Request, key string) {
 		case wireStageDownload:
 			wire.Stats.DownloadFailed.Add(1)
 		}
+		wire.retryObserver.finish(&observation, outcome)
 	}()
 
 	infoHash := r.InfoHash
@@ -467,6 +536,9 @@ func (wire *Wire) fetchMetadata(r Request, key string) {
 	wire.Stats.dialAttemptsBySource[src].Add(1)
 	dial, err := net.DialTimeout("tcp", address, 500*time.Millisecond)
 	if err != nil {
+		if isNetworkTimeout(err) {
+			outcome = retryOutcomeDialTimeout
+		}
 		return
 	}
 	wire.Stats.DialOK.Add(1)
@@ -485,10 +557,29 @@ func (wire *Wire) fetchMetadata(r Request, key string) {
 	data := bytes.NewBuffer(nil)
 	data.Grow(BLOCK)
 
-	if sendHandshake(conn, infoHash, wire.peerID) != nil ||
-		read(conn, 68, data) != nil ||
-		onHandshake(data.Next(68)) != nil ||
-		sendExtHandshake(conn) != nil {
+	if err = sendHandshake(conn, infoHash, wire.peerID); err != nil {
+		outcome = retryOutcomeHandshakeWrite
+		return
+	}
+	if err = read(conn, 68, data); err != nil {
+		outcome = retryOutcomeHandshakeReadError
+		if isNetworkTimeout(err) {
+			outcome = retryOutcomeHandshakeReadTimeout
+		}
+		return
+	}
+	handshake := data.Next(68)
+	if !bytes.Equal(handshake[28:48], infoHash) {
+		// Some peers echo a different infohash. This is recorded but deliberately
+		// not rejected, preserving the pre-observer wire semantics exactly.
+		wire.retryObserver.echoMismatch(observation)
+	}
+	if err = onHandshake(handshake); err != nil {
+		outcome = retryOutcomeHandshakeProtocol
+		return
+	}
+	if err = sendExtHandshake(conn); err != nil {
+		outcome = retryOutcomeExtensionHandshakeWrite
 		return
 	}
 	wire.Stats.HandshakeOK.Add(1)
@@ -496,11 +587,16 @@ func (wire *Wire) fetchMetadata(r Request, key string) {
 
 	for {
 		if time.Now().After(deadline) {
+			outcome = retryOutcomeDownloadDeadline
 			return
 		}
 
 		length, err = readMessage(conn, data)
 		if err != nil {
+			outcome = retryOutcomeMessageReadError
+			if isNetworkTimeout(err) {
+				outcome = retryOutcomeMessageReadTimeout
+			}
 			return
 		}
 
@@ -510,6 +606,7 @@ func (wire *Wire) fetchMetadata(r Request, key string) {
 
 		msgType, err = data.ReadByte()
 		if err != nil {
+			outcome = retryOutcomeExtensionProtocol
 			return
 		}
 
@@ -517,6 +614,7 @@ func (wire *Wire) fetchMetadata(r Request, key string) {
 		case EXTENDED:
 			extendedID, err := data.ReadByte()
 			if err != nil {
+				outcome = retryOutcomeExtensionProtocol
 				return
 			}
 
@@ -524,17 +622,20 @@ func (wire *Wire) fetchMetadata(r Request, key string) {
 			limitedReader := io.LimitReader(data, MaxMetadataSize)
 			payload, err := io.ReadAll(limitedReader)
 			if err != nil {
+				outcome = retryOutcomeExtensionProtocol
 				return
 			}
 
 			if extendedID == 0 {
 				// 扩展握手：获取 ut_metadata ID 和 metadata 总大小
 				if pieces != nil {
+					outcome = retryOutcomeExtensionProtocol
 					return
 				}
 
 				utMetadata, metadataSize, err = getUTMetaSize(payload)
 				if err != nil {
+					outcome = retryOutcomeMetadataSize
 					return
 				}
 
@@ -550,18 +651,25 @@ func (wire *Wire) fetchMetadata(r Request, key string) {
 			}
 
 			if pieces == nil {
+				outcome = retryOutcomeExtensionProtocol
 				return
 			}
 
 			d, index, err := DecodeDict(payload, 0)
 			if err != nil {
+				outcome = retryOutcomePieceProtocol
 				return
 			}
-			dict := d.(map[string]interface{})
+			dict, ok := d.(map[string]interface{})
+			if !ok {
+				outcome = retryOutcomePieceProtocol
+				return
+			}
 
 			if err = ParseKeys(dict, [][]string{
 				{"msg_type", "int"},
 				{"piece", "int"}}); err != nil {
+				outcome = retryOutcomePieceProtocol
 				return
 			}
 
@@ -573,6 +681,7 @@ func (wire *Wire) fetchMetadata(r Request, key string) {
 			pieceLen := length - 2 - index
 
 			if piece < 0 || piece >= piecesNum {
+				outcome = retryOutcomePieceProtocol
 				return
 			}
 
@@ -581,6 +690,7 @@ func (wire *Wire) fetchMetadata(r Request, key string) {
 				expectedPieceLen = metadataSize % BLOCK
 			}
 			if pieceLen != expectedPieceLen {
+				outcome = retryOutcomePieceProtocol
 				return
 			}
 
@@ -591,22 +701,29 @@ func (wire *Wire) fetchMetadata(r Request, key string) {
 
 				info := sha1.Sum(metadataInfo)
 				if !bytes.Equal(infoHash, info[:]) {
+					outcome = retryOutcomeMetadataHashMismatch
 					return
 				}
 
 				wire.Stats.DownloadOK.Add(1)
 				wire.Stats.downloadOKBySource[src].Add(1)
+				wire.retryObserver.finish(&observation, retryOutcomeSuccess)
+				stage = wireStageDone
 				wire.responses <- Response{
 					Request:      r,
 					MetadataInfo: metadataInfo,
 				}
-				stage = wireStageDone
 				return
 			}
 		default:
 			data.Reset()
 		}
 	}
+}
+
+func isNetworkTimeout(err error) bool {
+	var netErr net.Error
+	return errors.As(err, &netErr) && netErr.Timeout()
 }
 
 // Run 启动 peer wire 协议处理循环。
@@ -624,6 +741,10 @@ func (wire *Wire) Run() {
 }
 
 func (wire *Wire) runWorker(workerID int) {
+	if wire.retryObserver != nil {
+		wire.runObservedWorker(workerID)
+		return
+	}
 	for {
 		if workerID >= wire.ActiveWorkers() {
 			time.Sleep(250 * time.Millisecond)
@@ -633,17 +754,35 @@ func (wire *Wire) runWorker(workerID int) {
 		if !ok {
 			return
 		}
-		wire.runRequest(r)
+		wire.runRequest(r, 0)
 	}
 }
 
-func (wire *Wire) runRequest(r Request) {
+func (wire *Wire) runObservedWorker(workerID int) {
+	for {
+		if workerID >= wire.ActiveWorkers() {
+			time.Sleep(250 * time.Millisecond)
+			continue
+		}
+		r, ok := <-wire.observedRequests
+		if !ok {
+			return
+		}
+		wire.runRequest(r.Request, r.retryObservation)
+	}
+}
+
+func (wire *Wire) runRequest(r Request, observation retryObservation) {
 	wire.busy.Add(1)
 	defer wire.busy.Add(-1)
-	wire.handleRequest(r)
+	wire.handleObservedRequest(r, observation)
 }
 
 func (wire *Wire) handleRequest(r Request) {
+	wire.handleObservedRequest(r, 0)
+}
+
+func (wire *Wire) handleObservedRequest(r Request, observation retryObservation) {
 	src := r.Source
 	if src >= peerSourceCount {
 		src = PeerSourceUnknown
@@ -652,7 +791,6 @@ func (wire *Wire) handleRequest(r Request) {
 	if len(r.InfoHash) == 20 {
 		wire.Stats.queuedBySource[src].Add(1)
 	}
-
 	key := strings.Join([]string{
 		string(r.InfoHash), genAddress(r.IP, r.Port),
 	}, ":")
@@ -661,6 +799,7 @@ func (wire *Wire) handleRequest(r Request) {
 		if len(r.InfoHash) == 20 {
 			wire.Stats.Blacklisted.Add(1)
 			wire.Stats.blacklistedBySource[src].Add(1)
+			wire.retryObserver.finish(&observation, retryOutcomeBlacklisted)
 		}
 		return
 	}
@@ -669,8 +808,9 @@ func (wire *Wire) handleRequest(r Request) {
 	// 这是"重复 supply"而非"流失 supply"，单独计数以便和黑名单区分。
 	if !wire.queue.Set(key) {
 		wire.Stats.inflightDedupedBySource[src].Add(1)
+		wire.retryObserver.finish(&observation, retryOutcomeInflightDuplicate)
 		return
 	}
 
-	wire.fetchMetadata(r, key)
+	wire.fetchMetadata(r, key, observation)
 }

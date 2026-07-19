@@ -60,6 +60,24 @@ Durations use Go duration strings such as `2s`, `30s`, or `10m`.
 - `CHERRY_PICKER_METADATA_BLACKLIST`: peer wire blacklist size.
 - `CHERRY_PICKER_METADATA_REQUEST_QUEUE`: metadata request queue size.
 - `CHERRY_PICKER_METADATA_WORKERS`: metadata worker concurrency.
+- `CHERRY_PICKER_RETRY_OBSERVER_ENABLED`: enable the default-off
+  `retry-cohort-observer-v1` diagnostic.
+- `CHERRY_PICKER_RETRY_OBSERVER_SAMPLE_DENOMINATOR`: process-lifetime-stable
+  sample denominator, default `64`. Every candidate independently evaluates
+  three keyed samples: `(infohash, endpoint)` for retry cohorts, endpoint for
+  recently active hashes, and infohash for recently active endpoints. Identity
+  samples are updated even when the pair is outside its sample. A process-random
+  keyed hash makes membership and table shards impractical for remote peers to
+  predict; a restart intentionally draws new samples.
+- `CHERRY_PICKER_RETRY_OBSERVER_WINDOW`: fixed cohort lifetime; it must be
+  exactly `31m` so the `retry_16_31m` metric has comparable semantics.
+- `CHERRY_PICKER_RETRY_OBSERVER_CAPACITY`: bounded sampled-pair slots, default
+  `131072`. Startup accounts for pair tables, endpoint/hash identity tables,
+  the enabled request queue's full replacement allocation (including the brief
+  startup overlap with the baseline queue), and allocator
+  headroom against a hard 16 MiB observer budget. The bundled 2C4G profile is
+  conservatively estimated at about 7.9 MiB when enabled. With the observer
+  disabled, the downloader retains its original token-free request channel.
 - `CHERRY_PICKER_EXPORTER`: `stdout`, `file`, or `http`.
 - `CHERRY_PICKER_EXPORTER_FILE`: target file for the `file` exporter.
 - `CHERRY_PICKER_EXPORTER_URL`: target endpoint for the `http` exporter.
@@ -77,6 +95,25 @@ Durations use Go duration strings such as `2s`, `30s`, or `10m`.
   not TTL caches; experiments must not claim a TTL treatment until the runtime
   metrics and expiry implementation are wired.
 - `CHERRY_PICKER_PPROF_ADDR`: optional local Go profiling listener, for example `127.0.0.1:6060`.
+
+The retry observer reports first attempts and retries in `<2m`, `2-8m`,
+`8-16m`, and `16-31m` cohorts, with queue-full and wire-stage outcomes, latency
+buckets, endpoints with another hash active during the preceding 31 minutes,
+hashes with another endpoint active during that period, and mismatched
+infohashes echoed by the BT handshake. Identity evidence means existence within
+the window, not merely a counterpart transition: `A -> B -> B` marks both `B`
+observations as other-active. Pair, endpoint, and infohash denominators, sampled
+attempts, capacity drops, and identity other-active events are reported
+separately. Timing
+starts before request-channel admission and ends at the protocol result; a
+verified SHA1 success is recorded before response-channel backpressure. It uses
+the process monotonic clock, retains only bounded keyed 64-bit fingerprints and
+coarse timestamps, and makes no network or scheduling decision. Table/probe
+exhaustion drops observation only and never changes crawler admission or retry
+behavior. Configurations whose conservative allocation estimate would exceed
+16 MiB are rejected at startup. The 30-second snapshot reads independent atomic
+counters, so a concurrent boundary can be approximately one event apart; deltas
+and latency percentiles are diagnostic rather than transactional.
 
 ### Inbound `get_peers` heat
 

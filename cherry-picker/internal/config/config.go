@@ -71,6 +71,15 @@ type MetadataConfig struct {
 	WorkerInitial   int
 	WorkerMin       int
 	WorkerMax       int
+	// RetryObserverEnabled activates the bounded retry-cohort-observer-v1.
+	// It is disabled by default and never changes crawler admission semantics.
+	RetryObserverEnabled bool
+	// Applied independently to pair, endpoint, and infohash keyed samples.
+	RetryObserverSampleDenominator int
+	// RetryObserverWindow is fixed at exactly 31m by the observer so cohort
+	// names remain comparable across machines and experiment runs.
+	RetryObserverWindow   time.Duration
+	RetryObserverCapacity int
 }
 
 // FilterConfig controls which metadata is silently rejected before export.
@@ -209,13 +218,17 @@ func Load() (Config, error) {
 			NodeIDDir:        getenvDefault("CHERRY_PICKER_NODE_ID_DIR", ""),
 		},
 		Metadata: MetadataConfig{
-			Enabled:          getenvBool("CHERRY_PICKER_METADATA_ENABLED", true),
-			BlackListSize:    getenvInt("CHERRY_PICKER_METADATA_BLACKLIST", 131072),
-			RequestQueueSize: getenvInt("CHERRY_PICKER_METADATA_REQUEST_QUEUE", defaultMetadataRequestQueue()),
-			WorkerQueueSize:  getenvInt("CHERRY_PICKER_METADATA_WORKERS", defaultMetadataWorkers()),
-			WorkerInitial:    getenvInt("CHERRY_PICKER_METADATA_WORKERS_INITIAL", 0),
-			WorkerMin:        getenvInt("CHERRY_PICKER_METADATA_WORKERS_MIN", 0),
-			WorkerMax:        getenvInt("CHERRY_PICKER_METADATA_WORKERS_MAX", 0),
+			Enabled:                        getenvBool("CHERRY_PICKER_METADATA_ENABLED", true),
+			BlackListSize:                  getenvInt("CHERRY_PICKER_METADATA_BLACKLIST", 131072),
+			RequestQueueSize:               getenvInt("CHERRY_PICKER_METADATA_REQUEST_QUEUE", defaultMetadataRequestQueue()),
+			WorkerQueueSize:                getenvInt("CHERRY_PICKER_METADATA_WORKERS", defaultMetadataWorkers()),
+			WorkerInitial:                  getenvInt("CHERRY_PICKER_METADATA_WORKERS_INITIAL", 0),
+			WorkerMin:                      getenvInt("CHERRY_PICKER_METADATA_WORKERS_MIN", 0),
+			WorkerMax:                      getenvInt("CHERRY_PICKER_METADATA_WORKERS_MAX", 0),
+			RetryObserverEnabled:           getenvBool("CHERRY_PICKER_RETRY_OBSERVER_ENABLED", false),
+			RetryObserverSampleDenominator: getenvInt("CHERRY_PICKER_RETRY_OBSERVER_SAMPLE_DENOMINATOR", 64),
+			RetryObserverWindow:            getenvDuration("CHERRY_PICKER_RETRY_OBSERVER_WINDOW", 31*time.Minute),
+			RetryObserverCapacity:          getenvInt("CHERRY_PICKER_RETRY_OBSERVER_CAPACITY", 131_072),
 		},
 		Filter: FilterConfig{
 			MaxFileCount:          getenvInt("CHERRY_PICKER_FILTER_MAX_FILES", 0),
@@ -337,13 +350,17 @@ func loadFromFile(path string) (Config, error) {
 			NodeIDDir:        strings.TrimSpace(raw.Discovery.NodeIDDir),
 		},
 		Metadata: MetadataConfig{
-			Enabled:          raw.Metadata.Enabled,
-			BlackListSize:    raw.Metadata.BlackListSize,
-			RequestQueueSize: intOrDefault(raw.Metadata.RequestQueueSize, defaultMetadataRequestQueue()),
-			WorkerQueueSize:  intOrDefault(raw.Metadata.WorkerQueueSize, defaultMetadataWorkers()),
-			WorkerInitial:    raw.Metadata.WorkerInitial,
-			WorkerMin:        raw.Metadata.WorkerMin,
-			WorkerMax:        raw.Metadata.WorkerMax,
+			Enabled:                        raw.Metadata.Enabled,
+			BlackListSize:                  raw.Metadata.BlackListSize,
+			RequestQueueSize:               intOrDefault(raw.Metadata.RequestQueueSize, defaultMetadataRequestQueue()),
+			WorkerQueueSize:                intOrDefault(raw.Metadata.WorkerQueueSize, defaultMetadataWorkers()),
+			WorkerInitial:                  raw.Metadata.WorkerInitial,
+			WorkerMin:                      raw.Metadata.WorkerMin,
+			WorkerMax:                      raw.Metadata.WorkerMax,
+			RetryObserverEnabled:           raw.Metadata.RetryObserverEnabled,
+			RetryObserverSampleDenominator: raw.Metadata.RetryObserverSampleDenominator,
+			RetryObserverWindow:            parseDuration(raw.Metadata.RetryObserverWindow),
+			RetryObserverCapacity:          raw.Metadata.RetryObserverCapacity,
 		},
 		Filter: FilterConfig{
 			MaxFileCount:          raw.Filter.MaxFileCount,
@@ -491,6 +508,15 @@ func normalize(cfg Config) Config {
 	if cfg.Metadata.WorkerInitial > cfg.Metadata.WorkerMax {
 		cfg.Metadata.WorkerInitial = cfg.Metadata.WorkerMax
 	}
+	if cfg.Metadata.RetryObserverSampleDenominator <= 0 {
+		cfg.Metadata.RetryObserverSampleDenominator = 64
+	}
+	if cfg.Metadata.RetryObserverWindow <= 0 {
+		cfg.Metadata.RetryObserverWindow = 31 * time.Minute
+	}
+	if cfg.Metadata.RetryObserverCapacity <= 0 {
+		cfg.Metadata.RetryObserverCapacity = 131_072
+	}
 	normalizeFilterConfig(&cfg.Filter)
 
 	if cfg.Exporter.Kind == "" {
@@ -630,13 +656,17 @@ type fileDiscoveryConfig struct {
 }
 
 type fileMetadataConfig struct {
-	Enabled          bool `json:"enabled"`
-	BlackListSize    int  `json:"black_list_size"`
-	RequestQueueSize int  `json:"request_queue_size"`
-	WorkerQueueSize  int  `json:"worker_queue_size"`
-	WorkerInitial    int  `json:"worker_initial"`
-	WorkerMin        int  `json:"worker_min"`
-	WorkerMax        int  `json:"worker_max"`
+	Enabled                        bool   `json:"enabled"`
+	BlackListSize                  int    `json:"black_list_size"`
+	RequestQueueSize               int    `json:"request_queue_size"`
+	WorkerQueueSize                int    `json:"worker_queue_size"`
+	WorkerInitial                  int    `json:"worker_initial"`
+	WorkerMin                      int    `json:"worker_min"`
+	WorkerMax                      int    `json:"worker_max"`
+	RetryObserverEnabled           bool   `json:"retry_observer_enabled"`
+	RetryObserverSampleDenominator int    `json:"retry_observer_sample_denominator"`
+	RetryObserverWindow            string `json:"retry_observer_window"`
+	RetryObserverCapacity          int    `json:"retry_observer_capacity"`
 }
 
 type fileExporterConfig struct {

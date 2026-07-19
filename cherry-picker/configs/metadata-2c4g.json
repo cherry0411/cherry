@@ -33,7 +33,11 @@
     "enabled": true,
     "black_list_size": 131072,
     "request_queue_size": 32768,
-    "worker_queue_size": 1024
+    "worker_queue_size": 1024,
+    "retry_observer_enabled": false,
+    "retry_observer_sample_denominator": 64,
+    "retry_observer_window": "31m",
+    "retry_observer_capacity": 131072
   },
   "exporter": {
     "kind": "http",

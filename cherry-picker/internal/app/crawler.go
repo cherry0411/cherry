@@ -213,6 +213,7 @@ type statsSnapshot struct {
 	wireRequestCap    int64
 	wireResponseDepth int64
 	wireResponseCap   int64
+	retryObserver     *dht.RetryCohortSnapshot
 
 	// Aggregate of every DHT identity's UDP blacklist (normally 96). This is
 	// separate from the peer-wire TCP blacklist above.
@@ -557,6 +558,23 @@ func (a *Application) Run(ctx context.Context) error {
 	// 当前 admission ceiling；固定实验不会启动任何 worker 调节 goroutine。
 	wireWorkers := newWireWorkerController(a.cfg)
 	downloader := dht.NewWire(a.cfg.Metadata.BlackListSize, a.cfg.Metadata.RequestQueueSize, wireWorkers.maxWorkers)
+	if a.cfg.Metadata.RetryObserverEnabled {
+		observer, err := dht.NewRetryCohortObserver(dht.RetryCohortObserverOptions{
+			SampleDenominator:    a.cfg.Metadata.RetryObserverSampleDenominator,
+			Window:               a.cfg.Metadata.RetryObserverWindow,
+			PairCapacity:         a.cfg.Metadata.RetryObserverCapacity,
+			RequestQueueCapacity: downloader.RequestCapacity(),
+		})
+		if err != nil {
+			return fmt.Errorf("configure retry-cohort-observer-v1: %w", err)
+		}
+		downloader.SetRetryCohortObserver(observer)
+		snapshot := observer.Snapshot()
+		a.logger.Printf("retry-cohort-observer-v1 enabled: pair_sample=1/%d endpoint_sample=1/%d hash_sample=1/%d window=%ds pair_capacity=%d identity_capacity=%d estimated_bytes=%d",
+			snapshot.PairSampleDenominator, snapshot.EndpointSampleDenominator, snapshot.InfoHashSampleDenominator,
+			snapshot.WindowSeconds, snapshot.PairCapacity,
+			snapshot.IdentityCapacity, snapshot.EstimatedBytes)
+	}
 	wireWorkers.applyTarget(downloader, wireWorkers.initialWorkers)
 	wireTunerStarted := false
 	if a.cfg.Metadata.Enabled {
@@ -1677,6 +1695,7 @@ func (a *Application) emitStats(ctx context.Context, events chan<- pipeline.Even
 				wireRequestCap:                int64(downloader.RequestCapacity()),
 				wireResponseDepth:             int64(downloader.ResponseDepth()),
 				wireResponseCap:               int64(downloader.ResponseCapacity()),
+				retryObserver:                 downloader.RetryCohortSnapshot(),
 				dhtBlacklistSize:              int64(dhtBlacklist.Size),
 				dhtBlacklistMax:               int64(dhtBlacklist.MaxSize),
 				dhtBlacklistRejected:          dhtBlacklist.InsertRejected,
@@ -1873,6 +1892,7 @@ func (a *Application) emitStats(ctx context.Context, events chan<- pipeline.Even
 				"heat_shadow_sampled_bypassed":       current.heatShadow.sampledBypassed,
 			}
 			addWireWorkerStats(workerStats, current)
+			addRetryCohortWorkerStats(workerStats, current.retryObserver)
 			addLRUWorkerStats(workerStats, "infohash", current.infohashLRU)
 			addLRUWorkerStats(workerStats, "peer", current.peerLRU)
 			addLRUWorkerStats(workerStats, "metadata_request", current.metaReqLRU)
@@ -2024,6 +2044,7 @@ func formatRuntimeGauges(current, previous statsSnapshot) string {
 		current.heatShadow.sampledFalsePositive-previous.heatShadow.sampledFalsePositive,
 		current.heatShadow.sampledBypassed-previous.heatShadow.sampledBypassed,
 	)
+	appendRetryCohortRuntimeFields(&b, current.retryObserver, previous.retryObserver)
 	appendLRURuntimeFields(&b, "ih", current.infohashLRU, previous.infohashLRU)
 	appendLRURuntimeFields(&b, "peer", current.peerLRU, previous.peerLRU)
 	appendLRURuntimeFields(&b, "mreq", current.metaReqLRU, previous.metaReqLRU)
@@ -2067,6 +2088,126 @@ func addWireWorkerStats(out map[string]uint64, current statsSnapshot) {
 	out["wire_max_workers"] = uint64(current.wireMaxWorkers)
 	out["wire_busy_workers"] = uint64(current.wireBusyWorkers)
 	out["wire_workers_pinned"] = boolUint64(current.wireWorkersPinned)
+}
+
+func addRetryCohortWorkerStats(out map[string]uint64, snapshot *dht.RetryCohortSnapshot) {
+	out["retry_observer_enabled"] = boolUint64(snapshot != nil && snapshot.Enabled)
+	if snapshot == nil || !snapshot.Enabled {
+		return
+	}
+	out["retry_observer_pair_sample_denominator"] = snapshot.PairSampleDenominator
+	out["retry_observer_endpoint_sample_denominator"] = snapshot.EndpointSampleDenominator
+	out["retry_observer_infohash_sample_denominator"] = snapshot.InfoHashSampleDenominator
+	out["retry_observer_window_seconds"] = snapshot.WindowSeconds
+	out["retry_observer_pair_capacity"] = snapshot.PairCapacity
+	out["retry_observer_identity_capacity"] = snapshot.IdentityCapacity
+	out["retry_observer_estimated_bytes"] = snapshot.EstimatedBytes
+	out["retry_observer_candidates"] = snapshot.Candidates
+	out["retry_observer_pair_sampled_attempts"] = snapshot.PairSampledAttempts
+	out["retry_observer_pair_capacity_dropped"] = snapshot.PairCapacityDropped
+	out["retry_observer_endpoint_sampled_attempts"] = snapshot.EndpointSampledAttempts
+	out["retry_observer_endpoint_other_active_events"] = snapshot.EndpointOtherActiveEvents
+	out["retry_observer_endpoint_capacity_dropped"] = snapshot.EndpointCapacityDropped
+	out["retry_observer_infohash_sampled_attempts"] = snapshot.InfoHashSampledAttempts
+	out["retry_observer_infohash_other_active_events"] = snapshot.InfoHashOtherActiveEvents
+	out["retry_observer_infohash_capacity_dropped"] = snapshot.InfoHashCapacityDropped
+	out["retry_observer_pair_slots_used"] = snapshot.PairSlotsUsed
+	out["retry_observer_endpoint_slots_used"] = snapshot.EndpointSlotsUsed
+	out["retry_observer_infohash_slots_used"] = snapshot.InfoHashSlotsUsed
+	for classIndex, class := range snapshot.Classes {
+		prefix := "retry_observer_" + dht.RetryCohortClassName(classIndex) + "_"
+		out[prefix+"attempts"] = class.Attempts
+		out[prefix+"successes"] = class.Successes
+		out[prefix+"latency_us"] = class.LatencyMicros
+		out[prefix+"echo_hash_mismatch"] = class.EchoHashMismatches
+		for outcomeIndex, count := range class.Outcomes {
+			out[prefix+"outcome_"+dht.RetryOutcomeName(outcomeIndex)] = count
+		}
+		for bucket, count := range class.LatencyBuckets {
+			out[prefix+"latency_bucket_"+strconv.Itoa(bucket)] = count
+		}
+	}
+}
+
+func appendRetryCohortRuntimeFields(b *strings.Builder, current, previous *dht.RetryCohortSnapshot) {
+	if current == nil || !current.Enabled {
+		return
+	}
+	priorSnapshot := dht.RetryCohortSnapshot{}
+	if previous != nil {
+		priorSnapshot = *previous
+	}
+	fmt.Fprintf(b,
+		" retry_obs=true retry_obs_pair_den=%d retry_obs_endpoint_den=%d retry_obs_hash_den=%d retry_obs_candidate=%d retry_obs_pair_sample=%d retry_obs_pair_cap_drop=%d retry_obs_endpoint_sample=%d retry_obs_endpoint_other_active=%d retry_obs_endpoint_cap_drop=%d retry_obs_hash_sample=%d retry_obs_hash_other_active=%d retry_obs_hash_cap_drop=%d retry_obs_pair_slots=%d/%d retry_obs_endpoint_slots=%d/%d retry_obs_hash_slots=%d/%d retry_obs_mem=%d",
+		current.PairSampleDenominator,
+		current.EndpointSampleDenominator,
+		current.InfoHashSampleDenominator,
+		current.Candidates-priorSnapshot.Candidates,
+		current.PairSampledAttempts-priorSnapshot.PairSampledAttempts,
+		current.PairCapacityDropped-priorSnapshot.PairCapacityDropped,
+		current.EndpointSampledAttempts-priorSnapshot.EndpointSampledAttempts,
+		current.EndpointOtherActiveEvents-priorSnapshot.EndpointOtherActiveEvents,
+		current.EndpointCapacityDropped-priorSnapshot.EndpointCapacityDropped,
+		current.InfoHashSampledAttempts-priorSnapshot.InfoHashSampledAttempts,
+		current.InfoHashOtherActiveEvents-priorSnapshot.InfoHashOtherActiveEvents,
+		current.InfoHashCapacityDropped-priorSnapshot.InfoHashCapacityDropped,
+		current.PairSlotsUsed, current.PairCapacity,
+		current.EndpointSlotsUsed, current.IdentityCapacity,
+		current.InfoHashSlotsUsed, current.IdentityCapacity,
+		current.EstimatedBytes,
+	)
+	for classIndex, class := range current.Classes {
+		prior := priorSnapshot.Classes[classIndex]
+		attempts := class.Attempts - prior.Attempts
+		var done uint64
+		for outcomeIndex, count := range class.Outcomes {
+			delta := count - prior.Outcomes[outcomeIndex]
+			done += delta
+		}
+		if attempts == 0 && done == 0 {
+			continue
+		}
+		latencyMicros := class.LatencyMicros - prior.LatencyMicros
+		averageMicros := uint64(0)
+		if done > 0 {
+			averageMicros = latencyMicros / done
+		}
+		p95Millis := retryCohortP95Millis(class.LatencyBuckets, prior.LatencyBuckets, done)
+		name := dht.RetryCohortClassName(classIndex)
+		ok := class.Successes - prior.Successes
+		okPPM := uint64(0)
+		if done > 0 {
+			okPPM = ok * 1_000_000 / done
+		}
+		fmt.Fprintf(b,
+			" retry_obs_%s_attempt=%d retry_obs_%s_done=%d retry_obs_%s_ok=%d retry_obs_%s_ok_ppm=%d retry_obs_%s_avg_us=%d retry_obs_%s_p95_le_ms=%d retry_obs_%s_echo_bad=%d",
+			name, attempts, name, done, name, ok, name, okPPM, name, averageMicros, name, p95Millis,
+			name, class.EchoHashMismatches-prior.EchoHashMismatches,
+		)
+		for outcomeIndex, count := range class.Outcomes {
+			delta := count - prior.Outcomes[outcomeIndex]
+			if outcomeIndex == 0 || delta == 0 {
+				continue
+			}
+			fmt.Fprintf(b, " retry_obs_%s_%s=%d", name, dht.RetryOutcomeName(outcomeIndex), delta)
+		}
+	}
+}
+
+func retryCohortP95Millis(current, previous [9]uint64, done uint64) uint64 {
+	if done == 0 {
+		return 0
+	}
+	target := (done*95 + 99) / 100
+	limits := [...]uint64{1, 10, 100, 500, 1_000, 2_000, 5_000, 10_000, 10_001}
+	var cumulative uint64
+	for i := range current {
+		cumulative += current[i] - previous[i]
+		if cumulative >= target {
+			return limits[i]
+		}
+	}
+	return limits[len(limits)-1]
 }
 
 func buildInfohashSourceKey(ihHex, source, ip string, port int) string {
