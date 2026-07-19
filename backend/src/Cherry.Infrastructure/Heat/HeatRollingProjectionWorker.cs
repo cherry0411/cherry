@@ -23,6 +23,8 @@ public sealed class HeatRollingProjectionWorker : BackgroundService
     private readonly HeatRuntimeMetrics _metrics;
     private readonly ILogger<HeatRollingProjectionWorker> _logger;
     private readonly SearchRecoveryCoordinator _recovery;
+    private readonly TimeProvider _timeProvider;
+    private readonly HeatRollingProjectionCoalescer _coalescer;
 
     public HeatRollingProjectionWorker(
         HeatRollingStore store,
@@ -31,7 +33,8 @@ public sealed class HeatRollingProjectionWorker : BackgroundService
         HeatOptions options,
         HeatRuntimeMetrics metrics,
         ILogger<HeatRollingProjectionWorker> logger,
-        SearchRecoveryCoordinator recovery)
+        SearchRecoveryCoordinator recovery,
+        TimeProvider? timeProvider = null)
     {
         _store = store;
         _scopes = scopes;
@@ -40,6 +43,11 @@ public sealed class HeatRollingProjectionWorker : BackgroundService
         _metrics = metrics;
         _logger = logger;
         _recovery = recovery;
+        _timeProvider = timeProvider ?? TimeProvider.System;
+        _coalescer = new HeatRollingProjectionCoalescer(
+            options.ProjectionBatchSize,
+            TimeSpan.FromSeconds(options.RollingProjectionMaxDelaySeconds),
+            _timeProvider);
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -47,10 +55,11 @@ public sealed class HeatRollingProjectionWorker : BackgroundService
         // A restart or outage makes the active hour incomplete. Coverage grows
         // again only after the next fully observed UTC hour.
         await _store.MarkRuntimeStartAsync(
-            HeatRollingStore.UnixHour(DateTime.UtcNow) + 1,
+            HeatRollingStore.UnixHour(_timeProvider.GetUtcNow().UtcDateTime) + 1,
             stoppingToken);
         while (!stoppingToken.IsCancellationRequested)
         {
+            var failed = false;
             try
             {
                 await ProcessOnceAsync(stoppingToken);
@@ -58,10 +67,20 @@ public sealed class HeatRollingProjectionWorker : BackgroundService
             catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested) { break; }
             catch (Exception exception)
             {
+                failed = true;
                 _metrics.Fail(exception, "rolling-projection");
                 _logger.LogError(exception, "Rolling 24h heat projection failed");
             }
-            await Task.Delay(TimeSpan.FromSeconds(_options.LifecyclePollSeconds), stoppingToken);
+            var ordinaryDelay = TimeSpan.FromSeconds(_options.LifecyclePollSeconds);
+            var delay = _coalescer.GetNextDelay(ordinaryDelay);
+            // An expired batch retries promptly, but a failed dependency must
+            // not create a zero-delay loop on the constrained storage host.
+            if (failed && delay <= TimeSpan.Zero)
+                delay = ordinaryDelay < TimeSpan.FromSeconds(1)
+                    ? ordinaryDelay
+                    : TimeSpan.FromSeconds(1);
+            if (delay > TimeSpan.Zero)
+                await Task.Delay(delay, _timeProvider, stoppingToken);
         }
     }
 
@@ -86,6 +105,7 @@ public sealed class HeatRollingProjectionWorker : BackgroundService
             var targetHour = ClosedTargetHour();
             await _store.PrepareForProjectionAsync(targetHour, cancellationToken);
             if (ClosedTargetHour() != targetHour) continue;
+            _coalescer.BeginWindow(targetHour, _recovery.RecoveryGeneration);
             var page = await _store.ReadChangesPageAsync(
                 targetHour,
                 afterHashId: 0,
@@ -94,6 +114,12 @@ public sealed class HeatRollingProjectionWorker : BackgroundService
             if (ClosedTargetHour() != targetHour) continue;
             if (page.Changes.Count == 0)
             {
+                if (_coalescer.Count > 0)
+                {
+                    await FlushPendingChangesAsync(force: false, cancellationToken);
+                    if (ClosedTargetHour() != targetHour) continue;
+                    if (_coalescer.Count > 0) return true;
+                }
                 if (page.ProjectedHour is not null && page.ProjectedHour >= targetHour)
                     return false;
                 await _store.FinalizeProjectionAsync(targetHour, cancellationToken);
@@ -108,12 +134,6 @@ public sealed class HeatRollingProjectionWorker : BackgroundService
                 await connection.OpenAsync(cancellationToken);
 
             var restartAtNewTarget = false;
-            // A dirty SQLite page is intentionally smaller than a Meili task.
-            // Most dirty hashes keep the same rolling count, so submitting one
-            // task per page caused severe LMDB write amplification. Acknowledge
-            // unchanged/unmapped rows immediately, while bounding only the
-            // genuinely changed documents in this in-memory buffer.
-            var pendingChanges = new List<MappedChange>(_options.ProjectionBatchSize);
             while (true)
             {
                 if (ClosedTargetHour() != targetHour)
@@ -135,37 +155,77 @@ public sealed class HeatRollingProjectionWorker : BackgroundService
                     .Where(row => row.Count == row.ProjectedCount)
                     .Select(row => (row.InfoHash, row.Count, row.Revision))
                     .ToArray();
-                await _store.CommitProjectionPageAsync(
-                    targetHour,
-                    unchanged,
-                    Unmapped(page.Changes, mapped),
-                    cancellationToken);
+                var unmapped = Unmapped(page.Changes, mapped);
+                if (unchanged.Length > 0 || unmapped.Count > 0)
+                    await _store.CommitProjectionPageAsync(
+                        targetHour,
+                        unchanged,
+                        unmapped,
+                        cancellationToken);
                 if (ClosedTargetHour() != targetHour)
                 {
                     restartAtNewTarget = true;
                     break;
                 }
 
-                foreach (var row in changed)
+                // Only rows whose no-op/unmapped ACK committed may be removed
+                // from a prior volatile batch. A failed SQLite commit leaves
+                // both the dirty revision and its buffered update untouched.
+                foreach (var row in unchanged) _coalescer.Remove(row.InfoHash);
+                foreach (var row in unmapped) _coalescer.Remove(row.InfoHash);
+
+                // First merge rows retained by a failed/partial prior pass.
+                // If that batch is full, retry it once with the newest page
+                // revisions before admitting any page rows it did not contain.
+                var unstaged = changed
+                    .Where(row => !_coalescer.TryUpdateExisting(row))
+                    .ToArray();
+                if (_coalescer.IsFlushDue)
                 {
-                    pendingChanges.Add(row);
-                    if (pendingChanges.Count == _options.ProjectionBatchSize &&
-                        !await FlushPendingChangesAsync(
-                            targetHour, pendingChanges, cancellationToken))
+                    await FlushPendingChangesAsync(force: false, cancellationToken);
+                    if (ClosedTargetHour() != targetHour)
                     {
                         restartAtNewTarget = true;
                         break;
                     }
                 }
+
+                foreach (var row in unstaged)
+                {
+                    if (_coalescer.IsAtCapacity)
+                    {
+                        await FlushPendingChangesAsync(force: true, cancellationToken);
+                        if (ClosedTargetHour() != targetHour)
+                        {
+                            restartAtNewTarget = true;
+                            break;
+                        }
+                    }
+                    _coalescer.Upsert(row);
+                    if (_coalescer.IsFlushDue)
+                    {
+                        await FlushPendingChangesAsync(force: false, cancellationToken);
+                        if (ClosedTargetHour() != targetHour)
+                        {
+                            restartAtNewTarget = true;
+                            break;
+                        }
+                    }
+                }
                 if (restartAtNewTarget) break;
                 if (!page.HasMore)
                 {
-                    if (!await FlushPendingChangesAsync(
-                            targetHour, pendingChanges, cancellationToken))
+                    if (_coalescer.IsFlushDue)
+                        await FlushPendingChangesAsync(force: false, cancellationToken);
+                    if (ClosedTargetHour() != targetHour)
                     {
                         restartAtNewTarget = true;
                         break;
                     }
+                    // A partial tail deliberately stays dirty across polls. It
+                    // is submitted only when more rows fill the batch or the
+                    // oldest row reaches the configured latency ceiling.
+                    if (_coalescer.Count > 0) return true;
                     await _store.FinalizeProjectionAsync(targetHour, cancellationToken);
                     if (ClosedTargetHour() != targetHour)
                     {
@@ -187,12 +247,14 @@ public sealed class HeatRollingProjectionWorker : BackgroundService
                 }
                 if (page.Changes.Count == 0)
                 {
-                    if (!await FlushPendingChangesAsync(
-                            targetHour, pendingChanges, cancellationToken))
+                    if (_coalescer.IsFlushDue)
+                        await FlushPendingChangesAsync(force: false, cancellationToken);
+                    if (ClosedTargetHour() != targetHour)
                     {
                         restartAtNewTarget = true;
                         break;
                     }
+                    if (_coalescer.Count > 0) return true;
                     await _store.FinalizeProjectionAsync(targetHour, cancellationToken);
                     if (ClosedTargetHour() != targetHour)
                     {
@@ -206,12 +268,16 @@ public sealed class HeatRollingProjectionWorker : BackgroundService
         }
     }
 
-    private async Task<bool> FlushPendingChangesAsync(
+    private Task<int> FlushPendingChangesAsync(
+        bool force,
+        CancellationToken cancellationToken) =>
+        _coalescer.FlushAsync(force, SubmitPendingChangesAsync, cancellationToken);
+
+    private async Task<bool> SubmitPendingChangesAsync(
         long targetHour,
-        List<MappedChange> pendingChanges,
+        IReadOnlyList<RollingProjectionPendingChange> pendingChanges,
         CancellationToken cancellationToken)
     {
-        if (pendingChanges.Count == 0) return true;
         var documents = pendingChanges
             .OrderBy(row => row.Id)
             .Select(row => new HourlyHeatProjectionDocument(row.Id, row.Count))
@@ -231,19 +297,18 @@ public sealed class HeatRollingProjectionWorker : BackgroundService
                 .ToArray(),
             [],
             cancellationToken);
-        pendingChanges.Clear();
-        return ClosedTargetHour() == targetHour;
+        return true;
     }
 
-    private static long ClosedTargetHour() =>
-        HeatRollingStore.UnixHour(DateTime.UtcNow) - 1;
+    private long ClosedTargetHour() =>
+        HeatRollingStore.UnixHour(_timeProvider.GetUtcNow().UtcDateTime) - 1;
 
-    private static async Task<IReadOnlyList<MappedChange>> MapAsync(
+    private static async Task<IReadOnlyList<RollingProjectionPendingChange>> MapAsync(
         NpgsqlConnection connection,
         IReadOnlyList<RollingHeatChange> changes,
         CancellationToken cancellationToken)
     {
-        var result = new List<MappedChange>(changes.Count);
+        var result = new List<RollingProjectionPendingChange>(changes.Count);
         foreach (var chunk in changes.Chunk(5000))
         {
             await using var command = new NpgsqlCommand(
@@ -269,7 +334,7 @@ public sealed class HeatRollingProjectionWorker : BackgroundService
                 chunk.Select(change => change.Revision).ToArray());
             await using var reader = await command.ExecuteReaderAsync(cancellationToken);
             while (await reader.ReadAsync(cancellationToken))
-                result.Add(new MappedChange(
+                result.Add(new RollingProjectionPendingChange(
                     reader.GetInt64(0),
                     (byte[])reader[1],
                     reader.GetInt64(2),
@@ -281,7 +346,7 @@ public sealed class HeatRollingProjectionWorker : BackgroundService
 
     private async Task WaitForTaskAsync(long taskUid, CancellationToken cancellationToken)
     {
-        var deadline = DateTime.UtcNow.AddMinutes(2);
+        var deadline = _timeProvider.GetUtcNow().AddMinutes(2);
         while (true)
         {
             var state = await _meili.GetTaskAsync(taskUid, cancellationToken);
@@ -290,15 +355,15 @@ public sealed class HeatRollingProjectionWorker : BackgroundService
                 string.Equals(state.Status, "canceled", StringComparison.OrdinalIgnoreCase))
                 throw new InvalidOperationException(
                     $"Meilisearch rolling heat task {taskUid} failed: {state.Error ?? state.Status}");
-            if (DateTime.UtcNow >= deadline)
+            if (_timeProvider.GetUtcNow() >= deadline)
                 throw new TimeoutException($"Meilisearch rolling heat task {taskUid} timed out");
-            await Task.Delay(100, cancellationToken);
+            await Task.Delay(TimeSpan.FromMilliseconds(100), _timeProvider, cancellationToken);
         }
     }
 
     private static IReadOnlyList<(byte[] InfoHash, long Revision)> Unmapped(
         IReadOnlyList<RollingHeatChange> changes,
-        IReadOnlyList<MappedChange> mapped)
+        IReadOnlyList<RollingProjectionPendingChange> mapped)
     {
         var known = mapped
             .Select(row => Convert.ToHexString(row.InfoHash))
@@ -309,10 +374,4 @@ public sealed class HeatRollingProjectionWorker : BackgroundService
             .ToArray();
     }
 
-    private sealed record MappedChange(
-        long Id,
-        byte[] InfoHash,
-        long Count,
-        long ProjectedCount,
-        long Revision);
 }

@@ -111,6 +111,7 @@ public sealed class MeiliHeatContractTests
     public async Task RecoveryGate_WaitsForActiveProjection_AndBlocksNewProjection()
     {
         var coordinator = new SearchRecoveryCoordinator();
+        Assert.Equal(0, coordinator.RecoveryGeneration);
         var activeProjection = await coordinator.EnterProjectionAsync(CancellationToken.None);
 
         var recoveryTask = coordinator.EnterRecoveryAsync(CancellationToken.None).AsTask();
@@ -123,6 +124,7 @@ public sealed class MeiliHeatContractTests
         Assert.False(queuedProjectionTask.IsCompleted);
 
         await recovery.DisposeAsync();
+        Assert.Equal(1, coordinator.RecoveryGeneration);
         var queuedProjection = await queuedProjectionTask.WaitAsync(TimeSpan.FromSeconds(1));
         await queuedProjection.DisposeAsync();
     }

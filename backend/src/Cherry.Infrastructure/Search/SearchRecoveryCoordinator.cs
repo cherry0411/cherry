@@ -13,6 +13,9 @@ public sealed class SearchRecoveryCoordinator
     private TaskCompletionSource<bool> _changed = NewSignal();
     private int _activeProjections;
     private bool _recoveryRequested;
+    private long _recoveryGeneration;
+
+    public long RecoveryGeneration => Volatile.Read(ref _recoveryGeneration);
 
     public async ValueTask<IAsyncDisposable> EnterProjectionAsync(CancellationToken cancellationToken)
     {
@@ -81,6 +84,7 @@ public sealed class SearchRecoveryCoordinator
     {
         lock (_gate)
         {
+            Interlocked.Increment(ref _recoveryGeneration);
             _recoveryRequested = false;
             Pulse();
         }

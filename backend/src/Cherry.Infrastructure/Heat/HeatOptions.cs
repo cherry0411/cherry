@@ -27,6 +27,7 @@ public sealed class HeatOptions
     public int ChannelCapacity { get; init; } = 64;
     public int CommitBatchRequests { get; init; } = 8;
     public int ProjectionBatchSize { get; init; } = 500;
+    public int RollingProjectionMaxDelaySeconds { get; init; } = 45;
     public int LifecyclePollSeconds { get; init; } = 30;
     public long RollingMaxBytes { get; init; } = 5L * 1024 * 1024 * 1024;
     public long RollingMinFreeBytes { get; init; } = 2L * 1024 * 1024 * 1024;
@@ -77,6 +78,8 @@ public sealed class HeatOptions
             ChannelCapacity = Math.Clamp(ChannelCapacity, 1, 4096),
             CommitBatchRequests = Math.Clamp(CommitBatchRequests, 1, 64),
             ProjectionBatchSize = Math.Clamp(ProjectionBatchSize, 1, 5000),
+            RollingProjectionMaxDelaySeconds = Math.Clamp(
+                RollingProjectionMaxDelaySeconds, 1, 300),
             LifecyclePollSeconds = Math.Clamp(LifecyclePollSeconds, 5, 3600),
             RollingMaxBytes = Math.Clamp(RollingMaxBytes, 64L * 1024 * 1024, 64L * 1024 * 1024 * 1024),
             RollingMinFreeBytes = Math.Clamp(RollingMinFreeBytes, 256L * 1024 * 1024, 32L * 1024 * 1024 * 1024),

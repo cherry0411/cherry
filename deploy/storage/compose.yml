@@ -126,6 +126,7 @@ services:
       - Heat__LateGraceMinutes=${CHERRY_HEAT_LATE_GRACE_MINUTES:-30}
       - Heat__CommitBatchRequests=${CHERRY_HEAT_COMMIT_BATCH_REQUESTS:-8}
       - Heat__ProjectionBatchSize=${CHERRY_HEAT_PROJECTION_BATCH_SIZE:-500}
+      - Heat__RollingProjectionMaxDelaySeconds=${CHERRY_HEAT_ROLLING_PROJECTION_MAX_DELAY_SECONDS:-45}
       - Heat__RollingMaxBytes=${CHERRY_HEAT_ROLLING_MAX_BYTES:-5368709120}
       - Heat__RollingMinFreeBytes=${CHERRY_HEAT_ROLLING_MIN_FREE_BYTES:-2147483648}
     volumes:
