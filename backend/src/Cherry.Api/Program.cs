@@ -27,10 +27,17 @@ builder.Services.AddSingleton(heatOptions);
 builder.Services.AddSingleton<HeatRuntimeMetrics>();
 builder.Services.AddSingleton<HeatProjectionStatusCache>();
 builder.Services.AddSingleton<HeatRollingStore>();
+builder.Services.AddSingleton<HeatActorHourShadowStore>();
+builder.Services.AddSingleton<IHeatActorHourBatchObserver>(sp =>
+    sp.GetRequiredService<HeatActorHourShadowStore>());
+builder.Services.AddSingleton<HeatActorHourShadowObserver>();
 builder.Services.AddSingleton<Cherry.Infrastructure.Search.SearchRecoveryCoordinator>();
 builder.Services.AddSingleton<HeatAccumulatorService>();
 if (heatOptions.Enabled)
 {
+    if (heatOptions.ActorHourShadowEnabled)
+        builder.Services.AddHostedService(sp =>
+            sp.GetRequiredService<HeatActorHourShadowObserver>());
     builder.Services.AddHostedService(sp => sp.GetRequiredService<HeatAccumulatorService>());
     builder.Services.AddScoped<HeatDaySealer>();
     builder.Services.AddHostedService<HeatLifecycleWorker>();
@@ -159,6 +166,7 @@ const string durableCrawlerPath = "/api/v1/torrents/batch/durable";
 const string searchOutboxStatsPath = "/api/v1/search/outbox/stats";
 const string searchOutboxRebuildPath = "/api/v1/search/outbox/rebuild";
 const string searchRecoveryPath = "/api/v1/search/outbox/recover-empty-index";
+const string heatShadowDiagnosticsPath = "/diagnostics/heat-shadow";
 var protectedCrawlerPaths = new[]
 {
     "/api/v1/torrents/batch",
@@ -172,7 +180,8 @@ app.Use(async (context, next) =>
     if (string.Equals(normalizedPath, durableCrawlerPath, StringComparison.OrdinalIgnoreCase) ||
         string.Equals(normalizedPath, searchOutboxStatsPath, StringComparison.OrdinalIgnoreCase) ||
         string.Equals(normalizedPath, searchOutboxRebuildPath, StringComparison.OrdinalIgnoreCase) ||
-        string.Equals(normalizedPath, searchRecoveryPath, StringComparison.OrdinalIgnoreCase))
+        string.Equals(normalizedPath, searchRecoveryPath, StringComparison.OrdinalIgnoreCase) ||
+        string.Equals(normalizedPath, heatShadowDiagnosticsPath, StringComparison.OrdinalIgnoreCase))
     {
         if (string.IsNullOrWhiteSpace(apiKey))
         {
@@ -294,18 +303,51 @@ StatsEndpoints.Map(app);
 SearchOutboxEndpoints.Map(app);
 HeatEndpoints.Map(app);
 
-// Health check
-app.MapGet("/health", async (IProcessedHashFilter processedHashFilter, HeatOptions heat,
-    HeatRuntimeMetrics heatMetrics, HeatRollingStore rolling, CancellationToken cancellationToken) => Results.Ok(new
+// Liveness must remain an in-memory, non-blocking path. Detailed shadow
+// diagnostics live behind the API-key boundary and are not published by nginx.
+app.MapGet("/health", (IProcessedHashFilter processedHashFilter, HeatOptions heat,
+    HeatRuntimeMetrics heatMetrics, HeatRollingStore rolling) =>
     {
-        status = "healthy",
-        processed_hash_fast_path_ready = processedHashFilter.IsReady,
-        heat = heatMetrics.Snapshot(heat.Enabled),
-        rolling_heat_capacity = heat.Enabled
-            ? await rolling.GetCapacityStatusAsync(cancellationToken)
-            : null,
-        time = DateTime.UtcNow
-    }))
+        var capacity = heat.Enabled ? rolling.GetCapacitySnapshot() : null;
+        return Results.Ok(new
+        {
+            status = "healthy",
+            processed_hash_fast_path_ready = processedHashFilter.IsReady,
+            heat = heatMetrics.Snapshot(heat.Enabled),
+            // Keep the original flat capacity fields for the existing UI and
+            // monitoring clients while adding freshness/error metadata.
+            rolling_heat_capacity = capacity is null ? null : new
+            {
+                UsedBytes = capacity.Status?.UsedBytes,
+                MaxBytes = capacity.Status?.MaxBytes,
+                AvailableFreeBytes = capacity.Status?.AvailableFreeBytes,
+                MinFreeBytes = capacity.Status?.MinFreeBytes,
+                Exhausted = capacity.Status?.Exhausted,
+                Reason = capacity.Status?.Reason,
+                capacity.Status,
+                capacity.SampledAt,
+                capacity.LastError,
+                capacity.Stale
+            },
+            actor_hour_shadow = new
+            {
+                enabled = heat.Enabled && heat.ActorHourShadowEnabled,
+                diagnostics = heatShadowDiagnosticsPath
+            },
+            time = DateTime.UtcNow
+        });
+    })
     .WithTags("Health");
+
+app.MapGet(heatShadowDiagnosticsPath, (HeatOptions heat,
+    HeatActorHourShadowStore actorHourShadow,
+    HeatActorHourShadowObserver actorHourObserver) => Results.Ok(new
+    {
+        enabled = heat.Enabled && heat.ActorHourShadowEnabled,
+        accumulator = actorHourShadow.Snapshot(),
+        observer = actorHourObserver.Snapshot(),
+        measured_at = DateTime.UtcNow
+    }))
+    .WithTags("Diagnostics");
 
 await app.RunAsync();

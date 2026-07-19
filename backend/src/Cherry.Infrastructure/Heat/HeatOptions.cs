@@ -30,6 +30,12 @@ public sealed class HeatOptions
     public int LifecyclePollSeconds { get; init; } = 30;
     public long RollingMaxBytes { get; init; } = 5L * 1024 * 1024 * 1024;
     public long RollingMinFreeBytes { get; init; } = 2L * 1024 * 1024 * 1024;
+    public bool ActorHourShadowEnabled { get; init; }
+    public int ActorHourShadowPairCapacity { get; init; } = 1_000_000;
+    public int ActorHourShadowHashCapacity { get; init; } = 250_000;
+    public int ActorHourShadowFalsePositivePpm { get; init; } = 1_000;
+    public int ActorHourShadowQueueCapacity { get; init; } = 8;
+    public int ActorHourShadowQueueRecordCapacity { get; init; } = 500_000;
 
     public DateOnly? ParsedCoverageStartDay =>
         DateOnly.TryParseExact(
@@ -73,7 +79,21 @@ public sealed class HeatOptions
             ProjectionBatchSize = Math.Clamp(ProjectionBatchSize, 1, 5000),
             LifecyclePollSeconds = Math.Clamp(LifecyclePollSeconds, 5, 3600),
             RollingMaxBytes = Math.Clamp(RollingMaxBytes, 64L * 1024 * 1024, 64L * 1024 * 1024 * 1024),
-            RollingMinFreeBytes = Math.Clamp(RollingMinFreeBytes, 256L * 1024 * 1024, 32L * 1024 * 1024 * 1024)
+            RollingMinFreeBytes = Math.Clamp(RollingMinFreeBytes, 256L * 1024 * 1024, 32L * 1024 * 1024 * 1024),
+            // A shadow worker without the heat authority cannot receive a
+            // valid durable batch and should allocate no tables or channels.
+            ActorHourShadowEnabled = Enabled && ActorHourShadowEnabled,
+            ActorHourShadowPairCapacity = Math.Clamp(
+                ActorHourShadowPairCapacity, 1_000, 50_000_000),
+            ActorHourShadowHashCapacity = Math.Min(
+                Math.Clamp(ActorHourShadowHashCapacity, 1_000, 2_000_000),
+                Math.Clamp(ActorHourShadowPairCapacity, 1_000, 50_000_000)),
+            ActorHourShadowFalsePositivePpm = Math.Clamp(
+                ActorHourShadowFalsePositivePpm, 1, 100_000),
+            ActorHourShadowQueueCapacity = Math.Clamp(
+                ActorHourShadowQueueCapacity, 1, 1_024),
+            ActorHourShadowQueueRecordCapacity = Math.Clamp(
+                ActorHourShadowQueueRecordCapacity, 1_000, 10_000_000)
         };
     }
 

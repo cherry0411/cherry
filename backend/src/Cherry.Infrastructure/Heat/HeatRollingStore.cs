@@ -26,6 +26,16 @@ public sealed record RollingCapacityStatus(
     long MinFreeBytes,
     bool Exhausted,
     string? Reason);
+/// <summary>
+/// Immutable last-good capacity sample. Stale is true before the first
+/// successful sample or when the most recent sample attempt failed; SampledAt
+/// lets callers apply any age policy without putting a timer on the hot path.
+/// </summary>
+public sealed record RollingCapacitySnapshot(
+    RollingCapacityStatus? Status,
+    DateTimeOffset? SampledAt,
+    string? LastError,
+    bool Stale);
 
 public sealed class HeatRollingCapacityException : IOException
 {
@@ -55,6 +65,7 @@ public sealed class HeatRollingStore
     // out of busy_timeout races, but never hold this gate while PostgreSQL or
     // Meilisearch is being awaited.
     private readonly SemaphoreSlim _writeGate = new(1, 1);
+    private RollingCapacitySnapshot _capacitySnapshot = new(null, null, null, true);
     private int _initialized;
     private long _preparedHour = long.MinValue;
 
@@ -66,6 +77,14 @@ public sealed class HeatRollingStore
     }
 
     public string Path => _path;
+
+    /// <summary>
+    /// Returns the last completed capacity sample without touching SQLite or
+    /// the filesystem. Diagnostic and liveness paths must use this snapshot;
+    /// admission continues to use <see cref="GetCapacityStatusAsync"/>.
+    /// </summary>
+    public RollingCapacitySnapshot GetCapacitySnapshot() =>
+        Volatile.Read(ref _capacitySnapshot);
 
     /// <summary>
     /// Once per closed UTC hour, expire first and physically close the WAL
@@ -133,8 +152,23 @@ public sealed class HeatRollingStore
     public async Task<RollingCapacityStatus> GetCapacityStatusAsync(
         CancellationToken cancellationToken)
     {
-        await using var connection = await OpenAsync(cancellationToken);
-        return await ReadCapacityStatusAsync(connection, cancellationToken);
+        SqliteConnection connection;
+        try
+        {
+            connection = await OpenAsync(cancellationToken);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception exception)
+        {
+            PublishCapacityFailure(exception);
+            throw;
+        }
+
+        await using (connection)
+            return await ReadAndPublishCapacityStatusAsync(connection, cancellationToken);
     }
 
     public async Task<long?> GetProjectedHourAsync(CancellationToken cancellationToken)
@@ -377,7 +411,8 @@ public sealed class HeatRollingStore
                 await recordMutations.ExecuteNonQueryAsync(cancellationToken);
             }
         }
-        ThrowIfCapacityExceeded(await ReadCapacityStatusAsync(connection, cancellationToken));
+        ThrowIfCapacityExceeded(
+            await ReadAndPublishCapacityStatusAsync(connection, cancellationToken));
         await transaction.CommitAsync(cancellationToken);
     }
 
@@ -944,6 +979,44 @@ public sealed class HeatRollingStore
             reason = $"Rolling heat filesystem has only {available} free bytes; {_minFreeBytes} required";
         return new RollingCapacityStatus(
             usedBytes, _maxBytes, available, _minFreeBytes, reason is not null, reason);
+    }
+
+    private async Task<RollingCapacityStatus> ReadAndPublishCapacityStatusAsync(
+        SqliteConnection connection,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            var status = await ReadCapacityStatusAsync(connection, cancellationToken);
+            Volatile.Write(
+                ref _capacitySnapshot,
+                new RollingCapacitySnapshot(status, DateTimeOffset.UtcNow, null, false));
+            return status;
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception exception)
+        {
+            PublishCapacityFailure(exception);
+            throw;
+        }
+    }
+
+    private void PublishCapacityFailure(Exception exception)
+    {
+        var message = $"{exception.GetType().Name}: {exception.Message}";
+        if (message.Length > 512) message = message[..512];
+        while (true)
+        {
+            var current = Volatile.Read(ref _capacitySnapshot);
+            var failed = current with { LastError = message, Stale = true };
+            if (ReferenceEquals(
+                    Interlocked.CompareExchange(ref _capacitySnapshot, failed, current),
+                    current))
+                return;
+        }
     }
 
     private static long ExistingLength(string path) =>

@@ -1075,10 +1075,106 @@ public sealed class HeatProtocolAndCodecTests
                 () => store.PrepareForIngestAsync(CancellationToken.None));
             Assert.True(exception.Status.Exhausted);
             Assert.True(exception.Status.UsedBytes > exception.Status.MaxBytes);
+            var snapshot = store.GetCapacitySnapshot();
+            Assert.Equal(exception.Status, snapshot.Status);
+            Assert.False(snapshot.Stale);
+            Assert.Null(snapshot.LastError);
         }
         finally
         {
             if (Directory.Exists(directory)) Directory.Delete(directory, true);
+        }
+    }
+
+    [Fact]
+    public void RollingCapacitySnapshotStartsStaleWithoutTouchingDisk()
+    {
+        var directory = Path.Combine(Path.GetTempPath(), $"cherry-rolling-{Guid.NewGuid():N}");
+        var store = new HeatRollingStore(Options(directory));
+
+        var snapshot = store.GetCapacitySnapshot();
+
+        Assert.Null(snapshot.Status);
+        Assert.Null(snapshot.SampledAt);
+        Assert.Null(snapshot.LastError);
+        Assert.True(snapshot.Stale);
+        Assert.False(Directory.Exists(directory));
+    }
+
+    [Fact]
+    public async Task RollingCapacityLiveCheckPublishesLastGoodSnapshot()
+    {
+        var directory = Path.Combine(Path.GetTempPath(), $"cherry-rolling-{Guid.NewGuid():N}");
+        var store = new HeatRollingStore(Options(directory));
+        var startedAt = DateTimeOffset.UtcNow;
+        try
+        {
+            var status = await store.GetCapacityStatusAsync(CancellationToken.None);
+            var snapshot = store.GetCapacitySnapshot();
+
+            Assert.Equal(status, snapshot.Status);
+            Assert.NotNull(snapshot.SampledAt);
+            Assert.True(snapshot.SampledAt >= startedAt);
+            Assert.Null(snapshot.LastError);
+            Assert.False(snapshot.Stale);
+        }
+        finally
+        {
+            if (Directory.Exists(directory)) Directory.Delete(directory, true);
+        }
+    }
+
+    [Fact]
+    public async Task RollingApplyPublishesCapacitySnapshotFromItsAuthoritativeCheck()
+    {
+        var directory = Path.Combine(Path.GetTempPath(), $"cherry-rolling-{Guid.NewGuid():N}");
+        var store = new HeatRollingStore(Options(directory));
+        var targetHour = HeatRollingStore.UnixHour(DateTime.UtcNow) - 1;
+        try
+        {
+            await store.ApplyAsync(
+                [BatchAt(targetHour, SHA1.HashData([91]), [701], 1)],
+                CancellationToken.None);
+            var snapshot = store.GetCapacitySnapshot();
+
+            Assert.NotNull(snapshot.Status);
+            Assert.True(snapshot.Status.UsedBytes > 0);
+            Assert.NotNull(snapshot.SampledAt);
+            Assert.Null(snapshot.LastError);
+            Assert.False(snapshot.Stale);
+        }
+        finally
+        {
+            if (Directory.Exists(directory)) Directory.Delete(directory, true);
+        }
+    }
+
+    [Fact]
+    public async Task RollingCapacityFailureKeepsLastGoodSnapshotAndMarksItStale()
+    {
+        var directory = Path.Combine(Path.GetTempPath(), $"cherry-rolling-{Guid.NewGuid():N}");
+        var store = new HeatRollingStore(Options(directory));
+        try
+        {
+            await store.GetCapacityStatusAsync(CancellationToken.None);
+            var good = store.GetCapacitySnapshot();
+            Directory.Delete(directory, true);
+            await File.WriteAllTextAsync(directory, "blocks the rolling directory");
+
+            await Assert.ThrowsAsync<IOException>(
+                () => store.GetCapacityStatusAsync(CancellationToken.None));
+            var failed = store.GetCapacitySnapshot();
+
+            Assert.Equal(good.Status, failed.Status);
+            Assert.Equal(good.SampledAt, failed.SampledAt);
+            Assert.NotNull(failed.LastError);
+            Assert.Contains("IOException", failed.LastError);
+            Assert.True(failed.Stale);
+        }
+        finally
+        {
+            if (File.Exists(directory)) File.Delete(directory);
+            else if (Directory.Exists(directory)) Directory.Delete(directory, true);
         }
     }
 

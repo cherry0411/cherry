@@ -53,6 +53,7 @@ public sealed class HeatAccumulatorService : BackgroundService
     private readonly HeatRuntimeMetrics _metrics;
     private readonly ILogger<HeatAccumulatorService> _logger;
     private readonly HeatRollingStore _rolling;
+    private readonly HeatActorHourShadowObserver _actorHourObserver;
     private readonly Channel<HeatAccumulatorCommand> _channel;
     private readonly HashSet<DateOnly> _sealingDays = [];
     private readonly object _gate = new();
@@ -61,12 +62,17 @@ public sealed class HeatAccumulatorService : BackgroundService
         HeatOptions options,
         HeatRuntimeMetrics metrics,
         ILogger<HeatAccumulatorService> logger,
-        HeatRollingStore? rolling = null)
+        HeatRollingStore? rolling = null,
+        HeatActorHourShadowStore? actorHourShadow = null,
+        HeatActorHourShadowObserver? actorHourObserver = null)
     {
         _options = options;
         _metrics = metrics;
         _logger = logger;
         _rolling = rolling ?? new HeatRollingStore(options);
+        var shadowStore = actorHourShadow ?? new HeatActorHourShadowStore(options);
+        _actorHourObserver = actorHourObserver ?? new HeatActorHourShadowObserver(
+            options, shadowStore);
         _channel = Channel.CreateBounded<HeatAccumulatorCommand>(new BoundedChannelOptions(options.ChannelCapacity)
         {
             SingleReader = true,
@@ -249,12 +255,11 @@ public sealed class HeatAccumulatorService : BackgroundService
             // The crawler is ACKed only after both authorities are durable.
             // A crash between commits yields a daily receipt replay; replaying
             // the idempotent MAX(last_seen_hour) upsert closes that gap.
-            await _rolling.ApplyAsync(
-                commands.Select((command, index) => (command, results[index]))
-                    .Where(pair => pair.Item2.Status is HeatAcceptStatus.Accepted or HeatAcceptStatus.Replay)
-                    .Select(pair => pair.command.Batch)
-                    .ToArray(),
-                stoppingToken);
+            var acknowledgedBatches = commands.Select((command, index) => (command, results[index]))
+                .Where(pair => pair.Item2.Status is HeatAcceptStatus.Accepted or HeatAcceptStatus.Replay)
+                .Select(pair => pair.command.Batch)
+                .ToArray();
+            await _rolling.ApplyAsync(acknowledgedBatches, stoppingToken);
             _metrics.ClearFailure("daily-ingest");
             for (var index = 0; index < commands.Count; index++)
             {
@@ -265,6 +270,11 @@ public sealed class HeatAccumulatorService : BackgroundService
                     _metrics.Rejected();
                 commands[index].Completion.TrySetResult(result);
             }
+
+            // Complete every durable ACK before entering even the shadow loss
+            // slow path. Queue saturation can take a tiny per-hour ledger lock,
+            // but it can no longer extend the requests in this group commit.
+            TryObserveAcknowledged(acknowledgedBatches);
         }
         catch (Exception exception)
         {
@@ -279,6 +289,20 @@ public sealed class HeatAccumulatorService : BackgroundService
                     exception is HeatRollingCapacityException
                         ? "Heat storage capacity exhausted"
                         : IsStorageFailure(exception) ? "Heat storage unavailable" : "Heat commit failed"));
+        }
+    }
+
+    private void TryObserveAcknowledged(ChhtBatch[] acknowledgedBatches)
+    {
+        if (!_actorHourObserver.Enabled || acknowledgedBatches.Length == 0) return;
+        try
+        {
+            _ = _actorHourObserver.TryEnqueue(acknowledgedBatches);
+        }
+        catch
+        {
+            // ACK and both authorities are already complete. Shadow admission
+            // or attribution failures are intentionally fail-open.
         }
     }
 

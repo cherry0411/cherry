@@ -17,7 +17,16 @@ public sealed record ChhtBatch(
     IReadOnlyList<ChhtHashGroup> Groups,
     byte[] PayloadSha256)
 {
-    public int RecordCount => Groups.Sum(group => group.ActorFingerprints.Count);
+    public int RecordCount
+    {
+        get
+        {
+            var total = 0;
+            for (var index = 0; index < Groups.Count; index++)
+                total = checked(total + Groups[index].ActorFingerprints.Count);
+            return total;
+        }
+    }
 }
 
 public sealed record ChhtCompletion(
