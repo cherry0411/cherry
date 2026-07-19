@@ -2,6 +2,8 @@ package cache
 
 import (
 	"fmt"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -116,6 +118,66 @@ func TestLRUHotHitHasNoAllocations(t *testing.T) {
 		cache.Set("alpha")
 	}); allocs != 0 {
 		t.Fatalf("Set(existing) allocations = %f, want 0", allocs)
+	}
+}
+
+func TestLRUWithTTLExpiresFromFirstInsertionWithoutSliding(t *testing.T) {
+	cache := NewLRUWithTTL(8, 2*time.Second)
+	cache.observedUnix.Store(100)
+	if !cache.Set("dead-peer") {
+		t.Fatal("first attempt was not admitted")
+	}
+
+	cache.observedUnix.Store(101)
+	if cache.Set("dead-peer") {
+		t.Fatal("attempt became retryable before cooldown")
+	}
+
+	// The duplicate at second 101 must not slide the original deadline.
+	cache.observedUnix.Store(102)
+	if !cache.Set("dead-peer") {
+		t.Fatal("attempt did not become retryable at fixed cooldown")
+	}
+	stats := cache.Snapshot()
+	if stats.Expirations != 1 {
+		t.Fatalf("Expirations = %d, want 1", stats.Expirations)
+	}
+}
+
+func TestLRUWithTTLConcurrentExpiryAdmitsExactlyOneRetry(t *testing.T) {
+	cache := NewLRUWithTTL(8, time.Second)
+	cache.observedUnix.Store(100)
+	cache.Set("dead-peer")
+	cache.observedUnix.Store(101)
+
+	var admitted atomic.Int64
+	var wg sync.WaitGroup
+	for range 64 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if cache.Set("dead-peer") {
+				admitted.Add(1)
+			}
+		}()
+	}
+	wg.Wait()
+
+	if got := admitted.Load(); got != 1 {
+		t.Fatalf("admitted retries = %d, want exactly 1", got)
+	}
+	if got := cache.Len(); got != 1 {
+		t.Fatalf("Len = %d, want 1", got)
+	}
+}
+
+func TestLRUWithNonPositiveTTLPreservesLegacyBehavior(t *testing.T) {
+	cache := NewLRUWithTTL(8, 0)
+	cache.observedUnix.Store(100)
+	cache.Set("peer")
+	cache.observedUnix.Store(^uint32(0))
+	if cache.Set("peer") {
+		t.Fatal("zero TTL unexpectedly expired a legacy entry")
 	}
 }
 

@@ -6,6 +6,8 @@ import (
 	"log"
 	"net/http"
 	"net/http/httptest"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -163,6 +165,99 @@ func TestQueueMetadataRequestPauseRemainsRetryable(t *testing.T) {
 	}
 	if got := stats.metadataReqAdmitted.Load(); got != 1 {
 		t.Fatalf("metadataReqAdmitted after retry = %d, want 1", got)
+	}
+}
+
+func TestQueueMetadataRequestExpiryIsOptInAndRetriesAfterCooldown(t *testing.T) {
+	cfg := defaultTestConfig()
+	cfg.Metadata.Enabled = true
+	cfg.Dedupe.ExpireMetadataAttempts = true
+	cfg.Dedupe.MetadataTTL = time.Second
+	application := New(cfg, testLogger())
+	downloader := dht.NewWire(64, 4, 1)
+	stats := &runtimeStats{}
+	checkQueue := make(chan string, 4)
+	infoHash := "0123456789012345678901234567890123456789"
+
+	application.queueMetadataRequest(downloader, infoHash, "127.0.0.1", 6881, dht.PeerSourceAnnounce, stats, checkQueue)
+	application.queueMetadataRequest(downloader, infoHash, "127.0.0.1", 6881, dht.PeerSourceAnnounce, stats, checkQueue)
+	if got := stats.metadataReqAdmitted.Load(); got != 1 {
+		t.Fatalf("admitted before cooldown = %d, want 1", got)
+	}
+
+	// Expiration uses the telemetry clock so the hot request path avoids
+	// time.Now. Advance it after crossing the one-second cooldown.
+	time.Sleep(1100 * time.Millisecond)
+	application.metadataRequestSeen.Snapshot()
+	application.queueMetadataRequest(downloader, infoHash, "127.0.0.1", 6881, dht.PeerSourceAnnounce, stats, checkQueue)
+	if got := stats.metadataReqAdmitted.Load(); got != 2 {
+		t.Fatalf("admitted after cooldown = %d, want 2", got)
+	}
+}
+
+func TestBadMetadataPayloadDoesNotPoisonSuccessfulResultDedupe(t *testing.T) {
+	application := New(defaultTestConfig(), testLogger())
+	stats := &runtimeStats{}
+	infoHash := []byte("01234567890123456789")
+	bad := dht.Response{
+		Request:      dht.Request{InfoHash: infoHash},
+		MetadataInfo: []byte("not-bencode"),
+	}
+	ihHex, _, accepted := application.acceptMetadataResponse(bad, stats)
+	if accepted {
+		t.Fatal("malformed payload was accepted")
+	}
+	if application.metadataResultSeen.Contains(ihHex) {
+		t.Fatal("malformed payload poisoned successful-result dedupe")
+	}
+
+	good := dht.Response{
+		Request: dht.Request{InfoHash: infoHash},
+		MetadataInfo: []byte(dht.Encode(map[string]interface{}{
+			"name":   "valid-after-bad",
+			"length": 42,
+		})),
+	}
+	_, metadata, accepted := application.acceptMetadataResponse(good, stats)
+	if !accepted || metadata == nil || metadata.Name != "valid-after-bad" {
+		t.Fatalf("valid response after malformed response was not accepted: accepted=%v metadata=%+v", accepted, metadata)
+	}
+	if got := stats.metadataEventsInvalid.Load(); got != 1 {
+		t.Fatalf("invalid = %d, want 1", got)
+	}
+	if got := stats.metadataEventsDeduped.Load(); got != 0 {
+		t.Fatalf("deduped = %d, want 0", got)
+	}
+}
+
+func TestConcurrentValidMetadataResponsesExportOnce(t *testing.T) {
+	application := New(defaultTestConfig(), testLogger())
+	stats := &runtimeStats{}
+	response := dht.Response{
+		Request: dht.Request{InfoHash: []byte("01234567890123456789")},
+		MetadataInfo: []byte(dht.Encode(map[string]interface{}{
+			"name":   "one-result",
+			"length": 42,
+		})),
+	}
+
+	var accepted atomic.Int64
+	var wg sync.WaitGroup
+	for range 32 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, _, ok := application.acceptMetadataResponse(response, stats); ok {
+				accepted.Add(1)
+			}
+		}()
+	}
+	wg.Wait()
+	if got := accepted.Load(); got != 1 {
+		t.Fatalf("accepted = %d, want exactly 1", got)
+	}
+	if got := stats.metadataEventsDeduped.Load(); got != 31 {
+		t.Fatalf("deduped = %d, want 31", got)
 	}
 }
 

@@ -117,6 +117,7 @@ type runtimeStats struct {
 	metadataEventsSent      atomic.Uint64
 	peerEventsDeduped       atomic.Uint64
 	metadataEventsDeduped   atomic.Uint64
+	metadataEventsInvalid   atomic.Uint64
 	metadataEventsFiltered  atomic.Uint64
 	metadataRequestsQueued  atomic.Uint64
 	metadataReqAdmitted     atomic.Uint64
@@ -157,6 +158,7 @@ type statsSnapshot struct {
 	metadataEventsSent      uint64
 	metadataEventsDropped   uint64
 	metadataEventsDeduped   uint64
+	metadataEventsInvalid   uint64
 	metadataEventsFiltered  uint64
 	metadataLocale          metadataLocaleSnapshot
 	dhtPacketsReceived      uint64
@@ -204,16 +206,27 @@ type statsSnapshot struct {
 	// Wire queue/worker gauges. The existing stage counters above are
 	// cumulative; these instantaneous depths explain which stage is applying
 	// backpressure in each 30-second window.
-	wireTargetWorkers int64
-	wireActiveWorkers int64
-	wireMaxWorkers    int64
-	wireBusyWorkers   int64
-	wireWorkersPinned bool
-	wireRequestDepth  int64
-	wireRequestCap    int64
-	wireResponseDepth int64
-	wireResponseCap   int64
-	retryObserver     *dht.RetryCohortSnapshot
+	wireTargetWorkers  int64
+	wireActiveWorkers  int64
+	wireMaxWorkers     int64
+	wireBusyWorkers    int64
+	wireWorkersPinned  bool
+	wireRequestDepth   int64
+	wireRequestCap     int64
+	wireResponseDepth  int64
+	wireResponseCap    int64
+	wireSourceSchedule bool
+	wireAnnounceDepth  int64
+	wireAnnounceCap    int64
+	wireAnnounceIn     int64
+	wireAnnounceDrop   int64
+	wireLookupDepth    int64
+	wireLookupCap      int64
+	wireLookupIn       int64
+	wireLookupDrop     int64
+	retryObserver      *dht.RetryCohortSnapshot
+	metadataSpoolOn    bool
+	metadataSpool      export.DurableIngestorSnapshot
 
 	// Aggregate of every DHT identity's UDP blacklist (normally 96). This is
 	// separate from the peer-wire TCP blacklist above.
@@ -312,6 +325,10 @@ func New(cfg config.Config, logger *log.Logger) *Application {
 	}
 	memLimit := resolveMemLimit(cfg)
 	lruCaps := newLRUCaps(cfg, memLimit)
+	metadataRequestSeen := cache.NewLRU(lruCaps.metadataRequestSeen)
+	if cfg.Dedupe.ExpireMetadataAttempts {
+		metadataRequestSeen = cache.NewLRUWithTTL(lruCaps.metadataRequestSeen, cfg.Dedupe.MetadataTTL)
+	}
 	policy, policyErr := buildStoragePolicy(cfg.Filter)
 	return &Application{
 		cfg:      cfg,
@@ -320,7 +337,7 @@ func New(cfg config.Config, logger *log.Logger) *Application {
 
 		infohashSeen:        cache.NewLRU(lruCaps.infohashSeen),
 		peerSeen:            cache.NewLRU(lruCaps.peerSeen),
-		metadataRequestSeen: cache.NewLRU(lruCaps.metadataRequestSeen),
+		metadataRequestSeen: metadataRequestSeen,
 		metadataResultSeen:  cache.NewLRU(lruCaps.metadataResultSeen),
 		remoteKnown:         cache.NewLRU(lruCaps.remoteKnown),
 
@@ -558,6 +575,16 @@ func (a *Application) Run(ctx context.Context) error {
 	// 当前 admission ceiling；固定实验不会启动任何 worker 调节 goroutine。
 	wireWorkers := newWireWorkerController(a.cfg)
 	downloader := dht.NewWire(a.cfg.Metadata.BlackListSize, a.cfg.Metadata.RequestQueueSize, wireWorkers.maxWorkers)
+	if a.cfg.Metadata.SourceSchedulerEnabled {
+		if err := downloader.ConfigureSourceScheduler(dht.SourceSchedulerOptions{
+			AnnounceSharePercent: a.cfg.Metadata.AnnounceSharePercent,
+		}); err != nil {
+			return fmt.Errorf("configure wire source scheduler: %w", err)
+		}
+		queue := downloader.SourceQueueSnapshot()
+		a.logger.Printf("wire source scheduler enabled: announce_share=%d announce_capacity=%d lookup_capacity=%d",
+			a.cfg.Metadata.AnnounceSharePercent, queue.AnnounceCapacity, queue.LookupCapacity)
+	}
 	if a.cfg.Metadata.RetryObserverEnabled {
 		observer, err := dht.NewRetryCohortObserver(dht.RetryCohortObserverOptions{
 			SampleDenominator:    a.cfg.Metadata.RetryObserverSampleDenominator,
@@ -675,9 +702,11 @@ func (a *Application) Run(ctx context.Context) error {
 		a.memLimit/1024/1024, gogcDefault,
 		a.infohashSeen.Cap(), a.peerSeen.Cap(),
 		a.metadataRequestSeen.Cap(), a.metadataResultSeen.Cap(), a.remoteKnown.Cap())
+	a.logger.Printf("metadata attempt expiry: enabled=%v cooldown=%s",
+		a.cfg.Dedupe.ExpireMetadataAttempts, a.cfg.Dedupe.MetadataTTL)
 
 	// 后台 goroutines
-	go a.emitStats(ctx, events, stats, downloader, wireWorkers)
+	go a.emitStats(ctx, events, stats, downloader, wireWorkers, durableIngestor)
 	go a.flushPeerCountsLoop(ctx)
 	go a.flushRejectLoop(ctx)
 	go a.pollPendingRequests(ctx)
@@ -1538,16 +1567,8 @@ func (a *Application) consumeMetadata(
 		case <-ctx.Done():
 			return
 		case response := <-responses:
-			ihHex := hex.EncodeToString(response.InfoHash)
-			// G7: dedupe by infohash only; one result per hash is sufficient.
-			if !a.metadataResultSeen.Set(ihHex) {
-				stats.metadataEventsDeduped.Add(1)
-				fail.Add(1)
-				continue
-			}
-			metadata, err := normalizeMetadata(response.MetadataInfo)
-			if err != nil {
-				stats.metadataEventsDeduped.Add(1)
+			ihHex, metadata, accepted := a.acceptMetadataResponse(response, stats)
+			if !accepted {
 				fail.Add(1)
 				continue
 			}
@@ -1621,7 +1642,33 @@ func (a *Application) consumeMetadata(
 	}
 }
 
-func (a *Application) emitStats(ctx context.Context, events chan<- pipeline.Event, stats *runtimeStats, downloader *dht.Wire, wireWorkers *wireWorkerController) {
+// acceptMetadataResponse deliberately validates the payload before recording
+// the infohash in the session-long successful-result cache. A malformed peer
+// response therefore cannot suppress a later valid response for the same hash.
+func (a *Application) acceptMetadataResponse(response dht.Response, stats *runtimeStats) (string, *pipeline.Metadata, bool) {
+	ihHex := hex.EncodeToString(response.InfoHash)
+	metadata, err := normalizeMetadata(response.MetadataInfo)
+	if err != nil {
+		stats.metadataEventsInvalid.Add(1)
+		return ihHex, nil, false
+	}
+	// Successful results remain non-expiring and are deduped by infohash. The
+	// attempt cooldown is a separate (hash, peer) cache.
+	if !a.metadataResultSeen.Set(ihHex) {
+		stats.metadataEventsDeduped.Add(1)
+		return ihHex, nil, false
+	}
+	return ihHex, metadata, true
+}
+
+func (a *Application) emitStats(
+	ctx context.Context,
+	events chan<- pipeline.Event,
+	stats *runtimeStats,
+	downloader *dht.Wire,
+	wireWorkers *wireWorkerController,
+	durableIngestor *export.DurableIngestor,
+) {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 	var previous statsSnapshot
@@ -1632,6 +1679,7 @@ func (a *Application) emitStats(ctx context.Context, events chan<- pipeline.Even
 		case <-ticker.C:
 			packetStats := a.aggregatePacketStats()
 			dhtBlacklist := a.aggregateDHTBlacklistStats()
+			wireSourceQueues := downloader.SourceQueueSnapshot()
 			var oracleStats export.OracleObserverSnapshot
 			if a.oracleObserver != nil {
 				oracleStats = a.oracleObserver.Snapshot()
@@ -1639,6 +1687,10 @@ func (a *Application) emitStats(ctx context.Context, events chan<- pipeline.Even
 			var heatStats heat.Snapshot
 			if a.heatCollector != nil {
 				heatStats = a.heatCollector.Snapshot()
+			}
+			var metadataSpool export.DurableIngestorSnapshot
+			if durableIngestor != nil {
+				metadataSpool = durableIngestor.Snapshot()
 			}
 			current := statsSnapshot{
 				infohashEventsSent:            stats.infohashEventsSent.Load(),
@@ -1663,6 +1715,7 @@ func (a *Application) emitStats(ctx context.Context, events chan<- pipeline.Even
 				metadataEventsSent:            stats.metadataEventsSent.Load(),
 				metadataEventsDropped:         stats.metadataEventsDropped.Load(),
 				metadataEventsDeduped:         stats.metadataEventsDeduped.Load(),
+				metadataEventsInvalid:         stats.metadataEventsInvalid.Load(),
 				metadataEventsFiltered:        stats.metadataEventsFiltered.Load(),
 				metadataLocale:                stats.metadataLocale.snapshot(),
 				dhtPacketsReceived:            packetStats.Received,
@@ -1695,7 +1748,18 @@ func (a *Application) emitStats(ctx context.Context, events chan<- pipeline.Even
 				wireRequestCap:                int64(downloader.RequestCapacity()),
 				wireResponseDepth:             int64(downloader.ResponseDepth()),
 				wireResponseCap:               int64(downloader.ResponseCapacity()),
+				wireSourceSchedule:            wireSourceQueues.Enabled,
+				wireAnnounceDepth:             int64(wireSourceQueues.AnnounceDepth),
+				wireAnnounceCap:               int64(wireSourceQueues.AnnounceCapacity),
+				wireAnnounceIn:                wireSourceQueues.AnnounceAdmitted,
+				wireAnnounceDrop:              wireSourceQueues.AnnounceDropped,
+				wireLookupDepth:               int64(wireSourceQueues.LookupDepth),
+				wireLookupCap:                 int64(wireSourceQueues.LookupCapacity),
+				wireLookupIn:                  wireSourceQueues.LookupAdmitted,
+				wireLookupDrop:                wireSourceQueues.LookupDropped,
 				retryObserver:                 downloader.RetryCohortSnapshot(),
+				metadataSpoolOn:               durableIngestor != nil,
+				metadataSpool:                 metadataSpool,
 				dhtBlacklistSize:              int64(dhtBlacklist.Size),
 				dhtBlacklistMax:               int64(dhtBlacklist.MaxSize),
 				dhtBlacklistRejected:          dhtBlacklist.InsertRejected,
@@ -1799,6 +1863,7 @@ func (a *Application) emitStats(ctx context.Context, events chan<- pipeline.Even
 				"metadata_events_sent":      current.metadataEventsSent,
 				"metadata_events_dropped":   current.metadataEventsDropped,
 				"metadata_events_deduped":   current.metadataEventsDeduped,
+				"metadata_events_invalid":   current.metadataEventsInvalid,
 				"metadata_events_filtered":  current.metadataEventsFiltered,
 				"dht_packets_received":      current.dhtPacketsReceived,
 				"dht_packets_enqueued":      current.dhtPacketsEnqueued,
@@ -1842,6 +1907,15 @@ func (a *Application) emitStats(ctx context.Context, events chan<- pipeline.Even
 				"wire_request_capacity":              uint64(current.wireRequestCap),
 				"wire_response_depth":                uint64(current.wireResponseDepth),
 				"wire_response_capacity":             uint64(current.wireResponseCap),
+				"wire_source_scheduler_enabled":      boolUint64(current.wireSourceSchedule),
+				"wire_announce_queue_depth":          uint64(current.wireAnnounceDepth),
+				"wire_announce_queue_capacity":       uint64(current.wireAnnounceCap),
+				"wire_announce_queue_admitted":       uint64(current.wireAnnounceIn),
+				"wire_announce_queue_dropped":        uint64(current.wireAnnounceDrop),
+				"wire_lookup_queue_depth":            uint64(current.wireLookupDepth),
+				"wire_lookup_queue_capacity":         uint64(current.wireLookupCap),
+				"wire_lookup_queue_admitted":         uint64(current.wireLookupIn),
+				"wire_lookup_queue_dropped":          uint64(current.wireLookupDrop),
 				"dht_blacklist_size":                 uint64(current.dhtBlacklistSize),
 				"dht_blacklist_max":                  uint64(current.dhtBlacklistMax),
 				"dht_blacklist_rejected":             uint64(current.dhtBlacklistRejected),
@@ -1893,6 +1967,7 @@ func (a *Application) emitStats(ctx context.Context, events chan<- pipeline.Even
 			}
 			addWireWorkerStats(workerStats, current)
 			addRetryCohortWorkerStats(workerStats, current.retryObserver)
+			addMetadataSpoolWorkerStats(workerStats, current)
 			addLRUWorkerStats(workerStats, "infohash", current.infohashLRU)
 			addLRUWorkerStats(workerStats, "peer", current.peerLRU)
 			addLRUWorkerStats(workerStats, "metadata_request", current.metaReqLRU)
@@ -1917,7 +1992,7 @@ func (a *Application) logRuntimeDelta(current, previous statsSnapshot) {
 	netOutKBps := (current.dhtBytesSent - previous.dhtBytesSent) / 1024 / interval
 	localeDelta := current.metadataLocale.subtract(previous.metadataLocale)
 	a.logger.Printf(
-		"runtime 30s: dht_recv=%d handled=%d dropped=%d decode_err=%d net_in=%dKB/s net_out=%dKB/s nodes=%d node_add=%d node_rm=%d refresh_q=%d lookup_queue=%d lookup_drop=%d lookup_sent=%d follow_sent=%d sample_q=%d sample_resp=%d sample_hash=%d sample_unique=%d peer_sent=%d peer_drop=%d peer_dedup=%d meta_req=%d meta_admitted=%d meta_req_dedup=%d meta_sent=%d meta_drop=%d meta_dedup=%d meta_filtered=%d meta_locale_n=%d meta_han=%d meta_kana=%d meta_hangul=%d meta_zh_proxy=%d check_drop=%d paused=%v wire_q_drop=%d wire_dial=%d wire_conn=%d wire_dial_fail=%d wire_hs=%d wire_hs_fail=%d wire_ok=%d wire_dl_fail=%d wire_bl=%d ann_q=%d ann_bl=%d ann_inflight=%d ann_dial=%d ann_conn=%d ann_ok=%d gp_q=%d gp_bl=%d gp_inflight=%d gp_dial=%d gp_conn=%d gp_ok=%d bl_size=%d bl_max=%d bl_reject=%d bl_expired=%d%s",
+		"runtime 30s: dht_recv=%d handled=%d dropped=%d decode_err=%d net_in=%dKB/s net_out=%dKB/s nodes=%d node_add=%d node_rm=%d refresh_q=%d lookup_queue=%d lookup_drop=%d lookup_sent=%d follow_sent=%d sample_q=%d sample_resp=%d sample_hash=%d sample_unique=%d peer_sent=%d peer_drop=%d peer_dedup=%d meta_req=%d meta_admitted=%d meta_req_dedup=%d meta_sent=%d meta_drop=%d meta_dedup=%d meta_invalid=%d meta_filtered=%d meta_locale_n=%d meta_han=%d meta_kana=%d meta_hangul=%d meta_zh_proxy=%d check_drop=%d paused=%v wire_q_drop=%d wire_dial=%d wire_conn=%d wire_dial_fail=%d wire_hs=%d wire_hs_fail=%d wire_ok=%d wire_dl_fail=%d wire_bl=%d ann_q=%d ann_bl=%d ann_inflight=%d ann_dial=%d ann_conn=%d ann_ok=%d gp_q=%d gp_bl=%d gp_inflight=%d gp_dial=%d gp_conn=%d gp_ok=%d bl_size=%d bl_max=%d bl_reject=%d bl_expired=%d%s",
 		current.dhtPacketsReceived-previous.dhtPacketsReceived,
 		current.dhtPacketsHandled-previous.dhtPacketsHandled,
 		current.dhtPacketsDropped-previous.dhtPacketsDropped,
@@ -1945,6 +2020,7 @@ func (a *Application) logRuntimeDelta(current, previous statsSnapshot) {
 		current.metadataEventsSent-previous.metadataEventsSent,
 		current.metadataEventsDropped-previous.metadataEventsDropped,
 		current.metadataEventsDeduped-previous.metadataEventsDeduped,
+		current.metadataEventsInvalid-previous.metadataEventsInvalid,
 		current.metadataEventsFiltered-previous.metadataEventsFiltered,
 		localeDelta.classified,
 		localeDelta.han,
@@ -1986,7 +2062,7 @@ func (a *Application) logRuntimeDelta(current, previous statsSnapshot) {
 func formatRuntimeGauges(current, previous statsSnapshot) string {
 	var b strings.Builder
 	fmt.Fprintf(&b,
-		" wire_target=%d wire_active=%d wire_max=%d wire_busy=%d wire_pinned=%t wire_req_depth=%d wire_req_cap=%d wire_resp_depth=%d wire_resp_cap=%d dht_bl_size=%d dht_bl_max=%d dht_bl_reject=%d dht_bl_expired=%d oracle_obs_q=%d oracle_obs_sent=%d oracle_obs_drop=%d oracle_obs_http_fail=%d oracle_obs_depth=%d oracle_obs_cap=%d oracle_obs_invalid=%t heat_q=%d heat_drop=%d heat_durable=%d heat_lost=%d heat_spool_retry=%d heat_export=%d heat_export_retry=%d heat_perm_fail=%d heat_closed_records=%d heat_closed_batches=%d heat_depth=%d heat_cap=%d heat_spool_bytes=%d heat_spool_max=%d heat_spool_records=%d",
+		" wire_target=%d wire_active=%d wire_max=%d wire_busy=%d wire_pinned=%t wire_req_depth=%d wire_req_cap=%d wire_resp_depth=%d wire_resp_cap=%d wire_src_sched=%t wire_ann_depth=%d wire_ann_cap=%d wire_ann_in=%d wire_ann_drop=%d wire_gp_depth=%d wire_gp_cap=%d wire_gp_in=%d wire_gp_drop=%d dht_bl_size=%d dht_bl_max=%d dht_bl_reject=%d dht_bl_expired=%d oracle_obs_q=%d oracle_obs_sent=%d oracle_obs_drop=%d oracle_obs_http_fail=%d oracle_obs_depth=%d oracle_obs_cap=%d oracle_obs_invalid=%t heat_q=%d heat_drop=%d heat_durable=%d heat_lost=%d heat_spool_retry=%d heat_export=%d heat_export_retry=%d heat_perm_fail=%d heat_closed_records=%d heat_closed_batches=%d heat_depth=%d heat_cap=%d heat_spool_bytes=%d heat_spool_max=%d heat_spool_records=%d",
 		current.wireTargetWorkers,
 		current.wireActiveWorkers,
 		current.wireMaxWorkers,
@@ -1996,6 +2072,15 @@ func formatRuntimeGauges(current, previous statsSnapshot) string {
 		current.wireRequestCap,
 		current.wireResponseDepth,
 		current.wireResponseCap,
+		current.wireSourceSchedule,
+		current.wireAnnounceDepth,
+		current.wireAnnounceCap,
+		current.wireAnnounceIn-previous.wireAnnounceIn,
+		current.wireAnnounceDrop-previous.wireAnnounceDrop,
+		current.wireLookupDepth,
+		current.wireLookupCap,
+		current.wireLookupIn-previous.wireLookupIn,
+		current.wireLookupDrop-previous.wireLookupDrop,
 		current.dhtBlacklistSize,
 		current.dhtBlacklistMax,
 		current.dhtBlacklistRejected-previous.dhtBlacklistRejected,
@@ -2045,6 +2130,7 @@ func formatRuntimeGauges(current, previous statsSnapshot) string {
 		current.heatShadow.sampledBypassed-previous.heatShadow.sampledBypassed,
 	)
 	appendRetryCohortRuntimeFields(&b, current.retryObserver, previous.retryObserver)
+	appendMetadataSpoolRuntimeFields(&b, current, previous)
 	appendLRURuntimeFields(&b, "ih", current.infohashLRU, previous.infohashLRU)
 	appendLRURuntimeFields(&b, "peer", current.peerLRU, previous.peerLRU)
 	appendLRURuntimeFields(&b, "mreq", current.metaReqLRU, previous.metaReqLRU)
@@ -2053,9 +2139,50 @@ func formatRuntimeGauges(current, previous statsSnapshot) string {
 	return b.String()
 }
 
+func appendMetadataSpoolRuntimeFields(b *strings.Builder, current, previous statsSnapshot) {
+	if !current.metadataSpoolOn {
+		fmt.Fprint(b, " meta_spool=false")
+		return
+	}
+	cur := current.metadataSpool
+	prev := previous.metadataSpool
+	groups := cur.Groups - prev.Groups
+	records := cur.RecordsGrouped - prev.RecordsGrouped
+	successfulAppends := cur.SuccessfulAppends - prev.SuccessfulAppends
+	fsyncMicros := uint64((cur.AppendFsyncTotal - prev.AppendFsyncTotal) / time.Microsecond)
+	avgGroup := uint64(0)
+	if groups > 0 {
+		avgGroup = records / groups
+	}
+	avgFsyncMicros := uint64(0)
+	if successfulAppends > 0 {
+		avgFsyncMicros = fsyncMicros / successfulAppends
+	}
+	fmt.Fprintf(b,
+		" meta_spool=true meta_spool_pending=%d meta_spool_peak=%d meta_spool_groups=%d meta_spool_records=%d meta_spool_avg_group=%d meta_spool_last_group=%d meta_spool_max_group=%d meta_spool_full=%d meta_spool_timer=%d meta_spool_shutdown=%d meta_spool_append=%d meta_spool_append_ok=%d meta_spool_capacity_retry=%d meta_spool_append_err=%d meta_spool_fsync_avg_us=%d meta_spool_fsync_last_us=%d meta_spool_fsync_max_us=%d",
+		cur.Pending,
+		cur.PendingPeak,
+		groups,
+		records,
+		avgGroup,
+		cur.LastGroupSize,
+		cur.MaxGroupSize,
+		cur.BatchFullGroups-prev.BatchFullGroups,
+		cur.TimerGroups-prev.TimerGroups,
+		cur.ShutdownGroups-prev.ShutdownGroups,
+		cur.AppendAttempts-prev.AppendAttempts,
+		successfulAppends,
+		cur.CapacityRetries-prev.CapacityRetries,
+		cur.AppendErrors-prev.AppendErrors,
+		avgFsyncMicros,
+		cur.AppendFsyncLast/time.Microsecond,
+		cur.AppendFsyncMax/time.Microsecond,
+	)
+}
+
 func appendLRURuntimeFields(b *strings.Builder, name string, current, previous cache.LRUStats) {
 	fmt.Fprintf(b,
-		" lru_%s_len=%d lru_%s_cap=%d lru_%s_oldest_s=%d lru_%s_hit=%d lru_%s_miss=%d lru_%s_insert=%d lru_%s_evict=%d lru_%s_del_miss=%d",
+		" lru_%s_len=%d lru_%s_cap=%d lru_%s_oldest_s=%d lru_%s_hit=%d lru_%s_miss=%d lru_%s_insert=%d lru_%s_evict=%d lru_%s_expire=%d lru_%s_del_miss=%d",
 		name, current.Len,
 		name, current.Capacity,
 		name, current.OldestAgeSeconds,
@@ -2063,6 +2190,7 @@ func appendLRURuntimeFields(b *strings.Builder, name string, current, previous c
 		name, current.Misses-previous.Misses,
 		name, current.Inserts-previous.Inserts,
 		name, current.Evicts-previous.Evicts,
+		name, current.Expirations-previous.Expirations,
 		name, current.DeleteMisses-previous.DeleteMisses,
 	)
 }
@@ -2076,6 +2204,7 @@ func addLRUWorkerStats(out map[string]uint64, name string, stats cache.LRUStats)
 	out[prefix+"misses"] = stats.Misses
 	out[prefix+"inserts"] = stats.Inserts
 	out[prefix+"evicts"] = stats.Evicts
+	out[prefix+"expirations"] = stats.Expirations
 	out[prefix+"delete_misses"] = stats.DeleteMisses
 }
 
@@ -2088,6 +2217,39 @@ func addWireWorkerStats(out map[string]uint64, current statsSnapshot) {
 	out["wire_max_workers"] = uint64(current.wireMaxWorkers)
 	out["wire_busy_workers"] = uint64(current.wireBusyWorkers)
 	out["wire_workers_pinned"] = boolUint64(current.wireWorkersPinned)
+	out["wire_source_scheduler_enabled"] = boolUint64(current.wireSourceSchedule)
+	out["wire_announce_queue_depth"] = uint64(current.wireAnnounceDepth)
+	out["wire_announce_queue_capacity"] = uint64(current.wireAnnounceCap)
+	out["wire_announce_queue_admitted"] = uint64(current.wireAnnounceIn)
+	out["wire_announce_queue_dropped"] = uint64(current.wireAnnounceDrop)
+	out["wire_lookup_queue_depth"] = uint64(current.wireLookupDepth)
+	out["wire_lookup_queue_capacity"] = uint64(current.wireLookupCap)
+	out["wire_lookup_queue_admitted"] = uint64(current.wireLookupIn)
+	out["wire_lookup_queue_dropped"] = uint64(current.wireLookupDrop)
+}
+
+func addMetadataSpoolWorkerStats(out map[string]uint64, current statsSnapshot) {
+	out["metadata_spool_enabled"] = boolUint64(current.metadataSpoolOn)
+	if !current.metadataSpoolOn {
+		return
+	}
+	stats := current.metadataSpool
+	out["metadata_spool_pending"] = uint64(stats.Pending)
+	out["metadata_spool_pending_peak"] = uint64(stats.PendingPeak)
+	out["metadata_spool_groups"] = stats.Groups
+	out["metadata_spool_records_grouped"] = stats.RecordsGrouped
+	out["metadata_spool_last_group_size"] = uint64(stats.LastGroupSize)
+	out["metadata_spool_max_group_size"] = uint64(stats.MaxGroupSize)
+	out["metadata_spool_batch_full_groups"] = stats.BatchFullGroups
+	out["metadata_spool_timer_groups"] = stats.TimerGroups
+	out["metadata_spool_shutdown_groups"] = stats.ShutdownGroups
+	out["metadata_spool_append_attempts"] = stats.AppendAttempts
+	out["metadata_spool_successful_appends"] = stats.SuccessfulAppends
+	out["metadata_spool_capacity_retries"] = stats.CapacityRetries
+	out["metadata_spool_append_errors"] = stats.AppendErrors
+	out["metadata_spool_fsync_total_us"] = uint64(stats.AppendFsyncTotal / time.Microsecond)
+	out["metadata_spool_fsync_last_us"] = uint64(stats.AppendFsyncLast / time.Microsecond)
+	out["metadata_spool_fsync_max_us"] = uint64(stats.AppendFsyncMax / time.Microsecond)
 }
 
 func addRetryCohortWorkerStats(out map[string]uint64, snapshot *dht.RetryCohortSnapshot) {

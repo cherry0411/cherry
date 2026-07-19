@@ -267,16 +267,26 @@ func (wire *Wire) SetRetryCohortObserver(observer *RetryCohortObserver) {
 	if wire.retryObserver != nil {
 		panic("retry cohort observer already installed")
 	}
-	if len(wire.requests) != 0 {
+	if wire.RequestDepth() != 0 {
 		panic("retry cohort observer must be installed before request admission")
 	}
-	if uint64(cap(wire.requests)) != observer.requestQueueCapacity {
+	if uint64(wire.RequestCapacity()) != observer.requestQueueCapacity {
 		panic("retry cohort observer request queue capacity does not match wire")
 	}
-	wire.observedRequests = make(chan observedRequest, cap(wire.requests))
-	// Release the baseline channel. Disabled deployments retain chan Request
-	// with no 8-byte token; enabled deployments pay only the observed slot delta.
-	wire.requests = nil
+	if wire.sourceRequests != nil {
+		wire.sourceObservedRequests = &sourceRequestQueue[observedRequest]{
+			announce:       make(chan observedRequest, cap(wire.sourceRequests.announce)),
+			lookup:         make(chan observedRequest, cap(wire.sourceRequests.lookup)),
+			announceWeight: wire.sourceRequests.announceWeight,
+			lookupWeight:   wire.sourceRequests.lookupWeight,
+		}
+		wire.sourceRequests = nil
+	} else {
+		wire.observedRequests = make(chan observedRequest, cap(wire.requests))
+		// Release the baseline channel. Disabled deployments retain chan Request
+		// with no 8-byte token; enabled deployments pay only the observed slot delta.
+		wire.requests = nil
+	}
 	wire.retryObserver = observer
 }
 
@@ -296,17 +306,19 @@ func (wire *Wire) RetryCohortSnapshot() *RetryCohortSnapshot {
 //   - queue 改为有界 LRU（防止无限增长）
 //   - Run() 使用固定 worker 池，降低高负载调度开销
 type Wire struct {
-	blackList        *blackList
-	queue            *cache.LRU // 有界 LRU，替代原来的 syncedMap
-	requests         chan Request
-	observedRequests chan observedRequest
-	responses        chan Response
-	workerCount      int
-	active           atomic.Int64
-	busy             atomic.Int64
-	peerID           []byte
-	retryObserver    *RetryCohortObserver
-	Stats            WireStats
+	blackList              *blackList
+	queue                  *cache.LRU // 有界 LRU，替代原来的 syncedMap
+	requests               chan Request
+	observedRequests       chan observedRequest
+	sourceRequests         *sourceRequestQueue[Request]
+	sourceObservedRequests *sourceRequestQueue[observedRequest]
+	responses              chan Response
+	workerCount            int
+	active                 atomic.Int64
+	busy                   atomic.Int64
+	peerID                 []byte
+	retryObserver          *RetryCohortObserver
+	Stats                  WireStats
 }
 
 // NewWire 创建一个 Wire 实例。
@@ -354,6 +366,13 @@ func (wire *Wire) Request(infoHash []byte, ip string, port int) {
 func (wire *Wire) RequestFromSource(infoHash []byte, ip string, port int, source PeerSource) bool {
 	request := Request{InfoHash: infoHash, IP: ip, Port: port, Source: source}
 	if wire.retryObserver == nil {
+		if wire.sourceRequests != nil {
+			if wire.sourceRequests.tryEnqueue(request, source) {
+				return true
+			}
+			wire.Stats.QueueDropped.Add(1)
+			return false
+		}
 		select {
 		case wire.requests <- request:
 			return true
@@ -365,6 +384,14 @@ func (wire *Wire) RequestFromSource(infoHash []byte, ip string, port int, source
 	observed := observedRequest{Request: request}
 	if len(infoHash) == 20 {
 		observed.retryObservation = wire.retryObserver.begin(request)
+	}
+	if wire.sourceObservedRequests != nil {
+		if wire.sourceObservedRequests.tryEnqueue(observed, source) {
+			return true
+		}
+		wire.Stats.QueueDropped.Add(1)
+		wire.retryObserver.finish(&observed.retryObservation, retryOutcomeQueueFull)
+		return false
 	}
 	select {
 	case wire.observedRequests <- observed:
@@ -400,6 +427,12 @@ func (wire *Wire) MaxWorkers() int {
 }
 
 func (wire *Wire) RequestDepth() int {
+	if wire.sourceObservedRequests != nil {
+		return wire.sourceObservedRequests.depth()
+	}
+	if wire.sourceRequests != nil {
+		return wire.sourceRequests.depth()
+	}
 	if wire.retryObserver != nil {
 		return len(wire.observedRequests)
 	}
@@ -411,6 +444,12 @@ func (wire *Wire) ResponseDepth() int {
 }
 
 func (wire *Wire) RequestCapacity() int {
+	if wire.sourceObservedRequests != nil {
+		return wire.sourceObservedRequests.capacity()
+	}
+	if wire.sourceRequests != nil {
+		return wire.sourceRequests.capacity()
+	}
 	if wire.retryObserver != nil {
 		return cap(wire.observedRequests)
 	}
@@ -750,7 +789,15 @@ func (wire *Wire) runWorker(workerID int) {
 			time.Sleep(250 * time.Millisecond)
 			continue
 		}
-		r, ok := <-wire.requests
+		var (
+			r  Request
+			ok bool
+		)
+		if wire.sourceRequests != nil {
+			r, ok = wire.sourceRequests.dequeue()
+		} else {
+			r, ok = <-wire.requests
+		}
 		if !ok {
 			return
 		}
@@ -764,7 +811,15 @@ func (wire *Wire) runObservedWorker(workerID int) {
 			time.Sleep(250 * time.Millisecond)
 			continue
 		}
-		r, ok := <-wire.observedRequests
+		var (
+			r  observedRequest
+			ok bool
+		)
+		if wire.sourceObservedRequests != nil {
+			r, ok = wire.sourceObservedRequests.dequeue()
+		} else {
+			r, ok = <-wire.observedRequests
+		}
 		if !ok {
 			return
 		}

@@ -5,7 +5,8 @@
   "event_queue": 4096,
   "dedupe": {
     "peer_ttl": "10m",
-    "metadata_ttl": "30m"
+    "metadata_ttl": "30m",
+    "expire_metadata_attempts": false
   },
   "discovery": {
     "mode": "crawl",
@@ -26,7 +27,7 @@
     "packet_jobs": 512,
     "read_workers": 1,
     "max_nodes": 1000,
-    "refresh_nodes": 256,
+    "refresh_nodes": 32,
     "node_id_dir": "/var/lib/cherry-picker/nodes"
   },
   "metadata": {
@@ -34,6 +35,8 @@
     "black_list_size": 131072,
     "request_queue_size": 32768,
     "worker_queue_size": 1024,
+    "source_scheduler_enabled": false,
+    "announce_share_percent": 75,
     "retry_observer_enabled": false,
     "retry_observer_sample_denominator": 64,
     "retry_observer_window": "31m",

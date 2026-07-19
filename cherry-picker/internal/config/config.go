@@ -35,6 +35,10 @@ type Config struct {
 type DedupeConfig struct {
 	PeerTTL     time.Duration
 	MetadataTTL time.Duration
+	// ExpireMetadataAttempts enables a fixed (non-sliding) cooldown for the
+	// (infohash, peer) wire-attempt cache. It defaults off so existing
+	// deployments retain the legacy session-long behavior until an A/B opts in.
+	ExpireMetadataAttempts bool
 }
 
 type DiscoveryConfig struct {
@@ -65,6 +69,12 @@ type MetadataConfig struct {
 	Enabled          bool
 	BlackListSize    int
 	RequestQueueSize int
+	// SourceSchedulerEnabled opt-in isolates announce_peer from get_peers wire
+	// admission. Disabled preserves the legacy shared FIFO exactly.
+	SourceSchedulerEnabled bool
+	// AnnounceSharePercent reserves this percentage of request slots and wire
+	// dequeue opportunities for passive announce_peer supply.
+	AnnounceSharePercent int
 	// WorkerQueueSize is the legacy name for the physical wire-worker ceiling.
 	// It remains populated for callers that have not migrated to WorkerMax.
 	WorkerQueueSize int
@@ -191,8 +201,9 @@ func Load() (Config, error) {
 		TargetCPU:   float64(getenvInt("CHERRY_PICKER_TARGET_CPU", 80)) / 100.0,
 		MemLimitMB:  getenvInt("CHERRY_PICKER_MEM_LIMIT_MB", 0),
 		Dedupe: DedupeConfig{
-			PeerTTL:     getenvDuration("CHERRY_PICKER_DEDUPE_PEER_TTL", 10*time.Minute),
-			MetadataTTL: getenvDuration("CHERRY_PICKER_DEDUPE_METADATA_TTL", 30*time.Minute),
+			PeerTTL:                getenvDuration("CHERRY_PICKER_DEDUPE_PEER_TTL", 10*time.Minute),
+			MetadataTTL:            getenvDuration("CHERRY_PICKER_DEDUPE_METADATA_TTL", 30*time.Minute),
+			ExpireMetadataAttempts: getenvBool("CHERRY_PICKER_DEDUPE_EXPIRE_METADATA_ATTEMPTS", false),
 		},
 		Discovery: DiscoveryConfig{
 			Mode:             strings.ToLower(getenvDefault("CHERRY_PICKER_DHT_MODE", "crawl")),
@@ -221,6 +232,8 @@ func Load() (Config, error) {
 			Enabled:                        getenvBool("CHERRY_PICKER_METADATA_ENABLED", true),
 			BlackListSize:                  getenvInt("CHERRY_PICKER_METADATA_BLACKLIST", 131072),
 			RequestQueueSize:               getenvInt("CHERRY_PICKER_METADATA_REQUEST_QUEUE", defaultMetadataRequestQueue()),
+			SourceSchedulerEnabled:         getenvBool("CHERRY_PICKER_METADATA_SOURCE_SCHEDULER", false),
+			AnnounceSharePercent:           getenvInt("CHERRY_PICKER_METADATA_ANNOUNCE_SHARE", 75),
 			WorkerQueueSize:                getenvInt("CHERRY_PICKER_METADATA_WORKERS", defaultMetadataWorkers()),
 			WorkerInitial:                  getenvInt("CHERRY_PICKER_METADATA_WORKERS_INITIAL", 0),
 			WorkerMin:                      getenvInt("CHERRY_PICKER_METADATA_WORKERS_MIN", 0),
@@ -323,8 +336,9 @@ func loadFromFile(path string) (Config, error) {
 		AutoTune:    autoTune,
 		MemLimitMB:  raw.MemLimitMB,
 		Dedupe: DedupeConfig{
-			PeerTTL:     parseDuration(raw.Dedupe.PeerTTL),
-			MetadataTTL: parseDuration(raw.Dedupe.MetadataTTL),
+			PeerTTL:                parseDuration(raw.Dedupe.PeerTTL),
+			MetadataTTL:            parseDuration(raw.Dedupe.MetadataTTL),
+			ExpireMetadataAttempts: raw.Dedupe.ExpireMetadataAttempts,
 		},
 		Discovery: DiscoveryConfig{
 			Mode:             strings.ToLower(strings.TrimSpace(raw.Discovery.Mode)),
@@ -353,6 +367,8 @@ func loadFromFile(path string) (Config, error) {
 			Enabled:                        raw.Metadata.Enabled,
 			BlackListSize:                  raw.Metadata.BlackListSize,
 			RequestQueueSize:               intOrDefault(raw.Metadata.RequestQueueSize, defaultMetadataRequestQueue()),
+			SourceSchedulerEnabled:         raw.Metadata.SourceSchedulerEnabled,
+			AnnounceSharePercent:           raw.Metadata.AnnounceSharePercent,
 			WorkerQueueSize:                intOrDefault(raw.Metadata.WorkerQueueSize, defaultMetadataWorkers()),
 			WorkerInitial:                  raw.Metadata.WorkerInitial,
 			WorkerMin:                      raw.Metadata.WorkerMin,
@@ -482,6 +498,12 @@ func normalize(cfg Config) Config {
 	}
 	if cfg.Metadata.RequestQueueSize <= 0 {
 		cfg.Metadata.RequestQueueSize = defaultMetadataRequestQueue()
+	}
+	if cfg.Metadata.AnnounceSharePercent <= 0 {
+		cfg.Metadata.AnnounceSharePercent = 75
+	}
+	if cfg.Metadata.AnnounceSharePercent > 99 {
+		cfg.Metadata.AnnounceSharePercent = 99
 	}
 	// worker_queue_size is the legacy spelling of worker_max. A new explicit
 	// worker_max wins; otherwise existing production configurations retain the
@@ -627,8 +649,9 @@ type fileFilterConfig struct {
 }
 
 type fileDedupeConfig struct {
-	PeerTTL     string `json:"peer_ttl"`
-	MetadataTTL string `json:"metadata_ttl"`
+	PeerTTL                string `json:"peer_ttl"`
+	MetadataTTL            string `json:"metadata_ttl"`
+	ExpireMetadataAttempts bool   `json:"expire_metadata_attempts"`
 }
 
 type fileDiscoveryConfig struct {
@@ -659,6 +682,8 @@ type fileMetadataConfig struct {
 	Enabled                        bool   `json:"enabled"`
 	BlackListSize                  int    `json:"black_list_size"`
 	RequestQueueSize               int    `json:"request_queue_size"`
+	SourceSchedulerEnabled         bool   `json:"source_scheduler_enabled"`
+	AnnounceSharePercent           int    `json:"announce_share_percent"`
 	WorkerQueueSize                int    `json:"worker_queue_size"`
 	WorkerInitial                  int    `json:"worker_initial"`
 	WorkerMin                      int    `json:"worker_min"`

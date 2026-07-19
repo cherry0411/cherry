@@ -25,6 +25,7 @@ type DurableIngestor struct {
 
 	mu       sync.Mutex
 	pending  []*durableRequest
+	stats    DurableIngestorSnapshot
 	closed   bool
 	fatalErr error
 	wake     chan struct{}
@@ -34,9 +35,41 @@ type DurableIngestor struct {
 }
 
 type durableRequest struct {
-	record spool.Record
-	result chan error
+	record     spool.Record
+	result     chan error
+	admittedAt time.Time
 }
+
+// DurableIngestorSnapshot exposes the actual group-commit shape and cost. The
+// append duration includes record encoding, writes and every fsync performed by
+// Spool.AppendBatchDurable; successful calls are the definitive durability
+// boundary observed by Submit.
+type DurableIngestorSnapshot struct {
+	Pending           int
+	PendingPeak       int
+	Groups            uint64
+	RecordsGrouped    uint64
+	LastGroupSize     int
+	MaxGroupSize      int
+	BatchFullGroups   uint64
+	TimerGroups       uint64
+	ShutdownGroups    uint64
+	AppendAttempts    uint64
+	SuccessfulAppends uint64
+	CapacityRetries   uint64
+	AppendErrors      uint64
+	AppendFsyncTotal  time.Duration
+	AppendFsyncLast   time.Duration
+	AppendFsyncMax    time.Duration
+}
+
+type durableFlushReason uint8
+
+const (
+	durableFlushBatchFull durableFlushReason = iota
+	durableFlushTimer
+	durableFlushShutdown
+)
 
 type DurableIngestorOptions struct {
 	Spool         *spool.Spool
@@ -78,7 +111,7 @@ func (w *DurableIngestor) Submit(ctx context.Context, record spool.Record) error
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	req := &durableRequest{record: record, result: make(chan error, 1)}
+	req := &durableRequest{record: record, result: make(chan error, 1), admittedAt: time.Now()}
 
 	w.mu.Lock()
 	if w.closed {
@@ -90,6 +123,9 @@ func (w *DurableIngestor) Submit(ctx context.Context, record spool.Record) error
 		return err
 	}
 	w.pending = append(w.pending, req)
+	if len(w.pending) > w.stats.PendingPeak {
+		w.stats.PendingPeak = len(w.pending)
+	}
 	w.signalLocked()
 	w.mu.Unlock()
 
@@ -135,28 +171,65 @@ func (w *DurableIngestor) signalLocked() {
 	}
 }
 
+// Snapshot returns a concurrency-safe point-in-time copy of the group writer
+// statistics. Counters are process-lifetime values.
+func (w *DurableIngestor) Snapshot() DurableIngestorSnapshot {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	snapshot := w.stats
+	snapshot.Pending = len(w.pending)
+	return snapshot
+}
+
 func (w *DurableIngestor) run() {
 	defer close(w.done)
 	stopping := false
 	for {
-		if !stopping {
-			select {
-			case <-w.wake:
-			case <-w.stop:
-				stopping = true
+		reason := durableFlushTimer
+		for {
+			pending, oldest := w.pendingState()
+			if stopping {
+				if pending == 0 {
+					return
+				}
+				reason = durableFlushShutdown
+				break
 			}
-		}
+			if pending >= w.batchSize {
+				reason = durableFlushBatchFull
+				break
+			}
+			if pending == 0 {
+				select {
+				case <-w.wake:
+				case <-w.stop:
+					stopping = true
+				}
+				continue
+			}
 
-		if !stopping && w.pendingCount() < w.batchSize {
-			timer := time.NewTimer(w.maxDelay)
+			remaining := time.Until(oldest.Add(w.maxDelay))
+			if remaining <= 0 {
+				reason = durableFlushTimer
+				break
+			}
+			timer := time.NewTimer(remaining)
 			select {
 			case <-timer.C:
+				reason = durableFlushTimer
+				break
 			case <-w.wake:
 				stopAndDrainTimer(timer)
+				// A wake only announces changed state. Re-check the pending
+				// count and the original oldest-request deadline; it must not
+				// turn every concurrent Submit into an early one-record fsync.
+				continue
 			case <-w.stop:
 				stopAndDrainTimer(timer)
 				stopping = true
+				continue
 			}
+			break
 		}
 
 		batch := w.takeBatch()
@@ -171,13 +244,16 @@ func (w *DurableIngestor) run() {
 		for i := range batch {
 			records[i] = batch[i].record
 		}
+		w.recordGroup(reason, len(batch))
 		for {
 			if fatal := w.currentFatal(); fatal != nil {
 				completeDurableRequests(batch, fatal)
 				w.failPending(fatal)
 				return
 			}
+			started := time.Now()
 			_, err := w.spool.AppendBatchDurable(records)
+			w.recordAppend(time.Since(started), err)
 			if err == nil {
 				completeDurableRequests(batch, nil)
 				break
@@ -205,10 +281,52 @@ func (w *DurableIngestor) run() {
 	}
 }
 
-func (w *DurableIngestor) pendingCount() int {
+func (w *DurableIngestor) pendingState() (int, time.Time) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	return len(w.pending)
+	if len(w.pending) == 0 {
+		return 0, time.Time{}
+	}
+	return len(w.pending), w.pending[0].admittedAt
+}
+
+func (w *DurableIngestor) recordGroup(reason durableFlushReason, size int) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.stats.Groups++
+	w.stats.RecordsGrouped += uint64(size)
+	w.stats.LastGroupSize = size
+	if size > w.stats.MaxGroupSize {
+		w.stats.MaxGroupSize = size
+	}
+	switch reason {
+	case durableFlushBatchFull:
+		w.stats.BatchFullGroups++
+	case durableFlushTimer:
+		w.stats.TimerGroups++
+	case durableFlushShutdown:
+		w.stats.ShutdownGroups++
+	}
+}
+
+func (w *DurableIngestor) recordAppend(elapsed time.Duration, err error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.stats.AppendAttempts++
+	if err == nil {
+		w.stats.SuccessfulAppends++
+		w.stats.AppendFsyncTotal += elapsed
+		w.stats.AppendFsyncLast = elapsed
+		if elapsed > w.stats.AppendFsyncMax {
+			w.stats.AppendFsyncMax = elapsed
+		}
+		return
+	}
+	if errors.Is(err, spool.ErrAtCapacity) {
+		w.stats.CapacityRetries++
+		return
+	}
+	w.stats.AppendErrors++
 }
 
 func (w *DurableIngestor) takeBatch() []*durableRequest {

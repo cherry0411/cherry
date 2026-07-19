@@ -151,6 +151,90 @@ func TestLoadRetryObserverDefaultsDisabledAndParsesJSON(t *testing.T) {
 	}
 }
 
+func TestMetadataAttemptExpiryDefaultsOffAndIsExplicitlyConfigurable(t *testing.T) {
+	t.Setenv("CHERRY_PICKER_CONFIG", "")
+	t.Setenv("CHERRY_PICKER_DEDUPE_EXPIRE_METADATA_ATTEMPTS", "")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Dedupe.ExpireMetadataAttempts {
+		t.Fatal("metadata attempt expiry must remain off by default")
+	}
+
+	t.Setenv("CHERRY_PICKER_DEDUPE_EXPIRE_METADATA_ATTEMPTS", "true")
+	t.Setenv("CHERRY_PICKER_DEDUPE_METADATA_TTL", "2m")
+	cfg, err = Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Dedupe.ExpireMetadataAttempts || cfg.Dedupe.MetadataTTL != 2*time.Minute {
+		t.Fatalf("unexpected expiry env config: %+v", cfg.Dedupe)
+	}
+
+	path := filepath.Join(t.TempDir(), "crawler.json")
+	if err := os.WriteFile(path, []byte(`{
+  "dedupe": {
+    "metadata_ttl": "8m",
+    "expire_metadata_attempts": true
+  }
+}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CHERRY_PICKER_CONFIG", path)
+	cfg, err = Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Dedupe.ExpireMetadataAttempts || cfg.Dedupe.MetadataTTL != 8*time.Minute {
+		t.Fatalf("unexpected expiry JSON config: %+v", cfg.Dedupe)
+	}
+}
+
+func TestLoadWireSourceSchedulerDefaultsOffAndParsesJSON(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "crawler.json")
+	if err := os.WriteFile(path, []byte(`{
+  "metadata": {
+    "source_scheduler_enabled": true,
+    "announce_share_percent": 70
+  }
+}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CHERRY_PICKER_CONFIG", path)
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Metadata.SourceSchedulerEnabled || cfg.Metadata.AnnounceSharePercent != 70 {
+		t.Fatalf("unexpected scheduler JSON config: %+v", cfg.Metadata)
+	}
+
+	t.Setenv("CHERRY_PICKER_CONFIG", "")
+	t.Setenv("CHERRY_PICKER_METADATA_SOURCE_SCHEDULER", "false")
+	t.Setenv("CHERRY_PICKER_METADATA_ANNOUNCE_SHARE", "")
+	cfg, err = Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Metadata.SourceSchedulerEnabled || cfg.Metadata.AnnounceSharePercent != 75 {
+		t.Fatalf("unexpected scheduler defaults: %+v", cfg.Metadata)
+	}
+}
+
+func TestLoadWireSourceSchedulerFromEnvironment(t *testing.T) {
+	t.Setenv("CHERRY_PICKER_CONFIG", "")
+	t.Setenv("CHERRY_PICKER_METADATA_SOURCE_SCHEDULER", "true")
+	t.Setenv("CHERRY_PICKER_METADATA_ANNOUNCE_SHARE", "80")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Metadata.SourceSchedulerEnabled || cfg.Metadata.AnnounceSharePercent != 80 {
+		t.Fatalf("unexpected scheduler env config: %+v", cfg.Metadata)
+	}
+}
+
 func TestLoadFixedMetadataWorkersFromEnvironment(t *testing.T) {
 	t.Setenv("CHERRY_PICKER_CONFIG", "")
 	t.Setenv("CHERRY_PICKER_AUTO_TUNE", "false")

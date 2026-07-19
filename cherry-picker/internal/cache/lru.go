@@ -17,6 +17,10 @@ import (
 //   - Add(key) bool：同 Set，语义一致，供外部调用
 type LRU struct {
 	shards []*lruShard
+	// ttlSeconds is zero for the legacy non-expiring cache. Expiration is
+	// checked lazily on key access; cold expired entries remain bounded by the
+	// normal LRU capacity and disappear on access or capacity eviction.
+	ttlSeconds uint32
 
 	// observedUnix is a deliberately coarse clock. Snapshot advances it once
 	// per telemetry interval; hot Set/ContainsAndTouch operations only perform
@@ -36,10 +40,12 @@ type lruShard struct {
 	inserts      uint64
 	evicts       uint64
 	deleteMisses uint64
+	expirations  uint64
 }
 
 type entry struct {
 	key         string
+	insertedAt  uint32
 	lastTouched uint32
 }
 
@@ -55,10 +61,32 @@ type LRUStats struct {
 	Inserts          uint64
 	Evicts           uint64
 	DeleteMisses     uint64
+	Expirations      uint64
 }
 
 // NewLRU 创建一个容量为 capacity 的 LRU 缓存。capacity 必须 >= 1。
 func NewLRU(capacity int) *LRU {
+	return newLRU(capacity, 0)
+}
+
+// NewLRUWithTTL creates a bounded LRU whose entries become absent ttl after
+// their first insertion. Duplicate observations do not extend the deadline:
+// this is deliberate for attempt/failure cooldowns, where a noisy dead peer
+// must eventually become retryable. A non-positive ttl preserves NewLRU's
+// non-expiring behavior.
+func NewLRUWithTTL(capacity int, ttl time.Duration) *LRU {
+	var ttlSeconds uint32
+	if ttl > 0 {
+		seconds := (ttl + time.Second - 1) / time.Second
+		if seconds > time.Duration(^uint32(0)) {
+			seconds = time.Duration(^uint32(0))
+		}
+		ttlSeconds = uint32(seconds)
+	}
+	return newLRU(capacity, ttlSeconds)
+}
+
+func newLRU(capacity int, ttlSeconds uint32) *LRU {
 	if capacity < 1 {
 		capacity = 1
 	}
@@ -96,7 +124,7 @@ func NewLRU(capacity int) *LRU {
 		})
 	}
 
-	c := &LRU{shards: shards}
+	c := &LRU{shards: shards, ttlSeconds: ttlSeconds}
 	c.observedUnix.Store(uint32(time.Now().Unix()))
 	return c
 }
@@ -113,10 +141,16 @@ func (c *LRU) Set(key string) bool {
 
 	// 已存在：移至头部，返回 false（已见过）
 	if elem, ok := shard.items[key]; ok {
-		shard.hits++
-		elem.Value.(*entry).lastTouched = now
-		shard.list.MoveToFront(elem)
-		return false
+		if c.expired(now, elem.Value.(*entry)) {
+			shard.list.Remove(elem)
+			delete(shard.items, key)
+			shard.expirations++
+		} else {
+			shard.hits++
+			elem.Value.(*entry).lastTouched = now
+			shard.list.MoveToFront(elem)
+			return false
+		}
 	}
 	shard.misses++
 
@@ -126,7 +160,7 @@ func (c *LRU) Set(key string) bool {
 	}
 
 	// 插入新条目到链表头部
-	elem := shard.list.PushFront(&entry{key: key, lastTouched: now})
+	elem := shard.list.PushFront(&entry{key: key, insertedAt: now, lastTouched: now})
 	shard.items[key] = elem
 	shard.inserts++
 	return true
@@ -135,9 +169,16 @@ func (c *LRU) Set(key string) bool {
 // Contains 检查 key 是否存在，不更新 LRU 顺序。O(1)。
 func (c *LRU) Contains(key string) bool {
 	shard := c.shardFor(key)
+	now := c.observedUnix.Load()
 	shard.mu.Lock()
 	defer shard.mu.Unlock()
-	_, ok := shard.items[key]
+	elem, ok := shard.items[key]
+	if ok && c.expired(now, elem.Value.(*entry)) {
+		shard.list.Remove(elem)
+		delete(shard.items, key)
+		shard.expirations++
+		ok = false
+	}
 	if ok {
 		shard.hits++
 	} else {
@@ -156,6 +197,12 @@ func (c *LRU) ContainsAndTouch(key string) bool {
 	defer shard.mu.Unlock()
 
 	elem, ok := shard.items[key]
+	if ok && c.expired(now, elem.Value.(*entry)) {
+		shard.list.Remove(elem)
+		delete(shard.items, key)
+		shard.expirations++
+		ok = false
+	}
 	if ok {
 		shard.hits++
 		elem.Value.(*entry).lastTouched = now
@@ -226,6 +273,7 @@ func (c *LRU) Snapshot() LRUStats {
 		stats.Inserts += shard.inserts
 		stats.Evicts += shard.evicts
 		stats.DeleteMisses += shard.deleteMisses
+		stats.Expirations += shard.expirations
 		if tail := shard.list.Back(); tail != nil {
 			touched := tail.Value.(*entry).lastTouched
 			if now >= touched {
@@ -238,6 +286,13 @@ func (c *LRU) Snapshot() LRUStats {
 		shard.mu.Unlock()
 	}
 	return stats
+}
+
+// expired uses unsigned subtraction so normal uint32 Unix-second wraparound
+// remains well-defined for TTLs below half the uint32 range (all supported
+// production cooldowns are minutes, not decades).
+func (c *LRU) expired(now uint32, value *entry) bool {
+	return c.ttlSeconds > 0 && now-value.insertedAt >= c.ttlSeconds
 }
 
 // evict 淘汰链表尾部最旧的条目，调用方必须已持有锁。
